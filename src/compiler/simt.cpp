@@ -29,6 +29,7 @@
 #include <llvm/Analysis/VectorUtils.h>
 #include <llvm/IR/GetElementPtrTypeIterator.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
@@ -196,6 +197,16 @@ private:
     bool emit_mma(CallInst* call, Value* mask);
     Value* emit_mmav(CallInst* call);
     std::map<std::vector<Value*>, std::array<Value*, 8>> mmav_done_;  // one inline mma per operand set
+    AllocaInst* mma_scratch_ = nullptr;
+    // 1 KiB on the stack for an inline mma's converted operand (fp16, tf32).
+    Value* mma_scratch() {
+        if (!mma_scratch_) {
+            IRBuilder<> eb(&w_->getEntryBlock(), w_->getEntryBlock().begin());
+            mma_scratch_ = eb.CreateAlloca(ArrayType::get(b_.getInt8Ty(), 1024), nullptr, "mma.scratch");
+            mma_scratch_->setAlignment(Align(64));
+        }
+        return mma_scratch_;
+    }
 
     // Barriers (DESIGN.md 4.4): each __syncthreads is a block of its own; the
     // warp saves every slot and mask to its frame there and returns.
@@ -1785,17 +1796,27 @@ bool WarpBuilder::emit_mma(CallInst* call, Value* mask) {
     return true;
 }
 
-// __cpusim_mmav_bf16_f32(j, a, b0..b7, c0..c7): element j of one warp's
-// D = A * B + C, with B and C as values and A by pointer (its fragment, a
-// per-thread array). Element e of a fragment, over a warp's 32 lanes, is rows
-// 2e and 2e + 1 of the tile (mma.h), so C's values are already vdpbf16ps
-// accumulators, a row per 16 lanes, and B's are one register of two rows
-// each, interleaved into k pairs with vpermw. A's pairs are broadcast from
-// its fragment in memory (lane-major: row r at (r / 2) * W + (r % 2) * 16
-// elements), which folds into the load units; a broadcast out of a register
-// would cost a shuffle per vdpbf16ps on the same pipes. Loading A one step
-// ahead (mma.h's note) keeps those loads off stores still in flight. The
-// first of the 8 calls computes all of D; the others take their element.
+// __cpusim_mmav_<in>_<acc>(j, a, b0..b7, c0..c7): element j of one warp's
+// D = A * B + C (16 x 16 x 16), with B and C as values and A by pointer (its
+// fragment, a per-thread array). Element e of a fragment, over a warp's 32
+// lanes, is rows 2e and 2e + 1 of the tile (mma.h), so C's values are already
+// accumulators, a row per 16 lanes, and B's hold two rows of k each. A's
+// values are broadcast from its fragment in memory (lane-major: row r at
+// (r / 2) * W + (r % 2) * 16 elements), which the load units do; loading A
+// one step ahead (mma.h's note) keeps those loads off stores still in flight.
+// The first of the 8 calls computes all of D; the others take their element.
+//
+// Per type, one dot-product instruction per (row, group of k):
+//   bf16: vdpbf16ps, pairs of k. B's two rows interleaved with vpermw; A's
+//         pair broadcast as the third operand ({1to16} memory form).
+//   s8, u8: vpdpbusd, quads of k, unsigned bytes x signed bytes. A goes in as
+//         it is, on the side of its signedness (s8: the signed side, folded
+//         as a {1to16} memory operand; u8: the unsigned side, a broadcast
+//         load); B's four rows interleaved with vpermb and xor 0x80 for the
+//         other side (B + 128 unsigned, B - 128 signed), and the 128 * (row
+//         sum of A) that adds or removes is fixed at the end, a vpermd per
+//         row. (A xor 0x80 with a column-sum fix would need a vector xor per
+//         vpdpbusd, on the same pipes: half the speed.)
 Value* WarpBuilder::emit_mmav(CallInst* call) {
     std::vector<Value*> key{b_.GetInsertBlock()};
     for (unsigned i = 1; i < call->arg_size(); ++i) key.push_back(call->getArgOperand(i));
@@ -1803,21 +1824,23 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
     const unsigned j = unsigned(cast<ConstantInt>(call->getArgOperand(0))->getZExtValue());
     if (out[0]) return out[j];
 
+    const StringRef types = call->getCalledFunction()->getName().drop_front(StringRef(kMmavPrefix).size());
     auto* i8 = b_.getInt8Ty();
-    auto* v32bf = FixedVectorType::get(b_.getBFloatTy(), 32);
+    auto* i32 = b_.getInt32Ty();
     auto slice = [&](Value* v, unsigned first, unsigned n) {
-        SmallVector<int, 32> idx;
+        SmallVector<int, 64> idx;
         for (unsigned i = 0; i < n; ++i) idx.push_back(int(first + i));
         return b_.CreateShuffleVector(v, idx);
     };
     Value* pa = call->getArgOperand(1);
     auto* fa = dyn_cast<AllocaInst>(getUnderlyingObject(pa, 12));
     if (!fa || !private_elem_.count(fa)) return fail("tensor core fragment not in a per-thread array", call), nullptr;
+    const uint64_t ea = private_elem_[fa];  // bytes per element of A
     SplitAddress sa = split_address(pa);
     if (auto* lanes = dyn_cast<Constant>(sa.offsets)) {
         for (unsigned l = 0; l < W; ++l) {
             auto* e = dyn_cast_or_null<ConstantInt>(lanes->getAggregateElement(l));
-            if (!e || e->getZExtValue() != l * 2) return fail("tensor core fragment chosen per lane", call), nullptr;
+            if (!e || e->getZExtValue() != l * ea) return fail("tensor core fragment chosen per lane", call), nullptr;
         }
     } else {
         return fail("tensor core fragment chosen per lane", call), nullptr;
@@ -1827,28 +1850,124 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
         bv[e] = vector(call->getArgOperand(2 + e));
         c[e] = vector(call->getArgOperand(10 + e));
     }
-    SmallVector<uint16_t, 32> pairs;
-    for (unsigned n = 0; n < 16; ++n) pairs.push_back(uint16_t(n)), pairs.push_back(uint16_t(16 + n));
-    Constant* pair_idx = ConstantDataVector::get(ctx_, ArrayRef<uint16_t>(pairs));
-    Function* dp = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512bf16_dpbf16ps_512);
-    Function* perm = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_permvar_hi_512);
+    // Byte address of A's row r, element (column) k, in warp w's part.
+    auto a_at = [&](unsigned l0, unsigned r, unsigned k) {
+        return b_.CreateConstInBoundsGEP1_64(i8, sa.base, ((r / 2) * W + l0 + (r % 2) * 16 + k) * ea);
+    };
 
     std::array<std::vector<Value*>, 8> parts;  // per element: 16-lane rows, in lane order
     for (unsigned w = 0; w < W / CPUSIM_WARP_SIZE; ++w) {
         const unsigned l0 = w * CPUSIM_WARP_SIZE;
-        Value* abase = b_.CreateConstInBoundsGEP1_64(i8, sa.base, l0 * 2);
         Value* acc[16];
         for (unsigned r = 0; r < 16; ++r) acc[r] = slice(c[r / 2], l0 + (r % 2) * 16, 16);
-        // k pair outermost: 16 independent accumulator chains, one B live.
-        for (unsigned p = 0; p < 8; ++p) {
-            Value* bp = b_.CreateBitCast(b_.CreateCall(perm, {slice(bv[p], l0, 32), pair_idx}), v32bf);
-            for (unsigned r = 0; r < 16; ++r) {
-                Value* at = b_.CreateConstInBoundsGEP1_64(i8, abase, (r / 2) * W * 2 + (r % 2) * 32 + 4 * p);
-                Value* pr = b_.CreateAlignedLoad(b_.getInt32Ty(), at, Align(4));
-                // A last: only the third operand has a {1to16} memory form
-                // (each pair product is symmetric, so the order is free).
-                acc[r] = b_.CreateCall(dp, {acc[r], bp, b_.CreateBitCast(b_.CreateVectorSplat(16, pr), v32bf)});
+        if (types == "bf16_f32") {
+            auto* v32bf = FixedVectorType::get(b_.getBFloatTy(), 32);
+            SmallVector<uint16_t, 32> pairs;
+            for (unsigned n = 0; n < 16; ++n) pairs.push_back(uint16_t(n)), pairs.push_back(uint16_t(16 + n));
+            Constant* pair_idx = ConstantDataVector::get(ctx_, ArrayRef<uint16_t>(pairs));
+            Function* dp = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512bf16_dpbf16ps_512);
+            Function* perm = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_permvar_hi_512);
+            // k pair outermost: 16 independent accumulator chains, one B live.
+            for (unsigned p = 0; p < 8; ++p) {
+                Value* bp = b_.CreateBitCast(b_.CreateCall(perm, {slice(bv[p], l0, 32), pair_idx}), v32bf);
+                for (unsigned r = 0; r < 16; ++r) {
+                    Value* pr = b_.CreateAlignedLoad(i32, a_at(l0, r, 2 * p), Align(4));
+                    // A last: only the third operand has a {1to16} memory form
+                    // (each pair product is symmetric, so the order is free).
+                    acc[r] = b_.CreateCall(dp, {acc[r], bp, b_.CreateBitCast(b_.CreateVectorSplat(16, pr), v32bf)});
+                }
             }
+        } else if (types == "s8_s32" || types == "u8_s32") {
+            const bool sgn = types == "s8_s32";
+            auto* v16i32 = FixedVectorType::get(i32, 16);
+            auto* v64i8 = FixedVectorType::get(i8, 64);
+            SmallVector<uint8_t, 64> quads;
+            for (unsigned n = 0; n < 16; ++n)
+                for (unsigned t = 0; t < 4; ++t) quads.push_back(uint8_t(16 * t + n));
+            Constant* quad_idx = ConstantDataVector::get(ctx_, ArrayRef<uint8_t>(quads));
+            Function* dp = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_vpdpbusd_512);
+            Function* perm = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_permvar_qi_512);
+            Function* sad = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_psad_bw_512);
+            // B's quads, xor 0x80 to the side A is not on: B + 128 unsigned
+            // (s8) or B - 128 signed (u8).
+            Value* flip = ConstantInt::get(v16i32, 0x80808080);
+            Value* bq[4];
+            for (unsigned q = 0; q < 4; ++q) {
+                Value* rows = concat_chunks({slice(bv[2 * q], l0, 32), slice(bv[2 * q + 1], l0, 32)});
+                bq[q] = b_.CreateXor(b_.CreateBitCast(b_.CreateCall(perm, {rows, quad_idx}), v16i32), flip);
+            }
+            // That adds 128 * (row sum of A) for s8 and takes it off for u8.
+            // Row sums with vpsadbw (unsigned; s8 goes in as A + 128 and
+            // 16 * 128 comes off): 4 rows per register, two 8-byte halves
+            // each, added with a qword swap; then stored as they are, so row
+            // r's fix is the dword at (r / 4) * 64 + (r % 4) * 16 bytes of
+            // the scratch area, a broadcast load at the end.
+            auto* i64 = b_.getInt64Ty();
+            auto* v8i64 = FixedVectorType::get(i64, 8);
+            auto* v32i8 = FixedVectorType::get(i8, 32);
+            Value* scratch = mma_scratch();
+            for (unsigned e = 0; e < 8; e += 2) {
+                Value* ab = concat_chunks({b_.CreateAlignedLoad(v32i8, a_at(l0, 2 * e, 0), Align(1)),
+                                           b_.CreateAlignedLoad(v32i8, a_at(l0, 2 * e + 2, 0), Align(1))});
+                if (sgn) ab = b_.CreateXor(ab, ConstantInt::get(v64i8, 0x80));
+                Value* sums = b_.CreateCall(sad, {ab, Constant::getNullValue(v64i8)});  // 8 x i64
+                Value* rows = b_.CreateAdd(sums, b_.CreateShuffleVector(sums, {1, 0, 3, 2, 5, 4, 7, 6}));
+                if (sgn) rows = b_.CreateSub(rows, ConstantInt::get(v8i64, 16 * 128));
+                b_.CreateAlignedStore(b_.CreateShl(rows, 7), b_.CreateConstInBoundsGEP1_64(i8, scratch, e / 2 * 64),
+                                      Align(64));
+            }
+            // A's quad as it is, a broadcast load, on the signed side (s8) or
+            // the unsigned one (u8). No per-instruction work besides it.
+            for (unsigned q = 0; q < 4; ++q)
+                for (unsigned r = 0; r < 16; ++r) {
+                    // Volatile, so the fragment stays in memory and each quad
+                    // is a broadcast load; promoted to registers (SROA), it
+                    // would be broadcast out of them, a shuffle per vpdpbusd
+                    // on the same pipes.
+                    LoadInst* ld = b_.CreateAlignedLoad(i32, a_at(l0, r, 4 * q), Align(4));
+                    ld->setVolatile(true);
+                    Value* quad = b_.CreateVectorSplat(16, ld);
+                    acc[r] = sgn ? b_.CreateCall(dp, {acc[r], bq[q], quad}) : b_.CreateCall(dp, {acc[r], quad, bq[q]});
+                }
+            for (unsigned r = 0; r < 16; ++r) {
+                // Volatile: otherwise GVN forwards the store and the backend
+                // rebuilds each broadcast with shuffles.
+                LoadInst* ld = b_.CreateAlignedLoad(
+                    i32, b_.CreateConstInBoundsGEP1_64(i8, scratch, r / 4 * 64 + r % 4 * 16), Align(4));
+                ld->setVolatile(true);
+                Value* fix = b_.CreateVectorSplat(16, ld);
+                acc[r] = sgn ? b_.CreateSub(acc[r], fix) : b_.CreateAdd(acc[r], fix);
+            }
+
+        } else if (types == "f16_f32") {
+            auto* f32 = b_.getFloatTy();
+            auto* v16f = FixedVectorType::get(f32, 16);
+            auto* v16h = FixedVectorType::get(b_.getHalfTy(), 16);
+            auto* v32h = FixedVectorType::get(b_.getHalfTy(), 32);
+            Function* fma = Intrinsic::getDeclaration(&m_, Intrinsic::fma, {v16f});
+            // A in fp32, row-major (16 x 16), in a scratch area: each
+            // broadcast below then folds into its vfmadd231ps ({1to16}).
+            Value* scratch = mma_scratch();
+            for (unsigned e = 0; e < 8; ++e) {
+                Value* ah = b_.CreateAlignedLoad(v32h, a_at(l0, 2 * e, 0), Align(2));
+                b_.CreateAlignedStore(b_.CreateFPExt(ah, FixedVectorType::get(f32, 32)),
+                                      b_.CreateConstInBoundsGEP1_64(i8, scratch, e * 128), Align(64));
+            }
+            Value* bk[16];
+            for (unsigned k = 0; k < 16; ++k)
+                bk[k] = b_.CreateFPExt(b_.CreateBitCast(slice(bv[k / 2], l0 + (k % 2) * 16, 16), v16h), v16f);
+            // k outermost: 16 independent accumulator chains.
+            for (unsigned k = 0; k < 16; ++k)
+                for (unsigned r = 0; r < 16; ++r) {
+                    // Volatile: forwarded from the stores above, the
+                    // broadcasts would come out of registers, with shuffles.
+                    LoadInst* av = b_.CreateAlignedLoad(f32, b_.CreateConstInBoundsGEP1_64(i8, scratch, (r * 16 + k) * 4),
+                                                        Align(4));
+                    av->setVolatile(true);
+                    acc[r] = b_.CreateCall(fma, {b_.CreateVectorSplat(16, av), bk[k], acc[r]});
+                }
+        } else {
+            return fail("tensor core types not supported inline: " + types.str(), call), nullptr;
         }
         for (unsigned e = 0; e < 8; ++e) parts[e].push_back(acc[2 * e]), parts[e].push_back(acc[2 * e + 1]);
     }

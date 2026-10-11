@@ -35,6 +35,15 @@ __device__ __attribute__((convergent)) void __cpusim_mma_u8_s32(int* d, const un
 __device__ __attribute__((convergent, pure)) float __cpusim_mmav_bf16_f32(int j, const __nv_bfloat16* a,
                                                                           __CPUSIM_MMAV_ARGS(unsigned short),
                                                                           __CPUSIM_MMAV_ARGS(float));
+__device__ __attribute__((convergent, pure)) float __cpusim_mmav_f16_f32(int j, const __half* a,
+                                                                         __CPUSIM_MMAV_ARGS(unsigned short),
+                                                                         __CPUSIM_MMAV_ARGS(float));
+__device__ __attribute__((convergent, pure)) int __cpusim_mmav_s8_s32(int j, const signed char* a,
+                                                                     __CPUSIM_MMAV_ARGS(signed char),
+                                                                     __CPUSIM_MMAV_ARGS(int));
+__device__ __attribute__((convergent, pure)) int __cpusim_mmav_u8_s32(int j, const unsigned char* a,
+                                                                     __CPUSIM_MMAV_ARGS(unsigned char),
+                                                                     __CPUSIM_MMAV_ARGS(int));
 #undef __CPUSIM_MMAV_ARGS
 }
 
@@ -139,6 +148,9 @@ static __device__ __forceinline__ void saturate(fragment<accumulator, 16, 16, 16
 }
 }  // namespace __cpusim
 
+// The 8 elements of a fragment as arguments (with a member access appended).
+#define __CPUSIM_E(f, s) f.x[0] s, f.x[1] s, f.x[2] s, f.x[3] s, f.x[4] s, f.x[5] s, f.x[6] s, f.x[7] s
+
 // D = A * B + C. The fragments' layouts (row/col major) only affected how they
 // were loaded; the tiles are the same.
 template <typename LA, typename LB>
@@ -146,7 +158,11 @@ __device__ __forceinline__ void mma_sync(fragment<accumulator, 16, 16, 16, float
                                          const fragment<matrix_a, 16, 16, 16, __half, LA>& a,
                                          const fragment<matrix_b, 16, 16, 16, __half, LB>& b,
                                          const fragment<accumulator, 16, 16, 16, float>& c, bool satf = false) {
-    __cpusim_mma_f16_f32(d.x, a.x, b.x, c.x);
+    float r[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) r[j] = __cpusim_mmav_f16_f32(j, a.x, __CPUSIM_E(b, .__x), __CPUSIM_E(c, ));
+#pragma unroll
+    for (int j = 0; j < 8; ++j) d.x[j] = r[j];
     if (satf) __cpusim::saturate(d);
 }
 template <typename LA, typename LB>
@@ -154,11 +170,9 @@ __device__ __forceinline__ void mma_sync(fragment<accumulator, 16, 16, 16, float
                                          const fragment<matrix_a, 16, 16, 16, __nv_bfloat16, LA>& a,
                                          const fragment<matrix_b, 16, 16, 16, __nv_bfloat16, LB>& b,
                                          const fragment<accumulator, 16, 16, 16, float>& c, bool satf = false) {
-#define __CPUSIM_E(f, s) f.x[0] s, f.x[1] s, f.x[2] s, f.x[3] s, f.x[4] s, f.x[5] s, f.x[6] s, f.x[7] s
     float r[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) r[j] = __cpusim_mmav_bf16_f32(j, a.x, __CPUSIM_E(b, .__x), __CPUSIM_E(c, ));
-#undef __CPUSIM_E
 #pragma unroll
     for (int j = 0; j < 8; ++j) d.x[j] = r[j];
     if (satf) __cpusim::saturate(d);
@@ -172,7 +186,11 @@ __device__ __forceinline__ void mma_sync(fragment<accumulator, 16, 16, 16, TD>& 
     fragment<accumulator, 16, 16, 16, float> t;
 #pragma unroll
     for (int j = 0; j < 8; ++j) t.x[j] = (float)c.x[j];
-    __cpusim_mma_f16_f32(t.x, a.x, b.x, t.x);
+    float r[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) r[j] = __cpusim_mmav_f16_f32(j, a.x, __CPUSIM_E(b, .__x), __CPUSIM_E(t, ));
+#pragma unroll
+    for (int j = 0; j < 8; ++j) t.x[j] = r[j];
     if (satf) __cpusim::saturate(t);
 #pragma unroll
     for (int j = 0; j < 8; ++j) d.x[j] = (TD)t.x[j];
@@ -182,15 +200,25 @@ __device__ __forceinline__ void mma_sync(fragment<accumulator, 16, 16, 16, int>&
                                          const fragment<matrix_a, 16, 16, 16, signed char, LA>& a,
                                          const fragment<matrix_b, 16, 16, 16, signed char, LB>& b,
                                          const fragment<accumulator, 16, 16, 16, int>& c, bool satf = false) {
-    __cpusim_mma_s8_s32(d.x, a.x, b.x, c.x);
+    int r[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) r[j] = __cpusim_mmav_s8_s32(j, a.x, __CPUSIM_E(b, ), __CPUSIM_E(c, ));
+#pragma unroll
+    for (int j = 0; j < 8; ++j) d.x[j] = r[j];
 }
 template <typename LA, typename LB>
 __device__ __forceinline__ void mma_sync(fragment<accumulator, 16, 16, 16, int>& d,
                                          const fragment<matrix_a, 16, 16, 16, unsigned char, LA>& a,
                                          const fragment<matrix_b, 16, 16, 16, unsigned char, LB>& b,
                                          const fragment<accumulator, 16, 16, 16, int>& c, bool satf = false) {
-    __cpusim_mma_u8_s32(d.x, a.x, b.x, c.x);
+    int r[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) r[j] = __cpusim_mmav_u8_s32(j, a.x, __CPUSIM_E(b, ), __CPUSIM_E(c, ));
+#pragma unroll
+    for (int j = 0; j < 8; ++j) d.x[j] = r[j];
 }
+
+#undef __CPUSIM_E
 
 }  // namespace wmma
 }  // namespace nvcuda
