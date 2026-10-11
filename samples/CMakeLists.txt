@@ -16,6 +16,7 @@ option(SAMPLES_NO_FMAD "Compile device code with -fmad=false" ON)
 
 set(SAMPLES
     matmul
+    matmul_naive
     nbody
     reduction
     histogram
@@ -25,6 +26,8 @@ set(SAMPLES
     bitonic_sort
     spmv
     mandelbrot
+    tensor_gemm
+    cpu_gemm
 )
 
 enable_testing()
