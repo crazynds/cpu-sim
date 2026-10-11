@@ -65,7 +65,7 @@ Environment variables:
 
 `CPUSIM_PROFILE`, `CPUSIM_DEBUG` and `CPUSIM_DUMP_ASM` are read by the program, not by the driver: `libcpusim_cudart` tags each launch, and the driver (always the same one) executes that launch in the requested mode.
 
-Configuration (`~/.config/cpusim/device.toml`, everything optional):
+Configuration (`~/.config/cpusim/device.toml`, everything optional; `cpusimd --init-config` writes it with this machine's defaults, commented out):
 
 ```toml
 [device]

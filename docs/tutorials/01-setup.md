@@ -45,7 +45,15 @@ build/cpusimd --daemon
 build/cpu-smi -q
 ```
 
-`cpu-smi -q` shows the device: compute capability, tensor core types, the number of multiprocessors (physical cores) and which logical CPUs they are. By default the driver takes every physical core but the first two and their SMT siblings; to choose, set `cores` or `cpus` in `~/.config/cpusim/device.toml` (see the [README](../../README.md#usage)) and restart it.
+`cpu-smi -q` shows the device: compute capability, tensor core types, the number of multiprocessors (physical cores) and which logical CPUs they are.
+
+The configuration file, `~/.config/cpusim/device.toml`, is optional: without it (`Config : (defaults)` in `cpu-smi -q`) the driver takes every physical core but the first two, with their SMT siblings, and sizes the VRAM from the RAM. To change anything, generate the file with this machine's defaults, all commented out, and uncomment what you want:
+
+```sh
+build/cpusimd --init-config        # writes ~/.config/cpusim/device.toml; never overwrites
+```
+
+The keys that matter for benchmarks are `cores` (how many physical cores) and `cpus` (which ones). Restart the driver after editing.
 
 After rebuilding the project, restart the driver so it runs the new build:
 

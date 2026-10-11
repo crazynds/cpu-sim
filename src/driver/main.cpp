@@ -4,13 +4,18 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <sys/stat.h>
+
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 
 #include "common/config.h"
 #include "common/paths.h"
+#include "common/topology.h"
 #include "common/units.h"
 #include "device/device_core.h"
 #include "driver/monitor.h"
@@ -37,6 +42,7 @@ void usage() {
         "  -d, --daemon        detach and log to <socket>.log\n"
         "      --stop          stop the running driver\n"
         "      --status        print the pid of the running driver, exit 1 if none\n"
+        "      --init-config   write the config file with this machine's defaults, commented out\n"
         "  -V, --version\n"
         "  -h, --help\n",
         config_path().c_str());
@@ -71,6 +77,60 @@ bool daemonize(const std::string& log_path) {
     return true;
 }
 
+// Writes the config file (never over an existing one) with every key commented
+// out at the value the driver uses when the key is absent, so the file starts
+// out equivalent to having none and each setting is one uncomment away.
+int init_config() {
+    const std::string path = config_path();
+    if (access(path.c_str(), F_OK) == 0) {
+        std::fprintf(stderr, "cpusimd: %s already exists; not overwriting it\n", path.c_str());
+        return 1;
+    }
+    for (size_t at = path.find('/', 1); at != std::string::npos; at = path.find('/', at + 1))
+        mkdir(path.substr(0, at).c_str(), 0755);
+
+    const Topology topo = read_topology();
+    const int cores = std::max(1, int(topo.cores.size()) - 2);
+    std::vector<int> cpus;
+    for (size_t i = topo.cores.size() - size_t(cores); i < topo.cores.size(); ++i)
+        cpus.insert(cpus.end(), topo.cores[i].cpus.begin(), topo.cores[i].cpus.end());
+    std::sort(cpus.begin(), cpus.end());
+    const uint64_t ram = uint64_t(sysconf(_SC_PHYS_PAGES)) * uint64_t(sysconf(_SC_PAGESIZE));
+    const uint64_t vram_gib = std::clamp<uint64_t>(ram / 4 / GiB, 1, 8);
+    const Config defaults;
+
+    std::ofstream f(path);
+    f << "# CudaSimulator device configuration. Every key is optional: the values below,\n"
+         "# commented out, are what the driver uses on this machine when the key is absent.\n"
+         "# Restart the driver after editing (cpusimd --stop && cpusimd --daemon).\n"
+         "\n"
+         "[device]\n"
+         "# name = \"" << short_cpu_model(topo.cpu_model) << "\"      # shown by cpu-smi and cudaGetDeviceProperties\n"
+         "\n"
+         "# Which CPUs run kernels: either a number of physical cores (\"SMs\", taken from\n"
+         "# the end, leaving the first ones to the system) or a list of logical CPUs\n"
+         "# (each listed CPU brings its whole physical core, SMT siblings included).\n"
+         "# This machine: " << topo.cores.size() << " physical cores, " << topo.logical_cpus << " logical CPUs.\n"
+         "# cores = " << cores << "\n"
+         "# cpus = \"" << format_cpu_list(cpus) << "\"      # the same cores as above\n"
+         "\n"
+         "# Device memory (cudaMalloc): a quarter of the RAM, at most 8 GiB.\n"
+         "# vram_private = \"" << vram_gib << "GiB\"\n"
+         "# Shared pool for cudaMallocManaged and mapped host memory (\"0\" disables it).\n"
+         "# vram_shared = \"" << defaults.vram_shared / GiB << "GiB\"\n"
+         "# hugepages = \"" << hugepages_name(defaults.hugepages) << "\"      # 2MiB, 1GiB or none\n"
+         "# prefault = " << (defaults.prefault ? "true" : "false") << "      # true: occupy all of the VRAM in RAM at startup\n"
+         "\n"
+         "[driver]\n"
+         "# socket = \"" << socket_path(defaults) << "\"\n";
+    if (!f) {
+        std::fprintf(stderr, "cpusimd: cannot write %s\n", path.c_str());
+        return 1;
+    }
+    std::printf("wrote %s\n", path.c_str());
+    return 0;
+}
+
 void report_ready(bool ok) {
     if (g_ready_fd < 0) return;
     char c = ok ? 1 : 0;
@@ -99,6 +159,7 @@ int main(int argc, char** argv) {
         else if (a == "-d" || a == "--daemon") detach = true;
         else if (a == "--stop") stop = true;
         else if (a == "--status") status = true;
+        else if (a == "--init-config") return init_config();
         else if (a == "-V" || a == "--version") return std::printf("cpusimd %s\n", CPUSIM_VERSION), 0;
         else if (a == "-h" || a == "--help") return usage(), 0;
         else {

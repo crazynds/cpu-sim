@@ -38,7 +38,7 @@ nvcc -O3 -std=c++20 -arch=native bench/peak.cu -o peak_gpu && ./peak_gpu
 ## Things to check
 
 - **The clock**: divide the `fp32 FMA` result by (multiprocessors × 32 FLOPs × FMA units per core) and compare with `clocks.sm` from `cpu-smi`. If they agree, the kernel retires FMAs at the hardware rate and the number is the true ceiling.
-- **Scaling with cores**: set `cores = 1` (then 2, 4, ...) in `~/.config/cpusim/device.toml`, restart the driver and run again. The device always uses both SMT threads of each core it takes, so the result is per physical core; it should grow linearly until power limits lower the clock.
+- **Scaling with cores**: set `cores = 1` (then 2, 4, ...) in `~/.config/cpusim/device.toml` (create it with `build/cpusimd --init-config`, tutorial 1), restart the driver and run again. The device always uses both SMT threads of each core it takes, so the result is per physical core; it should grow linearly until power limits lower the clock.
 - **Thermal drift**: run `./peak fp32 30` and watch `clocks.sm`. The difference between the first seconds and the end is how much your cooling costs a long benchmark.
 
 ## Using the peak as a reference
