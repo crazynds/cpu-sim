@@ -530,24 +530,30 @@ int main(int argc, char** argv) {
             if (block_wide) return k.has_barriers ? threads <= lanes && threads > lanes / 2 : lanes <= threads;
             return lanes < threads;  // suspending variants: several groups per block
         };
+        // Tensor core kernels: an inline mma is a few hundred instructions per
+        // warp, repeated for every warp of a wide variant, which costs
+        // compile time and gains nothing: each warp's mma is enough
+        // independent work, and the runtime's measurement picked the 32-lane
+        // variant over the block-wide one (samples/tensor_gemm: 2x faster).
+        const bool tensor = min_sm > 0;
         bool ok = build(false, 32) && (spec || build(true, 32));
         // Wider variants: with barriers, a whole block per call makes them free
         // (64..512 lanes); without, 2 or 4 warps per call give the core more
         // independent work. The runtime measures which one wins.
         for (unsigned i = 0; ok && i < (k.has_barriers ? 4u : 2u); ++i) {
-            if (!wanted(64u << i, true)) continue;
+            if (!wanted(64u << i, true) || tensor) continue;
             ok = build(false, 64u << i);
             if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_WIDE_SHIFT + i);
         }
         // Groups of 2 and 4 warps that still suspend at barriers: fewer switches.
-        for (unsigned i = 0; ok && k.has_barriers && i < 2; ++i) {
+        for (unsigned i = 0; ok && k.has_barriers && !tensor && i < 2; ++i) {
             if (!wanted(64u << i, false)) continue;
             ok = build(false, 64u << i, true);
             if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_SUSP_SHIFT + i);
         }
         // Half a block per call, the two SMT siblings of a core together: for
         // blocks of L+1 to 2L threads.
-        for (unsigned i = 0; ok && k.has_barriers && i < 4; ++i) {
+        for (unsigned i = 0; ok && k.has_barriers && !tensor && i < 4; ++i) {
             const unsigned lanes = 64u << i;
             if (spec && !(threads > lanes && threads <= 2 * lanes)) continue;
             ok = build(false, lanes, false, true);
