@@ -23,7 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CPUSIM_KERNEL_ABI 8
+#define CPUSIM_KERNEL_ABI 9
 #define CPUSIM_WARP_SIZE 32   // CUDA's warp: lane ids, warp intrinsics
 #define CPUSIM_MAX_LANES 512  // widest group of threads one entry call runs
 
@@ -174,10 +174,13 @@ typedef uint32_t (*cpusim_block_fn)(cpusim_warp_ctx* ctxs, uint32_t nwarps, uint
 // The "fatbin" the compiler embeds in the application (clang puts it in
 // .nv_fatbin and passes it to __cudaRegisterFatBinary through a wrapper).
 //   header | manifest (text) | shared object | device bitcode (optional)
+//          | specialized objects: a table, then each shared object
 // Manifest lines:
 //   kernel <mangled name> <param bytes> <count> <offset>:<size> ...
 // The bitcode is the per-thread device code (the role of PTX): the runtime
-// recompiles it at launch, specialized for the block shape (JIT).
+// recompiles it at launch, specialized for the block shape (JIT), unless the
+// compiler already did for that shape (block shapes constant at the launches
+// it saw): those objects come ready in the table.
 #define CPUSIM_FATBIN_MAGIC "CPUSIMFB"
 
 typedef struct cpusim_fatbin_header {
@@ -187,4 +190,13 @@ typedef struct cpusim_fatbin_header {
     uint64_t manifest_offset, manifest_size;
     uint64_t object_offset, object_size;
     uint64_t bitcode_offset, bitcode_size;  // size 0: no bitcode
+    uint64_t specialized_offset, specialized_count;  // table of cpusim_fatbin_specialized
 } cpusim_fatbin_header;
+
+// A shared object of the module specialized for one block shape, as the JIT
+// would build it; offset from the start of the fatbin.
+typedef struct cpusim_fatbin_specialized {
+    uint32_t block[3];
+    uint32_t reserved;
+    uint64_t offset, size;
+} cpusim_fatbin_specialized;

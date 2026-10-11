@@ -1,7 +1,9 @@
 #!/bin/sh
 # Reproducibility: compiles a CUDA test twice (the binaries must be identical)
 # and runs it in every execution mode, repeating the automatic one; every
-# "DIGEST <kernel> <hash>" line must be the same in all runs.
+# "DIGEST <kernel> <hash>" line must be the same in all runs. One more build
+# with --no-specialize runs the code the JIT compiles at launch (in an empty
+# cache) instead of the one compiled ahead of time.
 #   cuda_repro_test.sh <cucc> <cpusimd> <test.cu> [cucc flags...]
 set -eu
 CUCC=$1 CPUSIMD=$2 SRC=$3
@@ -38,6 +40,11 @@ run three-cores CPUSIM_CORES=3
 run linear-order CPUSIM_BLOCK_ORDER=linear
 run no-barrier-pass CPUSIM_NO_BARRIER_PASS=1
 run tiny-trials CPUSIM_TRIAL_BLOCKS=1
+
+echo "== JIT (built with --no-specialize, empty cache)"
+"$CUCC" -std=c++20 -I "$(dirname "$SRC")" "$@" --no-specialize "$SRC" -o "$DIR/$NAME.jit"
+env CPUSIM_BACKEND=inprocess XDG_CACHE_HOME="$DIR/cache" "$DIR/$NAME.jit" | tee "$DIR/out"
+grep '^DIGEST ' "$DIR/out" > "$DIR/digests.jit"
 
 echo "== daemon backend"
 "$CPUSIMD" --daemon >/dev/null

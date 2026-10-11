@@ -212,23 +212,22 @@ void Profiler::report() {
     }
 }
 
-// ---- JIT: recompiling the device bitcode for the launch's block shape
+// ---- Specialized code: the device code compiled for the launch's block shape
 //
 // With blockDim known, threadIdx becomes a constant (or constant + uniform)
-// vector and the compiler resolves address patterns statically. The result is
-// cached on disk by content, so only the first run of a program pays for it.
-// CPUSIM_JIT=0 disables it; CPUSIM_VERBOSE=1 reports compilations.
+// vector and the compiler resolves address patterns statically. cucc already
+// did it for the block shapes constant at the program's launches (the objects
+// are in the fatbin); for any other shape the runtime recompiles the bitcode
+// (JIT), cached on disk by content, so only the first run of a program pays
+// for it. CPUSIM_JIT=0 runs the generic code instead; CPUSIM_VERBOSE=1
+// reports which one each shape gets.
 
-bool jit_enabled() {
-#if defined(CPUSIM_DEVC_PATH) && defined(CPUSIM_CLANG_PATH)
+bool specialization_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("CPUSIM_JIT");
         return !(v && std::strcmp(v, "0") == 0);
     }();
     return on;
-#else
-    return false;
-#endif
 }
 
 bool run_tool(std::vector<std::string> args) {
@@ -414,13 +413,30 @@ void dump_asm(Module& m, const std::array<uint32_t, 3>& block) {
 }
 
 // The device function to launch for this block shape, or 0 to use the generic one.
+// The module specialized for `block` by the compiler, if it is in the fatbin.
+const cpusim_fatbin_specialized* specialized_object(const Module& m, const std::array<uint32_t, 3>& block) {
+    const auto* table = reinterpret_cast<const cpusim_fatbin_specialized*>(reinterpret_cast<const uint8_t*>(m.header) +
+                                                                           m.header->specialized_offset);
+    for (uint64_t i = 0; i < m.header->specialized_count; ++i)
+        if (table[i].block[0] == block[0] && table[i].block[1] == block[1] && table[i].block[2] == block[2])
+            return &table[i];
+    return nullptr;
+}
+
 uint64_t jit_function(Module& m, const KernelDesc& k, const std::array<uint32_t, 3>& block, cpusim::Device* d) {
-    if (!jit_enabled() || !m.header->bitcode_size) return 0;
+    if (!specialization_enabled() || (!m.header->bitcode_size && !m.header->specialized_count)) return 0;
     JitModule& j = m.jit[block];
     if (!j.tried) {
         j.tried = true;
         std::string path;
-        if (jit_object(m, block, &path)) {
+        if (const cpusim_fatbin_specialized* s = specialized_object(m, block)) {
+            // Compiled ahead of time: nothing to wait for.
+            j.ok = d->load_module(reinterpret_cast<const uint8_t*>(m.header) + s->offset, s->size, &j.handle) ==
+                   Error::Success;
+            if (std::getenv("CPUSIM_VERBOSE"))
+                std::fprintf(stderr, "cpusim: block (%u,%u,%u): specialized ahead of time%s\n", block[0], block[1],
+                             block[2], j.ok ? "" : ", but it does not load");
+        } else if (m.header->bitcode_size && jit_object(m, block, &path)) {
             std::ifstream f(path, std::ios::binary);
             std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
             j.ok = !bytes.empty() && d->load_module(bytes.data(), bytes.size(), &j.handle) == Error::Success;

@@ -18,7 +18,7 @@ The device reports the highest compute capability its CPU supports; a kernel tha
 grep -o 'avx512[a-z_0-9]*' /proc/cpuinfo | sort -u
 ```
 
-The device code is compiled for the CPU it is compiled on (`-mcpu=native`, both in `cucc` and in the JIT), so it uses whatever extensions that CPU has. To build a binary for another machine, pass `--mcpu=<cpu>` to `cucc` (for example `--mcpu=znver4`, `--mcpu=sapphirerapids`).
+The device code is compiled for the CPU it is compiled on (`-mcpu=native`, both in `cucc` and in the JIT at run time), so it uses whatever extensions that CPU has. To build a binary for another machine, pass `--mcpu=<cpu>` to `cucc` (for example `--mcpu=znver4`, `--mcpu=sapphirerapids`).
 
 Also needed: GCC 13+, CMake 3.24+, LLVM/Clang 19 (setup in the [README](../../README.md#build)), and for the GPU comparisons `nvcc` with cuBLAS. Without a GPU, skip the GPU commands.
 
@@ -87,4 +87,4 @@ A CPU running AVX-512 on all cores is limited by power and temperature: the cloc
 
 ## First run of a CUDA program
 
-The first launch of each kernel and block shape compiles a specialized version (JIT, cached in `~/.cache/cpusim/jit`) and chooses the lane width by measurement. All benchmarks here do an untimed warm-up for that reason.
+Each block shape runs code specialized for it. `cucc` compiles it ahead of time for the shapes that are constants at the launches in the source; a launch with any other shape compiles it then (JIT, cached in `~/.cache/cpusim/jit`), which takes seconds on the first run. The first launches also choose the lane width by measurement. All benchmarks here do an untimed warm-up for both reasons. `CPUSIM_VERBOSE=1` shows which shapes came ready and which went through the JIT.

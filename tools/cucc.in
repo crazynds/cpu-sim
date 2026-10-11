@@ -11,8 +11,15 @@ the CPU, each warp in AVX-512 lanes:
 
 Usage mirrors nvcc for the common cases:
   cucc [-c] [-o out] [-I dir] [-D def] [-std=c++20] [-O3] [-fmad=false] [-fopenmp] [-Xcompiler a,b]
-       [-arch=sm_XX] [--keep] [-v] files... [-l lib] [-L dir]
+       [-arch=sm_XX] [--keep] [--no-specialize] [-v] files... [-l lib] [-L dir]
+
+The kernels are also compiled for each block shape that is a constant at a
+launch in the source (`k<<<grid, 128>>>`), in parallel, and those objects go
+into the fatbin: at run time a launch with one of those shapes needs no JIT.
+--no-specialize leaves every shape to the JIT.
 """
+import concurrent.futures
+import re
 import os
 import shlex
 import struct
@@ -56,6 +63,7 @@ class Options:
         self.inputs = []     # .o / .a passed to the linker
         self.link = []       # -l, -L
         self.host = []       # host-only flags (-fopenmp)
+        self.specialize = True  # compile the constant block shapes ahead of time
         self.mcpu = "native"  # the device code targets this machine's CPU (--mcpu=znver4 etc. for another)
 
 
@@ -78,6 +86,8 @@ def parse(argv):
             o.compile_only = True
         elif a in ("--keep", "-keep"):
             o.keep = True
+        elif a == "--no-specialize":
+            o.specialize = False
         elif a == "-v":
             o.verbose = True
         elif a.startswith("-O"):
@@ -135,23 +145,74 @@ def run(cmd, o):
         sys.exit(r.returncode)
 
 
-def build_fatbin(manifest_path, so_path, bc_path, out_path):
+def build_fatbin(manifest_path, so_path, bc_path, out_path, specialized=()):
+    """header | manifest | shared object | bitcode | table of specialized
+    objects (block x, y, z, 0, offset, size) | those objects
+    (src/device/kernel_abi.h)."""
     manifest = open(manifest_path, "rb").read()
     obj = open(so_path, "rb").read()
     bitcode = open(bc_path, "rb").read() if bc_path else b""
     # "cpusim-module <abi>": the version the device compiler generated code for.
     abi = int(manifest.split(b"\n", 1)[0].split()[1])
-    header_size = 8 + 4 + 4 + 8 * 6
+    align = lambda n, a: (n + a - 1) // a * a
+    header_size = 8 + 4 + 4 + 8 * 8
     manifest_off = header_size
-    obj_off = (manifest_off + len(manifest) + 4095) // 4096 * 4096
-    bc_off = (obj_off + len(obj) + 63) // 64 * 64
-    header = FATBIN_MAGIC + struct.pack("<II6Q", abi, 0, manifest_off, len(manifest), obj_off, len(obj),
-                                        bc_off if bitcode else 0, len(bitcode))
+    obj_off = align(manifest_off + len(manifest), 4096)
+    bc_off = align(obj_off + len(obj), 64)
+    table_off = align(bc_off + len(bitcode), 64)
+    objects = [(shape, open(path, "rb").read()) for shape, path in specialized]
+    entries, offset = [], align(table_off + 32 * len(objects), 64)
+    for shape, data in objects:
+        entries.append(struct.pack("<4I2Q", shape[0], shape[1], shape[2], 0, offset, len(data)))
+        offset = align(offset + len(data), 64)
+    header = FATBIN_MAGIC + struct.pack("<II8Q", abi, 0, manifest_off, len(manifest), obj_off, len(obj),
+                                        bc_off if bitcode else 0, len(bitcode), table_off if objects else 0,
+                                        len(objects))
     data = header + manifest
     data += b"\0" * (obj_off - len(data)) + obj
     if bitcode:
         data += b"\0" * (bc_off - len(data)) + bitcode
+    if objects:
+        data += b"\0" * (table_off - len(data)) + b"".join(entries)
+        for (shape, obj_data), entry in zip(objects, entries):
+            off = struct.unpack("<4I2Q", entry)[4]
+            data += b"\0" * (off - len(data)) + obj_data
     open(out_path, "wb").write(data)
+
+
+# The block shapes of the launches whose shape is a compile-time constant:
+# clang lowers k<<<grid, block>>> to __cudaPushCallConfiguration(grid.x | y << 32,
+# grid.z, block.x | block.y << 32, block.z, ...); after -O2 a constant block
+# shows as two integer literals.
+PUSH_CONFIG = re.compile(r"@__cudaPushCallConfiguration\(i64 [^,]+, i32 [^,]+, i64 (?:noundef )?(\d+), "
+                         r"i32 (?:noundef )?(\d+)")
+MAX_SPECIALIZED = 32
+
+
+def launch_shapes(src, common, o, base):
+    ll = base + ".host.ll"
+    run([CLANG] + common + o.host + ["--cuda-host-only", "-O2", "-S", "-emit-llvm", "-o", ll, src], o)
+    shapes = set()
+    for xy, z in PUSH_CONFIG.findall(open(ll).read()):
+        x, y, z = int(xy) & 0xFFFFFFFF, int(xy) >> 32, int(z)
+        if 0 < x * y * z <= 1024:
+            shapes.add((x, y, z))
+    return sorted(shapes)[:MAX_SPECIALIZED]
+
+
+def run_quiet(cmd, o):
+    """Like run(), but returns whether it worked instead of exiting."""
+    if o.verbose:
+        sys.stderr.write("+ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
+    return subprocess.run(cmd).returncode == 0
+
+
+def link_kernels(obj, so, o):
+    # libmvec/libm: the vector and scalar math the device code calls;
+    # libcpusim_tensor: the native tensor routines. Only recorded as
+    # dependencies when used.
+    return [CLANG, "-shared", "-nostdlib", "-o", so, obj, "-Wl,--as-needed", "-lmvec", "-lm", "-L", LIBDIR,
+            "-lcpusim_tensor", "-Wl,-rpath," + LIBDIR]
 
 
 def compile_cu(src, obj_out, o, tmp):
@@ -171,12 +232,26 @@ def compile_cu(src, obj_out, o, tmp):
     if o.keep:
         devc += ["--emit-ll", base + ".warp.ll", "--emit-scalar-ll", base + ".thread.ll", "--emit-raw-ll", base + ".raw.ll",
                  "--emit-asm", base + ".warp.s"]
-    run(devc, o)
-    # libmvec/libm: the vector and scalar math the device code calls;
-    # libcpusim_tensor: mma_sync. Only recorded as dependencies when used.
-    run([CLANG, "-shared", "-nostdlib", "-o", base + ".kernels.so", base + ".dev.o",
-         "-Wl,--as-needed", "-lmvec", "-lm", "-L", LIBDIR, "-lcpusim_tensor", "-Wl,-rpath," + LIBDIR], o)
-    build_fatbin(base + ".manifest", base + ".kernels.so", base + ".dev.bc", base + ".fatbin")
+    # The generic module and one per constant block shape, all at once.
+    shapes = launch_shapes(src, common, o, base) if o.specialize and not os.environ.get("CPUSIM_SPECIALIZE") else []
+    jobs = {None: [devc, link_kernels(base + ".dev.o", base + ".kernels.so", o)]}
+    for x, y, z in shapes:
+        stem = "%s.%dx%dx%d" % (base, x, y, z)
+        jobs[(x, y, z)] = [[DEVC, base + ".dev.bc", "-o", stem + ".o", "--manifest", stem + ".manifest", "--mcpu",
+                            o.mcpu, "--specialize", "%d,%d,%d" % (x, y, z)],
+                           link_kernels(stem + ".o", stem + ".so", o)]
+    run_all = lambda cmds: all(run_quiet(c, o) for c in cmds)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+        done = {shape: pool.submit(run_all, cmds) for shape, cmds in jobs.items()}
+    if not done[None].result():
+        sys.exit(1)
+    specialized = []
+    for shape in shapes:
+        if done[shape].result():
+            specialized.append((shape, "%s.%dx%dx%d.so" % ((base,) + shape)))
+        else:  # the JIT will try again at run time
+            sys.stderr.write("cucc: warning: no ahead-of-time code for block (%d,%d,%d)\n" % shape)
+    build_fatbin(base + ".manifest", base + ".kernels.so", base + ".dev.bc", base + ".fatbin", specialized)
 
     # Host: the fatbin goes into .nv_fatbin and is registered at startup.
     run([CLANG] + common + o.host + ["--cuda-host-only", o.opt, "-Xclang", "-fcuda-include-gpubinary",
