@@ -1,6 +1,6 @@
 # CudaSimulator
 
-Compiles CUDA programs **without modification** to run on the CPU: each 32-thread warp executes on AVX-512 lanes, and a resident driver plays the role of the GPU (it reserves cores and "VRAM", loads modules and runs kernels). The complete design is in [DESIGN.md](DESIGN.md); the optimizations of the CPU execution are explained one by one, with theory, code and results, in [docs/optimization/](docs/optimization/README.md), separated by iteration.
+Compiles CUDA programs **without modification** to run on the CPU: each 32-thread warp executes on AVX-512 lanes, and a resident driver plays the role of the GPU (it reserves cores and "VRAM", loads modules and runs kernels). The complete design is in [DESIGN.md](DESIGN.md); the optimizations of the CPU execution are explained one by one, with theory, code and results, in [docs/optimization/](docs/optimization/README.md), separated by iteration. To run the benchmarks yourself, follow the [benchmark tutorials](docs/tutorials/README.md).
 
 ## Status
 
