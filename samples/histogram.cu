@@ -29,7 +29,7 @@ __global__ void hist_shared(const uint8_t* data, unsigned int* bins, int n) {
 }
 
 int main() {
-    const int n = (1 << 23) + 77;
+    const int n = (5 << 27) + 77;
 
     // Half of the samples fall into 4 hot bins to force atomic conflicts.
     Lcg rng(99);

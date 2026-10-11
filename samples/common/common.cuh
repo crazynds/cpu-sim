@@ -16,6 +16,15 @@
 #include <type_traits>
 #include <vector>
 
+// Problem sizes: GPU-sized by default (>= 100 ms on an RTX 5060 where the
+// kernel allows it), smaller with -DSAMPLE_TEST, which the ctest runs use:
+// the same code paths and edge cases in seconds instead of minutes.
+#ifdef SAMPLE_TEST
+#define SAMPLE_SIZE(full, test) (test)
+#else
+#define SAMPLE_SIZE(full, test) (full)
+#endif
+
 #define CUDA_CHECK(call)                                                       \
     do {                                                                       \
         cudaError_t err_ = (call);                                             \

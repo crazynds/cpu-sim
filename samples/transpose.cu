@@ -32,11 +32,12 @@ __global__ void transpose_tiled(const float* in, float* out, int rows, int cols)
 }
 
 int main() {
-    const int rows = 2000, cols = 1500;
+    const int rows = SAMPLE_SIZE(24000, 2410), cols = SAMPLE_SIZE(18000, 1830);
 
     Lcg rng(3);
     std::vector<float> in(size_t(rows) * cols), ref(in.size());
     for (auto& v : in) v = rng.next_float(-100.0f, 100.0f);
+#pragma omp parallel for
     for (int r = 0; r < rows; ++r)
         for (int c = 0; c < cols; ++c) ref[size_t(c) * rows + r] = in[size_t(r) * cols + c];
 

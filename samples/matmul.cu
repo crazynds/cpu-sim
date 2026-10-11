@@ -40,7 +40,7 @@ __global__ void matmul_tiled(const float* A, const float* B, float* C, int M, in
 }
 
 int main() {
-    const int M = 500, N = 470, K = 530;
+    const int M = SAMPLE_SIZE(4100, 1030), N = SAMPLE_SIZE(4070, 1010), K = SAMPLE_SIZE(4130, 1050);
 
     Lcg rng(42);
     std::vector<float> A(size_t(M) * K), B(size_t(K) * N);
@@ -48,9 +48,9 @@ int main() {
     for (auto& v : B) v = rng.next_float(-1.0f, 1.0f);
 
     std::vector<float> ref(size_t(M) * N);
-    std::vector<double> row_acc(N);
+#pragma omp parallel for schedule(dynamic, 4)
     for (int i = 0; i < M; ++i) {
-        std::fill(row_acc.begin(), row_acc.end(), 0.0);
+        std::vector<double> row_acc(N, 0.0);
         for (int k = 0; k < K; ++k) {
             double a = A[size_t(i) * K + k];
             for (int j = 0; j < N; ++j) row_acc[j] += a * B[size_t(k) * N + j];

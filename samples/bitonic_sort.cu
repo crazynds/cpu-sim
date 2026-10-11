@@ -38,7 +38,7 @@ __global__ void bitonic_sort_segments(int* data) {
 }
 
 int main() {
-    const int segments = 2000;
+    const int segments = SAMPLE_SIZE(240000, 20000);
     const int n = segments * SORT_N;
 
     Lcg rng(21);
@@ -46,6 +46,7 @@ int main() {
     for (auto& v : data) v = static_cast<int>(rng.next_u32() % 1000000);
 
     std::vector<int> ref = data;
+#pragma omp parallel for
     for (int s = 0; s < segments; ++s)
         std::sort(ref.begin() + size_t(s) * SORT_N, ref.begin() + size_t(s + 1) * SORT_N);
 

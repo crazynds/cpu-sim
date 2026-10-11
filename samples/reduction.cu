@@ -55,7 +55,7 @@ __global__ void reduce_atomic(const float* in, float* out, int n) {
 }
 
 int main() {
-    const int n = (1 << 22) + 1234;
+    const int n = (1 << 28) + 1234;
 
     Lcg rng(123);
     std::vector<float> data(n);

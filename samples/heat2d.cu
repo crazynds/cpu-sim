@@ -47,7 +47,7 @@ __global__ void heat_step(const float* in, float* out, int w, int h, float alpha
 }
 
 int main() {
-    const int w = 1000, h = 700, iters = 20;
+    const int w = SAMPLE_SIZE(8000, 1010), h = SAMPLE_SIZE(6000, 750), iters = 60;
     const float alpha = 0.2f;
 
     Lcg rng(5);
@@ -58,6 +58,7 @@ int main() {
 
     std::vector<float> ref = grid, next(grid.size());
     for (int it = 0; it < iters; ++it) {
+#pragma omp parallel for
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) {
                 size_t i = size_t(y) * w + x;
@@ -74,7 +75,7 @@ int main() {
     dim3 block(BX, BY);
     dim3 blocks((w + BX - 1) / BX, (h + BY - 1) / BY);
 
-    report_time("heat_step x20", time_ms([&] {
+    report_time("heat_step x60", time_ms([&] {
         d_a.upload(grid);
         for (int it = 0; it < iters; ++it) {
             bool even = (it % 2 == 0);

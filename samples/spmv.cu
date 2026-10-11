@@ -32,7 +32,7 @@ __global__ void spmv_csr_warp(const int* row_ptr, const int* col_idx, const floa
 }
 
 int main() {
-    const int rows = 20000, cols = 20000;
+    const int rows = 8000000, cols = 8000000;
 
     Lcg rng(17);
     std::vector<int> row_ptr(rows + 1, 0), col_idx;

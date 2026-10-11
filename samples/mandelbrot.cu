@@ -6,7 +6,7 @@
 // lane. Built with -fmad=false so the GPU result is bit-exact with the CPU.
 #include "common.cuh"
 
-constexpr int MAX_ITER = 512;
+constexpr int MAX_ITER = 22528;
 
 __host__ __device__ inline int mandel_iters(int px, int py, int w, int h) {
     float cx = -2.0f + 3.0f * static_cast<float>(px) / static_cast<float>(w);
@@ -29,9 +29,10 @@ __global__ void mandelbrot(int* out, int w, int h) {
 }
 
 int main() {
-    const int w = 1024, h = 768;
+    const int w = SAMPLE_SIZE(4096, 1024), h = SAMPLE_SIZE(3072, 770);
 
     std::vector<int> ref(size_t(w) * h);
+#pragma omp parallel for schedule(dynamic, 8)
     for (int py = 0; py < h; ++py)
         for (int px = 0; px < w; ++px) ref[size_t(py) * w + px] = mandel_iters(px, py, w, h);
 

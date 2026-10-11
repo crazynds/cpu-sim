@@ -72,8 +72,8 @@ static void cpu_step(const std::vector<float4>& pos, const std::vector<float4>& 
 }
 
 int main() {
-    const int n = 4000;  // not a multiple of BLOCK on purpose
-    const int steps = 4;
+    const int n = 175000;  // not a multiple of BLOCK on purpose
+    const int steps = 1;
     const float dt = 0.01f;
 
     Lcg rng(7);
@@ -95,7 +95,7 @@ int main() {
     DeviceBuffer<float4> d_pos0(n), d_vel0(n), d_pos1(n), d_vel1(n);
     int blocks = (n + BLOCK - 1) / BLOCK;
 
-    report_time("nbody_step x4", time_ms([&] {
+    report_time("nbody_step", time_ms([&] {
         d_pos0.upload(pos);
         d_vel0.upload(vel);
         for (int s = 0; s < steps; ++s) {

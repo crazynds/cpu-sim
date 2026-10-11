@@ -77,7 +77,7 @@ static void scan_device(const int* d_in, int* d_out, int n) {
 }
 
 int main() {
-    const int n = (1 << 20) + 7777;
+    const int n = SAMPLE_SIZE((1 << 29) + 7777, (1 << 22) + 7777);
 
     Lcg rng(11);
     std::vector<int> data(n), ref(n);
