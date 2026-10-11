@@ -1881,26 +1881,32 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
     // they, B and a broadcast fit in the 32 vector registers (m32n8k16 has
     // 32 rows of one ymm).
     const unsigned rows_per_block = std::min(M, std::max(1u, 16 / segs));
+    // A's fragment and the scratch area are read through pointers passed
+    // through an empty asm: LLVM no longer knows what they point to, so it
+    // neither forwards the stores that filled them nor promotes A's array to
+    // registers. Each value is then a broadcast load (a {1to16} operand
+    // where the instruction has one); broadcast out of a register it would
+    // be a shuffle per instruction, on the pipes that do the arithmetic.
+    auto launder = [&](Value* p) {
+        return b_.CreateCall(InlineAsm::get(FunctionType::get(p->getType(), {p->getType()}, false), "", "=r,0", false),
+                             {p});
+    };
+    Value* abase = launder(sa.base);
+    auto scratch_base = [&]() { return launder(mma_scratch()); };
     // A fragment element holds 32 / C rows of its tile, C its columns.
     auto a_at = [&](unsigned l0, unsigned r, unsigned k) {  // A's row r, column k: byte address
         const unsigned per = 32 / K;
-        return b_.CreateConstInBoundsGEP1_64(i8, sa.base, ((r / per) * W + l0 + (r % per) * K + k) * ea);
+        return b_.CreateConstInBoundsGEP1_64(i8, abase, ((r / per) * W + l0 + (r % per) * K + k) * ea);
     };
     auto a_word = [&](unsigned l0, unsigned i) {  // sub-byte types: A's word in lane l0 + i
-        return b_.CreateConstInBoundsGEP1_64(i8, sa.base, (l0 + i) * ea);
+        return b_.CreateConstInBoundsGEP1_64(i8, abase, (l0 + i) * ea);
     };
     auto b_seg = [&](unsigned l0, unsigned k, unsigned s) {  // B's row k, segment s
         const unsigned per = 32 / N;
         return slice(bv[k / per], l0 + (k % per) * N + s * vl, vl);
     };
     auto splat_load = [&](Type* t, Value* at, unsigned n) {
-        // Volatile, so the fragment or scratch area stays in memory and each
-        // value is a broadcast load; forwarded from the stores (or promoted
-        // to registers), it would be broadcast out of registers: a shuffle
-        // per instruction, on the pipes that do the arithmetic.
-        LoadInst* ld = b_.CreateAlignedLoad(t, at, Align(t->getPrimitiveSizeInBits() / 8));
-        ld->setVolatile(true);
-        return b_.CreateVectorSplat(n, ld);
+        return b_.CreateVectorSplat(n, b_.CreateAlignedLoad(t, at, Align(t->getPrimitiveSizeInBits() / 8)));
     };
 
     std::array<std::vector<Value*>, 8> parts;  // per element of C: its row segments, in lane order
@@ -1930,8 +1936,7 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
             for (unsigned r0 = 0; r0 < M; r0 += rows_per_block)
                 for (unsigned p = 0; p < K / 2; ++p)
                     for (unsigned r = r0; r < r0 + rows_per_block; ++r) {
-                        // Not volatile: a plain load folds into vdpbf16ps.
-                        Value* pr = b_.CreateVectorSplat(vl, b_.CreateAlignedLoad(i32, a_at(l0, r, 2 * p), Align(4)));
+                            Value* pr = b_.CreateVectorSplat(vl, b_.CreateAlignedLoad(i32, a_at(l0, r, 2 * p), Align(4)));
                         for (unsigned s = 0; s < segs; ++s)
                             acc[r][s] = b_.CreateCall(dp, {acc[r][s], bp[p][s], b_.CreateBitCast(pr, vbf)});
                     }
@@ -1953,7 +1958,7 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
             // 16 * 128 comes off), 4 rows per register, two 8-byte halves
             // each added with a qword swap, stored as they are: row r's fix
             // is the dword at (r / 4) * 64 + (r % 4) * 16 of the scratch area.
-            Value* scratch = mma_scratch();
+            Value* scratch = scratch_base();
             auto* v8i64 = FixedVectorType::get(b_.getInt64Ty(), 8);
             for (unsigned r = 0; r < M; r += 4) {
                 Value* ab = concat_chunks({b_.CreateAlignedLoad(v32i8, a_at(l0, r, 0), Align(1)),
@@ -2007,7 +2012,7 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
                 auto* it = FixedVectorType::get(i32, n);
                 return b_.CreateBitCast(b_.CreateAnd(b_.CreateBitCast(v, it), ConstantInt::get(it, 0xffffe000u)), vt);
             };
-            Value* scratch = mma_scratch();
+            Value* scratch = scratch_base();
             auto* ta = FixedVectorType::get(tf ? f32 : b_.getInt16Ty(), 32);
             for (unsigned e = 0; e < M * K / 32; ++e)  // element e: 32 / K rows of A
                 b_.CreateAlignedStore(to_f32(b_.CreateAlignedLoad(ta, a_at(l0, e * (32 / K), 0), Align(2))),
@@ -2074,7 +2079,7 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
             SmallVector<int, 64> inter;
             for (unsigned m = 0; m < 8; ++m)
                 for (unsigned q = 0; q < 8; ++q) inter.push_back(int((q % 2) * 32 + 4 * m + q / 2));
-            Value* scratch = mma_scratch();
+            Value* scratch = scratch_base();
             b_.CreateAlignedStore(b_.CreateShuffleVector(ae[0], ae[1], inter), scratch, Align(64));
             if (sgn) {
                 Value* ones = ConstantInt::get(v8i32, 0x01010101);
