@@ -29,6 +29,7 @@
 #include <llvm/Analysis/VectorUtils.h>
 #include <llvm/IR/GetElementPtrTypeIterator.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/IntrinsicsNVPTX.h>
@@ -129,7 +130,25 @@ private:
     // `ptr` is the per-thread pointer; its offsets are recomputed in the rare
     // fallback paths so the common paths only need the cached pattern data.
     Value* gather(Type* elem, Value* ptr, Align align, Value* mask, const Twine& name);
-    void scatter(Value* vals, Value* ptr, Align align, Value* mask);
+    void scatter(Value* vals, Value* ptr, Align align, Value* mask, bool nontemporal = false);
+    void store_chunk(Value* v, Value* base, Align align, Value* mask, bool nontemporal);
+    // base + offset in bytes. When split_address found no base (null), the
+    // address is the integer itself: a pointer made by a GEP on null has no
+    // provenance, and LLVM treats a plain store through it as undefined.
+    Value* byte_ptr(Value* base, Value* offset) {
+        if (isa<ConstantPointerNull>(base)) return b_.CreateIntToPtr(offset, base->getType());
+        return b_.CreateGEP(b_.getInt8Ty(), base, offset);
+    }
+    // Non-temporal stores are weakly ordered on x86: before the block ends (the
+    // next kernel may read them from another core) or meets its SMT sibling at
+    // a barrier, an sfence makes them visible.
+    void sfence_if_streaming() {
+        for (Instruction& i : instructions(f_))
+            if (isa<StoreInst>(i) && i.hasMetadata(LLVMContext::MD_nontemporal)) {
+                b_.CreateCall(Intrinsic::getDeclaration(&m_, Intrinsic::x86_sse_sfence));
+                return;
+            }
+    }
     Value* half(Value* v, unsigned h);
     Value* concat_chunks(const std::vector<Value*>& parts);
     void fail(const std::string& what, const Value* v = nullptr) {
@@ -1277,7 +1296,7 @@ Value* WarpBuilder::gather(Type* elem, Value* ptr, Align align, Value* mask, con
             if (one_row) {
                 Value* any_mask = half(mask, 0);
                 for (unsigned h = 1; h < chunks; ++h) any_mask = b_.CreateOr(any_mask, half(mask, h));
-                Value* row = b_.CreateMaskedLoad(v16, b_.CreateGEP(b_.getInt8Ty(), addr.base, firsts[0]), align, any_mask,
+                Value* row = b_.CreateMaskedLoad(v16, byte_ptr(addr.base, firsts[0]), align, any_mask,
                                                  PoisonValue::get(v16));
                 SmallVector<int, 64> rep;
                 for (int i = 0; i < int(W); ++i) rep.push_back(i % 16);
@@ -1286,7 +1305,7 @@ Value* WarpBuilder::gather(Type* elem, Value* ptr, Align align, Value* mask, con
             std::vector<Value*> parts(chunks);
             for (unsigned h = 0; h < chunks; ++h) {
                 Value* m = half(mask, h);
-                Value* base = b_.CreateGEP(b_.getInt8Ty(), addr.base, firsts[h]);
+                Value* base = byte_ptr(addr.base, firsts[h]);
                 if (kind[h] == 'c') {
                     parts[h] = b_.CreateMaskedLoad(v16, base, align, m, PoisonValue::get(v16));
                 } else {
@@ -1321,7 +1340,7 @@ Value* WarpBuilder::gather(Type* elem, Value* ptr, Align align, Value* mask, con
     all_bcast = cached(all_bcast);
     same_first = cached(same_first);
     for (unsigned h = 0; h < chunks; ++h) {
-        bases[h] = b_.CreateGEP(b_.getInt8Ty(), addr.base, cached(firsts[h]));
+        bases[h] = byte_ptr(addr.base, cached(firsts[h]));
         cbits[h] = cached(cbits[h]);
         sbits[h] = cached(sbits[h]);
     }
@@ -1434,10 +1453,35 @@ Value* WarpBuilder::gather(Type* elem, Value* ptr, Align align, Value* mask, con
     return out;
 }
 
+// One contiguous chunk of 16 lanes. A non-temporal store (__stcs) has no
+// masked form on x86 (vmovntps), so it is used when all 16 lanes are active
+// and the chunk is 64-byte aligned, and the masked store otherwise.
+void WarpBuilder::store_chunk(Value* v, Value* base, Align align, Value* mask, bool nontemporal) {
+    if (!nontemporal) {
+        b_.CreateMaskedStore(v, base, align, mask);
+        return;
+    }
+    Value* full = b_.CreateICmpEQ(b_.CreateBitCast(mask, b_.getInt16Ty()), b_.getInt16(-1));
+    Value* aligned = b_.CreateICmpEQ(b_.CreateAnd(b_.CreatePtrToInt(base, b_.getInt64Ty()), b_.getInt64(63)),
+                                     b_.getInt64(0));
+    BasicBlock* bb_nt = BasicBlock::Create(ctx_, "st.nt", w_);
+    BasicBlock* bb_masked = BasicBlock::Create(ctx_, "st.masked", w_);
+    BasicBlock* bb_done = BasicBlock::Create(ctx_, "st.nt.done", w_);
+    b_.CreateCondBr(b_.CreateAnd(full, aligned), bb_nt, bb_masked);
+    b_.SetInsertPoint(bb_nt);
+    StoreInst* st = b_.CreateAlignedStore(v, base, Align(64));
+    st->setMetadata(LLVMContext::MD_nontemporal, MDNode::get(ctx_, ConstantAsMetadata::get(b_.getInt32(1))));
+    b_.CreateBr(bb_done);
+    b_.SetInsertPoint(bb_masked);
+    b_.CreateMaskedStore(v, base, align, mask);
+    b_.CreateBr(bb_done);
+    b_.SetInsertPoint(bb_done);
+}
+
 // Same idea for stores: when every chunk is contiguous, one masked store per
 // chunk; otherwise each chunk tests by itself (and scatters if needed, which
 // also keeps "the last lane wins" when lanes share an address).
-void WarpBuilder::scatter(Value* vals, Value* ptr, Align align, Value* mask) {
+void WarpBuilder::scatter(Value* vals, Value* ptr, Align align, Value* mask, bool nontemporal) {
     SplitAddress addr = split_address(ptr);
     Type* elem = cast<VectorType>(vals->getType())->getElementType();
     uint64_t size = m_.getDataLayout().getTypeStoreSize(elem);
@@ -1448,8 +1492,7 @@ void WarpBuilder::scatter(Value* vals, Value* ptr, Align align, Value* mask) {
         std::vector<char> kind = static_chunks(form, size, firsts);
         if (std::all_of(kind.begin(), kind.end(), [](char k) { return k == 'c'; })) {
             for (unsigned h = 0; h < chunks; ++h)
-                b_.CreateMaskedStore(half(vals, h), b_.CreateGEP(b_.getInt8Ty(), addr.base, firsts[h]), align,
-                                     half(mask, h));
+                store_chunk(half(vals, h), byte_ptr(addr.base, firsts[h]), align, half(mask, h), nontemporal);
             return;
         }
     }
@@ -1461,7 +1504,7 @@ void WarpBuilder::scatter(Value* vals, Value* ptr, Align align, Value* mask) {
         Value* delta = b_.CreateSub(offs[h], b_.CreateVectorSplat(16, first));
         cbits[h] = b_.CreateFreeze(b_.CreateBitCast(b_.CreateICmpEQ(delta, lane_steps(b_, size)), i16));
         all_contig = b_.CreateAnd(all_contig, b_.CreateICmpEQ(cbits[h], b_.getInt16(-1)));
-        bases[h] = b_.CreateGEP(b_.getInt8Ty(), addr.base, cached(first));
+        bases[h] = byte_ptr(addr.base, cached(first));
     }
     all_contig = cached(all_contig);
     for (unsigned h = 0; h < chunks; ++h) cbits[h] = cached(cbits[h]);
@@ -1472,7 +1515,7 @@ void WarpBuilder::scatter(Value* vals, Value* ptr, Align align, Value* mask) {
     b_.CreateCondBr(all_contig, contig, mixed);
 
     b_.SetInsertPoint(contig);
-    for (unsigned h = 0; h < chunks; ++h) b_.CreateMaskedStore(half(vals, h), bases[h], align, half(mask, h));
+    for (unsigned h = 0; h < chunks; ++h) store_chunk(half(vals, h), bases[h], align, half(mask, h), nontemporal);
     b_.CreateBr(done);
 
     b_.SetInsertPoint(mixed);
@@ -1836,6 +1879,7 @@ void WarpBuilder::emit_coop_barrier(Value* mask) {
     LoadInst* cur = b_.CreateAlignedLoad(i64, epoch, Align(8), "coop.cur");
     cur->setAtomic(AtomicOrdering::Monotonic);
     Value* next = b_.CreateAdd(cur, ConstantInt::get(i64, 1), "coop.next");
+    sfence_if_streaming();
     b_.CreateAlignedStore(next, epoch, Align(8))->setAtomic(AtomicOrdering::Release);
     b_.CreateBr(wait);
 
@@ -2478,7 +2522,7 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
                 Value* active = together ? b_.CreateICmpNE(m_bits, b_.getInt16(0))
                                          : b_.CreateICmpNE(b_.CreateAnd(m_bits, b_.getInt16(uint16_t(1u << l))),
                                                            b_.getInt16(0));
-                Value* p = b_.CreateSelect(active, b_.CreateGEP(b_.getInt8Ty(), addr.base, off),
+                Value* p = b_.CreateSelect(active, byte_ptr(addr.base, off),
                                            b_.CreatePointerCast(ctx_arg_, addr.base->getType()));
                 b_.CreateCall(pf, {p, call->getArgOperand(1), call->getArgOperand(2), call->getArgOperand(3)});
             }
@@ -2537,7 +2581,7 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
             b_.CreateMaskedScatter(vector(val), vector(ptr), st->getAlign(), mask);
             return true;
         }
-        scatter(vector(val), ptr, st->getAlign(), mask);
+        scatter(vector(val), ptr, st->getAlign(), mask, st->hasMetadata(LLVMContext::MD_nontemporal));
         return true;
     }
 
@@ -2735,6 +2779,7 @@ bool WarpBuilder::run(std::string* error) {
         if (w_) w_->eraseFromParent();
         return false;
     }
+    sfence_if_streaming();
     b_.CreateRet(b_.getInt32(CPUSIM_EXIT));
     if (dispatch_) emit_dispatch();
     if (profile_) k_.profiled = w_;

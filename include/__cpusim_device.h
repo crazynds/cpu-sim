@@ -402,8 +402,14 @@ template <typename T>
 __CPUSIM_DEV void __stwb(T* p, T v) { *p = v; }
 template <typename T>
 __CPUSIM_DEV void __stcg(T* p, T v) { *p = v; }
+// Streaming store (evict-first, data not reused soon): a non-temporal store,
+// which skips reading the line before writing it. The compiler emits it where
+// the whole warp writes contiguous lanes; elsewhere it is an ordinary store.
 template <typename T>
-__CPUSIM_DEV void __stcs(T* p, T v) { *p = v; }
+__CPUSIM_DEV void __stcs(T* p, T v) {
+    if constexpr (__is_arithmetic(T)) __builtin_nontemporal_store(v, p);
+    else *p = v;
+}
 template <typename T>
 __CPUSIM_DEV void __stwt(T* p, T v) { *p = v; }
 #undef __CPUSIM_DEV
