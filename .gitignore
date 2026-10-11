@@ -1,0 +1,15 @@
+build/
+samples/build/
+
+# Local build and tool output
+/cmake-build-*/
+compile_commands.json
+.cache/
+*.o
+*.so
+perf.data*
+*.perf
+
+# Editors
+.vscode/
+.idea/
