@@ -127,6 +127,12 @@ private:
     // Per 16-lane chunk, from a linear form: 'c' contiguous, 'b' one address,
     // 0 unknown at compile time; and the chunk's first offset (scalar).
     std::vector<char> static_chunks(const LinearForm& f, uint64_t size, std::vector<Value*>& firsts);
+    // Groups of g consecutive lanes (g = 8, 4 or 2, the largest that fits),
+    // each contiguous, on uniform terms that are the same within a group but
+    // not across groups: rows of a tile, g values per row, with a stride
+    // known only at run time (wmma's sub-byte fragments: 4 words of 8 rows).
+    // Returns g (0: no such pattern) and each group's first offset.
+    unsigned static_groups(const LinearForm& f, uint64_t size, std::vector<Value*>& firsts);
     std::pair<Value*, Value*> split_index(Value* idx, bool is_signed);
     // `ptr` is the per-thread pointer; its offsets are recomputed in the rare
     // fallback paths so the common paths only need the cached pattern data.
@@ -198,6 +204,14 @@ private:
     Value* emit_mmav(CallInst* call);
     std::map<std::vector<Value*>, std::array<Value*, 8>> mmav_done_;  // one inline mma per operand set
     AllocaInst* mma_scratch_ = nullptr;
+    // p through an empty asm that also clobbers memory: LLVM no longer knows
+    // what it points to and cannot move loads above it, so it neither
+    // forwards earlier stores to loads through it nor promotes the memory to
+    // registers; the loads themselves stay ordinary.
+    Value* launder(Value* p) {
+        return b_.CreateCall(
+            InlineAsm::get(FunctionType::get(p->getType(), {p->getType()}, false), "", "=r,0,~{memory}", true), {p});
+    }
     // 2 KiB on the stack for an inline mma's converted A (fp16: 32 x 16
     // floats at most) or row sums (int8).
     Value* mma_scratch() {
@@ -1156,6 +1170,35 @@ std::vector<char> WarpBuilder::static_chunks(const LinearForm& f, uint64_t size,
     return kind;
 }
 
+unsigned WarpBuilder::static_groups(const LinearForm& f, uint64_t size, std::vector<Value*>& firsts) {
+    auto* i64 = b_.getInt64Ty();
+    for (unsigned g : {8u, 4u, 2u}) {
+        bool fits = true;
+        for (unsigned s = 0; s < W && fits; s += g)
+            for (unsigned i = 1; i < g && fits; ++i) {
+                int64_t delta = 0;
+                for (const auto& [coef, lanes] : f.terms) {
+                    if (coef) fits &= lanes[s + i] == lanes[s];
+                    else delta += lanes[s + i] - lanes[s];
+                }
+                fits &= delta == int64_t(i * size);
+            }
+        if (!fits) continue;
+        firsts.assign(W / g, nullptr);
+        for (unsigned s = 0; s < W; s += g) {
+            Value* first = ConstantInt::get(i64, 0);
+            int64_t k = 0;
+            for (const auto& [coef, lanes] : f.terms) {
+                if (!coef) k += lanes[s];
+                else if (lanes[s]) first = b_.CreateAdd(first, b_.CreateMul(coef, ConstantInt::get(i64, lanes[s])));
+            }
+            firsts[s / g] = b_.CreateAdd(first, ConstantInt::get(i64, k));
+        }
+        return g;
+    }
+    return 0;
+}
+
 // A per-thread array the lane-major layout can hold: a fixed size, one
 // scalar size throughout, and only element accesses (through GEPs) as uses.
 bool WarpBuilder::check_private_array(AllocaInst* a) {
@@ -1284,6 +1327,8 @@ Value* WarpBuilder::cached(Value* v) {
 //     Bs[k][threadIdx.x] in a 16x16 block): ONE vector load, replicated;
 //   - every chunk contiguous: one masked load per chunk;
 //   - every chunk on a single address: one broadcast per chunk;
+//   - groups of 2, 4 or 8 contiguous lanes (rows of a tile with a run-time
+//     stride), known at compile time: one masked load per group;
 //   - otherwise each chunk picks contiguous / broadcast / gather by itself.
 // Inactive lanes are never dereferenced: masked loads only touch active lanes,
 // and a chunk's broadcast only happens if it has an active lane.
@@ -1327,6 +1372,19 @@ Value* WarpBuilder::gather(Type* elem, Value* ptr, Align align, Value* mask, con
                     Value* p = b_.CreateSelect(any, base, b_.CreatePointerCast(ctx_arg_, base->getType()));
                     parts[h] = b_.CreateVectorSplat(16, b_.CreateAlignedLoad(elem, p, Align(1)));
                 }
+            }
+            return concat_chunks(parts);
+        }
+        // Groups of contiguous lanes (rows with a run-time stride): one
+        // masked load per group, instead of a gather.
+        if (unsigned g = static_groups(form, size, firsts)) {
+            auto* vg = FixedVectorType::get(elem, g);
+            std::vector<Value*> parts;
+            for (unsigned s = 0; s < W; s += g) {
+                SmallVector<int, 8> idx;
+                for (unsigned i = 0; i < g; ++i) idx.push_back(int(s + i));
+                parts.push_back(b_.CreateMaskedLoad(vg, byte_ptr(addr.base, firsts[s / g]), align,
+                                                    b_.CreateShuffleVector(mask, idx), PoisonValue::get(vg)));
             }
             return concat_chunks(parts);
         }
@@ -1505,6 +1563,15 @@ void WarpBuilder::scatter(Value* vals, Value* ptr, Align align, Value* mask, boo
         if (std::all_of(kind.begin(), kind.end(), [](char k) { return k == 'c'; })) {
             for (unsigned h = 0; h < chunks; ++h)
                 store_chunk(half(vals, h), byte_ptr(addr.base, firsts[h]), align, half(mask, h), nontemporal);
+            return;
+        }
+        if (unsigned g = static_groups(form, size, firsts)) {  // rows with a run-time stride
+            for (unsigned s = 0; s < W; s += g) {
+                SmallVector<int, 8> idx;
+                for (unsigned i = 0; i < g; ++i) idx.push_back(int(s + i));
+                b_.CreateMaskedStore(b_.CreateShuffleVector(vals, idx), byte_ptr(addr.base, firsts[s / g]), align,
+                                     b_.CreateShuffleVector(mask, idx));
+            }
             return;
         }
     }
@@ -1872,9 +1939,11 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
     for (unsigned e = 0; e < nb; ++e) bv[e] = vector(call->getArgOperand(2 + e));
     for (unsigned e = 0; e < nc; ++e) c[e] = vector(call->getArgOperand(2 + nb + e));
     // An accumulator row is `segs` vectors of `vl` lanes: one zmm for 16
-    // columns (8 for doubles), two for 32, one ymm for 8. (Storing m32n8k16's
-    // tiles transposed would make it an m8n32k16 product, but loading them
-    // from row-major memory would then be a gather per element.)
+    // columns (8 for doubles), two for 32, one ymm for 8. Two ways to give
+    // m32n8k16 zmm rows were slower: storing its tiles transposed (an m8n32k16
+    // product, but loading them from row-major memory is then a gather per
+    // element), and two rows interleaved per zmm (A's operand is then a
+    // 64-bit broadcast, which does not fold into the instruction).
     const unsigned vl = kind == "f64_f64" ? 8 : std::min(N, 16u), segs = N / vl;
     // Accumulator rows done together (all groups of k for these rows, then
     // the next ones): at most 16 registers of accumulators live, so that
@@ -1887,12 +1956,10 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
     // registers. Each value is then a broadcast load (a {1to16} operand
     // where the instruction has one); broadcast out of a register it would
     // be a shuffle per instruction, on the pipes that do the arithmetic.
-    auto launder = [&](Value* p) {
-        return b_.CreateCall(InlineAsm::get(FunctionType::get(p->getType(), {p->getType()}, false), "", "=r,0", false),
-                             {p});
-    };
+    // (The scratch area is written through its own pointer and read through
+    // one laundered after the stores: through the same pointer, LLVM would
+    // still forward them.)
     Value* abase = launder(sa.base);
-    auto scratch_base = [&]() { return launder(mma_scratch()); };
     // A fragment element holds 32 / C rows of its tile, C its columns.
     auto a_at = [&](unsigned l0, unsigned r, unsigned k) {  // A's row r, column k: byte address
         const unsigned per = 32 / K;
@@ -1958,7 +2025,7 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
             // 16 * 128 comes off), 4 rows per register, two 8-byte halves
             // each added with a qword swap, stored as they are: row r's fix
             // is the dword at (r / 4) * 64 + (r % 4) * 16 of the scratch area.
-            Value* scratch = scratch_base();
+            Value* scratch = mma_scratch();
             auto* v8i64 = FixedVectorType::get(b_.getInt64Ty(), 8);
             for (unsigned r = 0; r < M; r += 4) {
                 Value* ab = concat_chunks({b_.CreateAlignedLoad(v32i8, a_at(l0, r, 0), Align(1)),
@@ -1973,6 +2040,7 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
             // load, on the side of its signedness; B's four rows interleaved
             // with vpermb and xor 0x80 for the other side (B + 128 unsigned,
             // B - 128 signed), which adds or removes 128 * (row sum of A).
+            Value* sread = launder(scratch);
             Value* flip = ConstantInt::get(vi32, 0x80808080);
             std::vector<std::array<Value*, 2>> bq(K / 4);
             for (unsigned q = 0; q < K / 4; ++q)
@@ -1991,7 +2059,7 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
                     }
             // The fix, at the end: by then the store above is done.
             for (unsigned r = 0; r < M; ++r) {
-                Value* fix = splat_load(i32, b_.CreateConstInBoundsGEP1_64(i8, scratch, r / 4 * 64 + r % 4 * 16), vl);
+                Value* fix = splat_load(i32, b_.CreateConstInBoundsGEP1_64(i8, sread, r / 4 * 64 + r % 4 * 16), vl);
                 for (unsigned s = 0; s < segs; ++s)
                     acc[r][s] = sgn ? b_.CreateSub(acc[r][s], fix) : b_.CreateAdd(acc[r][s], fix);
             }
@@ -2012,18 +2080,19 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
                 auto* it = FixedVectorType::get(i32, n);
                 return b_.CreateBitCast(b_.CreateAnd(b_.CreateBitCast(v, it), ConstantInt::get(it, 0xffffe000u)), vt);
             };
-            Value* scratch = scratch_base();
+            Value* scratch = mma_scratch();
             auto* ta = FixedVectorType::get(tf ? f32 : b_.getInt16Ty(), 32);
             for (unsigned e = 0; e < M * K / 32; ++e)  // element e: 32 / K rows of A
                 b_.CreateAlignedStore(to_f32(b_.CreateAlignedLoad(ta, a_at(l0, e * (32 / K), 0), Align(2))),
                                       b_.CreateConstInBoundsGEP1_64(i8, scratch, e * 128), Align(64));
+            Value* sread = launder(scratch);
             std::vector<std::array<Value*, 2>> bk(K);
             for (unsigned k = 0; k < K; ++k)
                 for (unsigned s = 0; s < segs; ++s) bk[k][s] = to_f32(b_seg(l0, k, s));
             for (unsigned r0 = 0; r0 < M; r0 += rows_per_block)
                 for (unsigned k = 0; k < K; ++k)
                     for (unsigned r = r0; r < r0 + rows_per_block; ++r) {
-                        Value* av = splat_load(f32, b_.CreateConstInBoundsGEP1_64(i8, scratch, (r * K + k) * 4), vl);
+                        Value* av = splat_load(f32, b_.CreateConstInBoundsGEP1_64(i8, sread, (r * K + k) * 4), vl);
                         for (unsigned s = 0; s < segs; ++s) acc[r][s] = b_.CreateCall(fma, {av, bk[k][s], acc[r][s]});
                     }
         } else if (kind == "f64_f64") {
@@ -2079,8 +2148,9 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
             SmallVector<int, 64> inter;
             for (unsigned m = 0; m < 8; ++m)
                 for (unsigned q = 0; q < 8; ++q) inter.push_back(int((q % 2) * 32 + 4 * m + q / 2));
-            Value* scratch = scratch_base();
+            Value* scratch = mma_scratch();
             b_.CreateAlignedStore(b_.CreateShuffleVector(ae[0], ae[1], inter), scratch, Align(64));
+            Value* sread = launder(scratch);
             if (sgn) {
                 Value* ones = ConstantInt::get(v8i32, 0x01010101);
                 Value* colsum = Constant::getNullValue(v8i32);
@@ -2089,7 +2159,7 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
             }
             for (unsigned q = 0; q < 8; ++q)
                 for (unsigned r = 0; r < 8; ++r) {
-                    Value* quad = splat_load(i32, b_.CreateConstInBoundsGEP1_64(i8, scratch, (8 * r + q) * 4), 8);
+                    Value* quad = splat_load(i32, b_.CreateConstInBoundsGEP1_64(i8, sread, (8 * r + q) * 4), 8);
                     acc[r][0] = b_.CreateCall(dp, {acc[r][0], quad, bq[q]});
                 }
         } else if (kind == "b1xor_s32" || kind == "b1and_s32") {
