@@ -9,8 +9,8 @@ The simulator runs CUDA kernels on AVX-512 vector lanes, so the CPU must have AV
 | Any kernel (the device refuses to start without these) | AVX-512 F, BW, DQ, VL; FMA | the device itself |
 | `half` and `__nv_bfloat16` arithmetic (`cuda_fp16.h`, `cuda_bf16.h`) | same as above (computed in fp32, rounded as CUDA does) | |
 | WMMA with `half` inputs | F16C + FMA (present on every AVX-512 CPU) | compute capability 7.0 |
-| WMMA with `signed char` / `unsigned char` inputs | AVX512-VNNI (`vpdpbusd`) + AVX512-VBMI (byte permutes) | compute capability 7.5 |
-| WMMA with `__nv_bfloat16` inputs | AVX512-BF16 (`vdpbf16ps`), in addition to the above | compute capability 12.0 (bf16 kernels need 8.0) |
+| WMMA with `signed char` / `unsigned char` inputs, and the experimental 4-bit and 1-bit types | AVX512-VNNI (`vpdpbusd`) + AVX512-VBMI (byte permutes) + AVX512-VPOPCNTDQ (`vpopcntd`) | compute capability 7.5 |
+| WMMA with `__nv_bfloat16`, tf32 or `double` inputs | AVX512-BF16 (`vdpbf16ps`), in addition to the above | compute capability 12.0 (these kernels need 8.0) |
 
 The device reports the highest compute capability its CPU supports; a kernel that needs a higher one fails to launch with `cudaErrorNoKernelImageForDevice`, as on an older GPU. Check what yours has:
 

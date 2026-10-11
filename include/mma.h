@@ -6,6 +6,8 @@
  * each in the shapes 16x16x16, 32x8x16 and 8x32x16, and
  *   tf32 x tf32       -> float, 16x16x8                        (sm_80: FMA)
  *   double x double   -> double, 8x8x4                         (sm_80: FMA)
+ *   experimental: s4, u4 -> int, 8x8x32; b1 (xor/and, popc) -> int, 8x8x128
+ *                                                   (sm_75: AVX512-VNNI, VPOPCNTDQ)
  * A kernel using a type the CPU has no instructions for fails to launch with
  * cudaErrorNoKernelImageForDevice, as on a GPU of an older generation; the
  * device's compute capability says which ones are there.
@@ -17,8 +19,7 @@
  * after the other: the compiler's inline mma reads B's and C's rows straight
  * out of registers and broadcasts A's values from its fragment in memory.
  * mma_sync becomes that inline code, one per warp (src/compiler/simt.cpp).
- * Not here (yet): the sub-byte experimental types, and satf for integer
- * accumulators. */
+ * Not here: satf for integer accumulators (ignored). */
 #ifndef CPUSIM_MMA_H
 #define CPUSIM_MMA_H
 
@@ -50,6 +51,13 @@ __CPUSIM_MMAV(float, f16_f32_m8n32k16, __half, __CPUSIM_X16(unsigned short), __C
 __CPUSIM_MMAV(int, s8_s32_m8n32k16, signed char, __CPUSIM_X16(signed char), __CPUSIM_X8(int));
 __CPUSIM_MMAV(int, u8_s32_m8n32k16, unsigned char, __CPUSIM_X16(unsigned char), __CPUSIM_X8(int));
 #undef __CPUSIM_X16
+// Sub-byte types: A's and B's 32 bits per lane by value/pointer, C's 2 elements.
+__device__ __attribute__((convergent, pure)) int __cpusim_mmav_s4_s32(int j, const unsigned* a, unsigned b, int c0, int c1);
+__device__ __attribute__((convergent, pure)) int __cpusim_mmav_u4_s32(int j, const unsigned* a, unsigned b, int c0, int c1);
+__device__ __attribute__((convergent, pure)) int __cpusim_mmav_b1xor_s32(int j, const unsigned* a, unsigned b, int c0,
+                                                                        int c1);
+__device__ __attribute__((convergent, pure)) int __cpusim_mmav_b1and_s32(int j, const unsigned* a, unsigned b, int c0,
+                                                                        int c1);
 __device__ __attribute__((convergent, pure)) double __cpusim_mmav_f64_f64(int j, const double* a, double b, double c0,
                                                                           double c1);
 #undef __CPUSIM_MMAV
@@ -69,6 +77,15 @@ enum layout_t { mem_row_major, mem_col_major };
 namespace precision {
 struct tf32 {};  // fp32 values used with a 10-bit mantissa; fragments hold floats
 }  // namespace precision
+namespace experimental {
+namespace precision {
+struct u4 {};  // 4-bit integers, 8 to a 32-bit word
+struct s4 {};
+struct b1 {};  // bits, 32 to a word
+}  // namespace precision
+enum bmmaBitOp { bmmaBitOpXOR = 1, bmmaBitOpAND = 2 };
+enum bmmaAccumulateOp { bmmaAccumulateOpPOPC = 1 };
+}  // namespace experimental
 
 namespace __cpusim {
 template <typename T>
@@ -163,6 +180,8 @@ __CPUSIM_FRAG(accumulator, 16, 16, 8, float)
 __CPUSIM_FRAG(matrix_a, 8, 8, 4, double)
 __CPUSIM_FRAG(matrix_b, 8, 8, 4, double)
 __CPUSIM_FRAG(accumulator, 8, 8, 4, double)
+__CPUSIM_FRAG(accumulator, 8, 8, 32, int)
+__CPUSIM_FRAG(accumulator, 8, 8, 128, int)
 #undef __CPUSIM_FRAG
 
 template <typename Use, int m, int n, int k, typename T, typename Layout>
@@ -300,6 +319,86 @@ __device__ __forceinline__ void mma_sync(fragment<accumulator, 8, 8, 4, double>&
     d.x[0] = r0;
     d.x[1] = r1;
     if (satf) __cpusim::saturate(d);
+}
+
+// Sub-byte types (experimental in CUDA too): A row-major, B column-major,
+// one 32-bit word per lane. Lane l holds word l % 4 of row (A) or column (B)
+// l / 4: rows and columns are 4 words, 32 values of 4 bits (8x8x32) or 128
+// bits (8x8x128). ldm counts elements (4-bit values or bits), as in CUDA.
+namespace __cpusim {
+template <typename T>
+struct subbyte;
+template <>
+struct subbyte<experimental::precision::s4> {
+    enum { k = 32, bits = 4 };
+};
+template <>
+struct subbyte<experimental::precision::u4> {
+    enum { k = 32, bits = 4 };
+};
+template <>
+struct subbyte<experimental::precision::b1> {
+    enum { k = 128, bits = 1 };
+};
+}  // namespace __cpusim
+#define __CPUSIM_SUBFRAG(USE, T, L)                                                            \
+    template <>                                                                                \
+    class fragment<USE, 8, 8, __cpusim::subbyte<T>::k, T, L> : public __frag_base<unsigned, 1> {};
+__CPUSIM_SUBFRAG(matrix_a, experimental::precision::s4, row_major)
+__CPUSIM_SUBFRAG(matrix_b, experimental::precision::s4, col_major)
+__CPUSIM_SUBFRAG(matrix_a, experimental::precision::u4, row_major)
+__CPUSIM_SUBFRAG(matrix_b, experimental::precision::u4, col_major)
+__CPUSIM_SUBFRAG(matrix_a, experimental::precision::b1, row_major)
+__CPUSIM_SUBFRAG(matrix_b, experimental::precision::b1, col_major)
+#undef __CPUSIM_SUBFRAG
+template <typename Use, typename T, typename L>
+__device__ __forceinline__ void load_matrix_sync(fragment<Use, 8, 8, __cpusim::subbyte<T>::k, T, L>& f, const void* p,
+                                                 unsigned ldm) {
+    const unsigned l = __cpusim_laneid();
+    f.x[0] = static_cast<const unsigned*>(p)[(l / 4) * (ldm * __cpusim::subbyte<T>::bits / 32) + l % 4];
+}
+template <typename T>
+__device__ __forceinline__ void fill_fragment(fragment<matrix_a, 8, 8, __cpusim::subbyte<T>::k, T, row_major>& f,
+                                              unsigned v) {
+    f.x[0] = v;
+}
+template <typename T>
+__device__ __forceinline__ void fill_fragment(fragment<matrix_b, 8, 8, __cpusim::subbyte<T>::k, T, col_major>& f,
+                                              unsigned v) {
+    f.x[0] = v;
+}
+__device__ __forceinline__ void mma_sync(fragment<accumulator, 8, 8, 32, int>& d,
+                                         const fragment<matrix_a, 8, 8, 32, experimental::precision::s4, row_major>& a,
+                                         const fragment<matrix_b, 8, 8, 32, experimental::precision::s4, col_major>& b,
+                                         const fragment<accumulator, 8, 8, 32, int>& c, bool satf = false) {
+    const int r0 = __cpusim_mmav_s4_s32(0, a.x, b.x[0], c.x[0], c.x[1]);
+    const int r1 = __cpusim_mmav_s4_s32(1, a.x, b.x[0], c.x[0], c.x[1]);
+    d.x[0] = r0, d.x[1] = r1;
+}
+__device__ __forceinline__ void mma_sync(fragment<accumulator, 8, 8, 32, int>& d,
+                                         const fragment<matrix_a, 8, 8, 32, experimental::precision::u4, row_major>& a,
+                                         const fragment<matrix_b, 8, 8, 32, experimental::precision::u4, col_major>& b,
+                                         const fragment<accumulator, 8, 8, 32, int>& c, bool satf = false) {
+    const int r0 = __cpusim_mmav_u4_s32(0, a.x, b.x[0], c.x[0], c.x[1]);
+    const int r1 = __cpusim_mmav_u4_s32(1, a.x, b.x[0], c.x[0], c.x[1]);
+    d.x[0] = r0, d.x[1] = r1;
+}
+// D = C + popc(A op B) per row of A and column of B.
+__device__ __forceinline__ void bmma_sync(fragment<accumulator, 8, 8, 128, int>& d,
+                                          const fragment<matrix_a, 8, 8, 128, experimental::precision::b1, row_major>& a,
+                                          const fragment<matrix_b, 8, 8, 128, experimental::precision::b1, col_major>& b,
+                                          const fragment<accumulator, 8, 8, 128, int>& c,
+                                          experimental::bmmaBitOp op = experimental::bmmaBitOpXOR,
+                                          experimental::bmmaAccumulateOp = experimental::bmmaAccumulateOpPOPC) {
+    int r0, r1;
+    if (op == experimental::bmmaBitOpAND) {
+        r0 = __cpusim_mmav_b1and_s32(0, a.x, b.x[0], c.x[0], c.x[1]);
+        r1 = __cpusim_mmav_b1and_s32(1, a.x, b.x[0], c.x[0], c.x[1]);
+    } else {
+        r0 = __cpusim_mmav_b1xor_s32(0, a.x, b.x[0], c.x[0], c.x[1]);
+        r1 = __cpusim_mmav_b1xor_s32(1, a.x, b.x[0], c.x[0], c.x[1]);
+    }
+    d.x[0] = r0, d.x[1] = r1;
 }
 
 #undef __CPUSIM_MMA

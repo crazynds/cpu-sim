@@ -138,11 +138,8 @@ def parse(argv):
 
 
 def run(cmd, o):
-    if o.verbose:
-        sys.stderr.write("+ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
-    r = subprocess.run(cmd)
-    if r.returncode != 0:
-        sys.exit(r.returncode)
+    if not run_quiet(cmd, o):
+        sys.exit(1)
 
 
 def build_fatbin(manifest_path, so_path, bc_path, out_path, specialized=()):
@@ -204,7 +201,10 @@ def run_quiet(cmd, o):
     """Like run(), but returns whether it worked instead of exiting."""
     if o.verbose:
         sys.stderr.write("+ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
-    return subprocess.run(cmd).returncode == 0
+    code = subprocess.run(cmd).returncode
+    if code < 0:  # killed by a signal: a crash says nothing by itself
+        sys.stderr.write("cucc: %s died (signal %d)\n" % (os.path.basename(cmd[0]), -code))
+    return code == 0
 
 
 def link_kernels(obj, so, o):

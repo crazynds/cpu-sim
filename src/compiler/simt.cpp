@@ -1824,6 +1824,8 @@ bool WarpBuilder::emit_mma(CallInst* call, Value* mask) {
 //         are cleared (the tensor core ignores them).
 //   f64 (8 x 8 x 4): one FMA of 8 doubles per (row, k), A broadcast from its
 //         fragment.
+//   s4, u4 (8 x 8 x 32): nibbles expanded to bytes, then as int8, with ymm.
+//   b1 (8 x 8 x 128): xor or and, then vpopcntd, per (row, word of k).
 Value* WarpBuilder::emit_mmav(CallInst* call) {
     std::vector<Value*> key{b_.GetInsertBlock()};
     for (unsigned i = 1; i < call->arg_size(); ++i) key.push_back(call->getArgOperand(i));
@@ -1860,7 +1862,11 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
     else if (kind.consume_back("_m8n32k16")) M = 8, N = 32;
     else if (kind == "tf32_f32") K = 8;
     else if (kind == "f64_f64") M = 8, N = 8, K = 4;
-    const unsigned nb = K * N / 32, nc = M * N / 32;  // elements of B and C per lane
+    // Sub-byte types: 8 x 8 x 32 (4 bits) or 8 x 8 x 128 (bits), one 32-bit
+    // word of A and of B per lane: word l % 4 of row (A) or column (B) l / 4.
+    const bool subbyte = kind == "s4_s32" || kind == "u4_s32" || kind.starts_with("b1");
+    if (subbyte) M = 8, N = 8, K = kind.starts_with("b1") ? 128 : 32;
+    const unsigned nb = subbyte ? 1 : K * N / 32, nc = M * N / 32;  // elements of B and C per lane
     if (call->arg_size() != 2 + nb + nc) return fail("tensor core call with the wrong arguments", call), nullptr;
     Value *bv[16], *c[8];
     for (unsigned e = 0; e < nb; ++e) bv[e] = vector(call->getArgOperand(2 + e));
@@ -1879,6 +1885,9 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
     auto a_at = [&](unsigned l0, unsigned r, unsigned k) {  // A's row r, column k: byte address
         const unsigned per = 32 / K;
         return b_.CreateConstInBoundsGEP1_64(i8, sa.base, ((r / per) * W + l0 + (r % per) * K + k) * ea);
+    };
+    auto a_word = [&](unsigned l0, unsigned i) {  // sub-byte types: A's word in lane l0 + i
+        return b_.CreateConstInBoundsGEP1_64(i8, sa.base, (l0 + i) * ea);
     };
     auto b_seg = [&](unsigned l0, unsigned k, unsigned s) {  // B's row k, segment s
         const unsigned per = 32 / N;
@@ -2021,6 +2030,83 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
                 for (unsigned r = 0; r < M; ++r)
                     acc[r][0] = b_.CreateCall(fma, {splat_load(f64, a_at(l0, r, k), 8), bk, acc[r][0]});
             }
+        } else if (kind == "s4_s32" || kind == "u4_s32") {
+            // Nibbles expanded to bytes once per mma, then vpdpbusd (ymm: the
+            // 8 columns of D) per (row, quad of k), as for int8. A goes on the
+            // unsigned side: u4 as it is, s4 xor 8 (= A + 8, 0..15); B on the
+            // signed side, s4 sign-extended. s4 then has 8 * (column sum of
+            // B) too many: one vector, the same for every row.
+            const bool sgn = kind == "s4_s32";
+            auto* v8i32 = FixedVectorType::get(i32, 8);
+            Function* dp = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_vpdpbusd_256);
+            // 4 nibbles (half h of each word) into the 4 bytes of a dword.
+            auto expand = [&](Value* words, unsigned h) {
+                auto* t = cast<FixedVectorType>(words->getType());
+                auto k = [&](uint32_t v) { return ConstantInt::get(t, v); };
+                Value* x = h ? b_.CreateLShr(words, k(16)) : words;
+                Value* r = b_.CreateAnd(x, k(0xf));
+                r = b_.CreateOr(r, b_.CreateShl(b_.CreateAnd(x, k(0xf0)), k(4)));
+                r = b_.CreateOr(r, b_.CreateShl(b_.CreateAnd(x, k(0xf00)), k(8)));
+                return b_.CreateOr(r, b_.CreateShl(b_.CreateAnd(x, k(0xf000)), k(12)));
+            };
+            auto pick = [&](Value* v, unsigned w) {  // word w of each of the 8 rows or columns
+                SmallVector<int, 8> idx;
+                for (unsigned n = 0; n < 8; ++n) idx.push_back(int(4 * n + w));
+                return b_.CreateShuffleVector(v, idx);
+            };
+            Value* bw = slice(bv[0], l0, 32);
+            Value* be[2] = {expand(bw, 0), expand(bw, 1)};
+            Value* bq[8];
+            for (unsigned q = 0; q < 8; ++q) {
+                bq[q] = pick(be[q % 2], q / 2);
+                if (sgn) {  // sign-extend each byte's nibble: (b ^ 8) - 8
+                    auto* v32i8 = FixedVectorType::get(i8, 32);
+                    Value* by = b_.CreateBitCast(bq[q], v32i8);
+                    by = b_.CreateSub(b_.CreateXor(by, ConstantInt::get(v32i8, 8)), ConstantInt::get(v32i8, 8));
+                    bq[q] = b_.CreateBitCast(by, v8i32);
+                }
+            }
+            // A, expanded, in the scratch area: row m, quad q at (8 m + q) * 4.
+            Value* aw = b_.CreateAlignedLoad(FixedVectorType::get(i32, 32), a_word(l0, 0), Align(4));
+            Value* ae[2] = {expand(aw, 0), expand(aw, 1)};
+            if (sgn)
+                for (Value*& v : ae) v = b_.CreateXor(v, ConstantInt::get(v->getType(), 0x08080808));
+            SmallVector<int, 64> inter;
+            for (unsigned m = 0; m < 8; ++m)
+                for (unsigned q = 0; q < 8; ++q) inter.push_back(int((q % 2) * 32 + 4 * m + q / 2));
+            Value* scratch = mma_scratch();
+            b_.CreateAlignedStore(b_.CreateShuffleVector(ae[0], ae[1], inter), scratch, Align(64));
+            if (sgn) {
+                Value* ones = ConstantInt::get(v8i32, 0x01010101);
+                Value* colsum = Constant::getNullValue(v8i32);
+                for (unsigned q = 0; q < 8; ++q) colsum = b_.CreateCall(dp, {colsum, ones, bq[q]});
+                for (unsigned r = 0; r < 8; ++r) acc[r][0] = b_.CreateSub(acc[r][0], b_.CreateShl(colsum, 3));
+            }
+            for (unsigned q = 0; q < 8; ++q)
+                for (unsigned r = 0; r < 8; ++r) {
+                    Value* quad = splat_load(i32, b_.CreateConstInBoundsGEP1_64(i8, scratch, (8 * r + q) * 4), 8);
+                    acc[r][0] = b_.CreateCall(dp, {acc[r][0], quad, bq[q]});
+                }
+        } else if (kind == "b1xor_s32" || kind == "b1and_s32") {
+            // D[m][n] = C + popcount(A row m op B column n), 128 bits: per
+            // row, 4 words of A broadcast against the 8 columns' word w, then
+            // vpopcntd (AVX512-VPOPCNTDQ).
+            const bool xor_op = kind == "b1xor_s32";
+            auto* v8i32 = FixedVectorType::get(i32, 8);
+            Function* popc = Intrinsic::getDeclaration(&m_, Intrinsic::ctpop, {v8i32});
+            Value* bw = slice(bv[0], l0, 32);
+            Value* bcol[4];
+            for (unsigned w = 0; w < 4; ++w) {
+                SmallVector<int, 8> idx;
+                for (unsigned n = 0; n < 8; ++n) idx.push_back(int(4 * n + w));
+                bcol[w] = b_.CreateShuffleVector(bw, idx);
+            }
+            for (unsigned r = 0; r < 8; ++r)
+                for (unsigned w = 0; w < 4; ++w) {
+                    Value* aword = splat_load(i32, a_word(l0, 4 * r + w), 8);
+                    Value* x = xor_op ? b_.CreateXor(aword, bcol[w]) : b_.CreateAnd(aword, bcol[w]);
+                    acc[r][0] = b_.CreateAdd(acc[r][0], b_.CreateCall(popc, {x}));
+                }
         } else {
             return fail("tensor core types not supported inline: " + types.str(), call), nullptr;
         }

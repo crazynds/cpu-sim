@@ -89,8 +89,10 @@ bool cpu_has_avx512() {
 TensorLevel tensor_level() {
     __builtin_cpu_init();
     TensorLevel level = TensorLevel::Fp16;
-    // vpdpbusd and the byte permutes (vpermb) of the int8 path.
-    if (__builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512vbmi")) {
+    // vpdpbusd and the byte permutes (vpermb) of the int8 path; vpopcntd for
+    // the 1-bit type, which compute capability 7.5 includes.
+    if (__builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512vbmi") &&
+        __builtin_cpu_supports("avx512vpopcntdq")) {
         level = TensorLevel::Int8;
         if (__builtin_cpu_supports("avx512bf16")) level = TensorLevel::Bf16;
     }
@@ -107,7 +109,7 @@ TensorLevel tensor_level() {
 const char* tensor_level_isa(TensorLevel level) {
     switch (level) {
         case TensorLevel::Bf16: return "AVX512-BF16 + AVX512-VNNI";
-        case TensorLevel::Int8: return "AVX512-VNNI";
+        case TensorLevel::Int8: return "AVX512-VNNI + AVX512-VBMI + AVX512-VPOPCNTDQ";
         default: return "F16C + FMA";
     }
 }
