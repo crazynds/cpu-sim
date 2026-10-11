@@ -164,7 +164,10 @@ void print_query(const DeviceStatus& st) {
         cpusim::TensorLevel level = cc >= 80 ? cpusim::TensorLevel::Bf16
                                     : cc >= 72 ? cpusim::TensorLevel::Int8
                                                : cpusim::TensorLevel::Fp16;
-        row(4, "Tensor Cores", fmt("%s (%s)", cc >= 80 ? "fp16, int8, bf16" : cc >= 72 ? "fp16, int8" : "fp16",
+        row(4, "Tensor Cores", fmt("%s (%s)",
+                                   cc >= 80   ? "fp16, int8, int4, b1, bf16, tf32, fp64"
+                                   : cc >= 72 ? "fp16, int8, int4, b1"
+                                              : "fp16",
                                    cpusim::tensor_level_isa(level)));
     }
     row(4, "Persistence Mode", "Enabled");

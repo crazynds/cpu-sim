@@ -4,7 +4,7 @@
 // multiplication goes (copies, packing, kernel) and the best of a few kernels.
 //
 //   build/cucc -O3 -std=c++20 bench/gemm_explore.cu -o gemm_explore
-//   CPUSIM_BACKEND=inprocess ./gemm_explore <step> [n]      (n: multiple of 1536)
+//   ./gemm_explore <step> [n]      (n: multiple of 1536; with the driver, cpusimd, running)
 //   ./gemm_explore list
 //
 // Steps (each includes the ones before it, except where noted):

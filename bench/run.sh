@@ -36,7 +36,7 @@ for n in $NAMES; do
     fi
     if [ "$WHICH" != gpu ]; then
         "$ROOT/build/cucc" -std=c++20 -fmad=false -I "$ROOT/samples/common" "$HERE/$n.cu" -o "$OUT/$n.cpu"
-        CPUSIM_BACKEND=${CPUSIM_BACKEND:-inprocess} "$OUT/$n.cpu" > "$OUT/$n.cpu.txt"
+        "$OUT/$n.cpu" > "$OUT/$n.cpu.txt"  # on the driver (cpusimd) when it is running
         sed -n 's/^BENCH /CPU /p' "$OUT/$n.cpu.txt"
         # Results must match the GPU's bit for bit.
         if [ -f "$OUT/$n.gpu.txt" ]; then

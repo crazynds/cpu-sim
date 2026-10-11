@@ -8,16 +8,34 @@
 build/cpu-smi -q | grep -iE 'compute|tensor'
 ```
 
-`CPUSIM_TENSOR` can only lower the level, to simulate an older device. With it, the kernels of the missing types must be refused:
+`CPUSIM_TENSOR` can only lower the level, to simulate an older device. It is read by the device, that is, by the driver: start one with it, and the kernels of the missing types must be refused:
 
 ```sh
 build/cucc -O3 -std=c++20 -I samples/common samples/tensor_gemm.cu -o build/bench/tensor_gemm
-CPUSIM_BACKEND=inprocess build/bench/tensor_gemm all 1024 2                    # every type the CPU supports
-CPUSIM_TENSOR=int8 CPUSIM_BACKEND=inprocess build/bench/tensor_gemm all 1024 2 # compute capability 7.5: no bf16
-CPUSIM_TENSOR=fp16 CPUSIM_BACKEND=inprocess build/bench/tensor_gemm all 1024 2 # compute capability 7.0: fp16 only
+build/bench/tensor_gemm all 1024 2                                  # every type the CPU supports
+build/cpusimd --stop && CPUSIM_TENSOR=int8 build/cpusimd --daemon
+build/bench/tensor_gemm all 1024 2                                  # compute capability 7.5: no bf16
+build/cpusimd --stop && CPUSIM_TENSOR=fp16 build/cpusimd --daemon
+build/bench/tensor_gemm all 1024 2                                  # compute capability 7.0: fp16 only
+build/cpusimd --stop && build/cpusimd --daemon                      # back to the full level
 ```
 
-(`CPUSIM_TENSOR` is read by the device, so these runs use the in-process backend; a running driver keeps its own level.) The sample checks the capability first, like a CUDA program would, and skips what is missing. The test `cuda_wmma` runs with both lowered levels and checks that the launch itself is refused.
+The sample checks the capability first, like a CUDA program would, and skips what is missing. The tests `cuda_wmma`, `cuda_wmma_shapes` and `cuda_wmma_subbyte` run with both lowered levels and check that the launch itself is refused.
+
+## Every tensor core operation: `bench/tensor_ops.cu`
+
+One program measures each operation: a GEMM of n x n through WMMA for every input type and shape (fp16 to fp32 and to fp16, bf16, tf32, fp64, int8, uint8, int4, uint4, and the 1-bit xor and and with popcount), one warp per tile of C. Built with `nvcc` it runs on the GPU, built with `cucc` on the simulator; `omp` runs, for each type, a C++ function with OpenMP that computes the same product from the same inputs with the same semantics, on the CPU without CUDA:
+
+```sh
+build/cucc -O3 -std=c++20 -fopenmp -Xcompiler -march=native bench/tensor_ops.cu -o build/bench/tensor_ops_cpu
+nvcc -O3 -std=c++20 -arch=native -Xcompiler -fopenmp,-march=native bench/tensor_ops.cu -o build/bench/tensor_ops_gpu
+build/bench/tensor_ops_gpu cuda      # the GPU's tensor cores
+build/bench/tensor_ops_cpu cuda      # the simulator (through the driver)
+build/bench/tensor_ops_cpu omp       # plain C++ with OpenMP
+build/bench/tensor_ops_cpu cuda 4096 # another size (a multiple of 128)
+```
+
+Each line gives the operation, the tile shape, the time of one GEMM (best of 3 after a warm-up), the rate in T(FL)OPS (2n^3 operations), and a check against an exact reference on 16 rows. Types the device's compute capability lacks are skipped. Compare the three runs per operation; compare also `cuda` with `./peak` (tutorial 2) for the types it covers: this GEMM loads every fragment from memory, so it measures the tensor path together with the loads that feed it.
 
 ## Tensor core throughput
 
