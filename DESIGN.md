@@ -1,347 +1,372 @@
 # CudaSimulator: design
 
-Documento de design consolidado a partir da fase de planejamento (2026-10-08). Serve de ponto de partida para quem continuar a implementação: o que já foi decidido, por quê, e em que ordem construir.
+Design document consolidated from the planning phase (2026-10-08). It serves as a starting point for whoever continues the implementation: what has already been decided, why, and in what order to build.
 
-Ainda não há nome para o projeto nem para as ferramentas. Nomes usados aqui (`cpusim`, `cpu-smi`) são provisórios.
-
----
-
-## 1. Objetivo
-
-Pegar um programa CUDA que funciona numa GPU NVIDIA e, **sem alterar o código-fonte**, compilá-lo para rodar na CPU, com cada warp executado nas lanes de registradores AVX-512.
-
-- **Compilação AOT**, não interpretação. O kernel escrito "por thread" vira código nativo que executa um warp inteiro em SIMD. Escalonamento, barreiras e controle de blocos ficam no código gerado mais um runtime nosso.
-- **Driver residente**, que se comporta como o driver da NVIDIA: reserva cores e memória ("VRAM"), recebe módulos de kernel, parâmetros e launches.
-- **Nada da NVIDIA é usado nem distribuído**: headers CUDA, runtime e driver são nossos. A versão de CUDA simulada é a **13**.
-- **AVX-512 é obrigatório.** Sem fallback por enquanto, mas o código deve detectar a ausência e emitir uma mensagem clara.
-
-Primeiro marco: uma **prova de conceito básica que funcione de ponta a ponta** (seção 9).
+There is not yet a name for the project or for the tools. Names used here (`cpusim`, `cpu-smi`) are provisional.
 
 ---
 
-## 2. Estado atual
+## 1. Goal
 
-- `samples/`: 10 programas CUDA autovalidados (veja `samples/README.md`). Rodam na GPU real e comparam com referência em CPU. **Todos passam na RTX 5060.** Eles são a suíte de testes diferenciais: a saída do nosso compilador precisa continuar imprimindo `PASS`.
-- Nada do simulador foi implementado ainda.
+Take a CUDA program that works on an NVIDIA GPU and, **without changing the source code**, compile it to run on the CPU, with each warp executed on AVX-512 register lanes.
 
-### Ambiente da máquina de desenvolvimento
+- **AOT compilation**, not interpretation. The kernel written "per thread" becomes native code that executes a whole warp in SIMD. Scheduling, barriers and block control stay in the generated code plus a runtime of our own.
+- **Resident driver**, which behaves like the NVIDIA driver: it reserves cores and memory ("VRAM"), and receives kernel modules, parameters and launches.
+- **Nothing from NVIDIA is used or distributed**: CUDA headers, runtime and driver are ours. The simulated CUDA version is **13**.
+- **AVX-512 is mandatory.** No fallback for now, but the code must detect its absence and emit a clear message.
 
-| Item | Valor |
+First milestone: a **basic proof of concept that works end to end** (section 9).
+
+---
+
+## 2. Current state
+
+Updated on 2026-10-08 (see also `README.md`):
+
+- **Base driver done** (step 1 of section 8): `cpusimd`, `cpu-smi`, daemon and in-process backends, VRAM with allocator and per-process contexts, memcpy via `process_vm_readv/writev`, modules via memfd + `dlopen`, launch.
+- **Proof of concept reached**: `samples/matmul_naive.cu` (`matmul` with only the naive kernel), unmodified, compiled by `cucc` and executed on both backends prints `PASS`, with a bit-for-bit error equal to that of the RTX 5060 (3.24e-05 with `-fmad=false`). Time: 2.0 ms against the GPU's 0.244 ms (118 GFLOP/s on 28 threads).
+- **Profiling** (user request): the compiler generates a second version of each kernel that counts operations per basic block; `CPUSIM_PROFILE=1` enables it (section 6.7).
+- How the compiler is today (it differs slightly from section 5, which remains the target):
+  - Clang generates per-thread IR for NVPTX (`-O2 -Xclang -disable-llvm-passes`), and `cpusim-devc` switches the target to x86-64;
+  - the uniformity analysis is ours (sources: `threadIdx`, lane id, allocas, loads through a varying pointer; joins of divergent branches; divergent loop exits);
+  - values that cross blocks are demoted to slots, the CFG is linearized with one mask per block (blocks with an empty mask are skipped) and a write to a slot under a partial mask becomes a blend;
+  - loads/stores through a varying pointer: address decomposed into uniform base + varying offset, and a test per half-warp chooses between a masked contiguous load, a broadcast or a gather. The test depends only on the offset, so it leaves the loops;
+  - a kernel with something not yet supported (`__syncthreads`, atomics, local arrays...) is a compile error.
+- **Barriers and shared memory** (2026-10-08): each `__syncthreads` becomes its own block; the warp saves slots and masks in its frame (`ctx->frame`) and returns `BARRIER`; on return a dispatcher restores them and jumps to after the barrier. The executor runs all the warps of the block up to the barrier, in rounds. `__shared__` becomes a uniform base (`ctx->shared`) + offset; the static size and the frame size go in `__cpusim_meta_<kernel>`. The 6 POC samples pass on both backends.
+- **Debug mode** (`CPUSIM_DEBUG`, per launch, requested by the program): step by step with guard pages; it is what found the first barrier bug (a frame smaller than the one used by one of the variants).
+- Samples still without support: `nbody` (`rsqrtf`), `reduction` and `spmv` (`__shfl_down_sync`, atomics), `histogram` (atomics).
+- **Optimization (night of 2026-10-08)**, measured with `bench/` (kernels only, hash compared with the GPU):
+  - JIT at launch: the fatbin carries the per-thread bitcode; at the first launch of each `blockDim` the runtime recompiles specialized (threadIdx constant or constant + uniform), with a disk cache. It was the largest gain.
+  - Width variants (32; 64/128 without a barrier; whole block 64..512 and "suspended" 64s/128s with a barrier) chosen at run time by measurement; block order in bands (swizzle) for cache reuse.
+  - Compiler: SIMT if-conversion with guarded loads, uniform loops with real control flow (including with a barrier), rematerialization of invariants, per-thread liveness at barriers, per-warp invariant cache in the frame, access-pattern tests in integer registers and per whole access, address decomposition into uniform base + varying offset (including `or disjoint`, `mul`/`shl` by a uniform).
+  - Result (RTX 5060 / CPU): matmul naive 163 / 224 ms; tiled 126 / 304 ms; mandelbrot 95 / 715 ms; transpose 15 and 11 / 142 and 135 ms; heat_step 1.8 / 15.6 ms; scan_blocks 20.6 / 399 ms; bitonic 26 / 709 ms.
+  - The laptop varies its clock with temperature: compare variants only in interleaved pairs in the same process.
+- Sample workloads increased (user request) so that the kernels last at least 100 ms on the RTX 5060 when the kernel is compute-bound; the memory-bound ones do not reach 100 ms within 8 GB and use the largest reasonable size.
+
+### Development machine environment
+
+| Item | Value |
 |---|---|
 | CPU | AMD Ryzen 9 8940HX (Zen 4), 16 cores / 32 threads, 2 CCDs |
-| AVX-512 | F, DQ, BW, VL, CD, VNNI, BF16, IFMA, VBMI, VBMI2, BITALG, VPOPCNTDQ. **Sem FP16.** Unidades de 256 bits ("double-pumped") |
+| AVX-512 | F, DQ, BW, VL, CD, VNNI, BF16, IFMA, VBMI, VBMI2, BITALG, VPOPCNTDQ. **No FP16.** 256-bit units ("double-pumped") |
 | Caches | L1d 32 KB/core, L2 1 MB/core, L3 2 x 32 MB |
-| GPU de referência | NVIDIA GeForce RTX 5060 Laptop (compute capability 12.0) |
-| CUDA SDK | 13.0 em `/usr/local/cuda-13.0` (usado **só** para rodar os samples na GPU real) |
-| Toolchain | GCC 13.3, CMake 3.28. **Clang e LLVM ainda não instalados** (precisam de `apt install clang llvm-dev`, com sudo) |
+| Reference GPU | NVIDIA GeForce RTX 5060 Laptop (compute capability 12.0) |
+| CUDA SDK | 13.0 at `/usr/local/cuda-13.0` (used **only** to run the samples on the real GPU) |
+| Toolchain | GCC 13.3, CMake 3.28. **Clang and LLVM not yet installed** (need `apt install clang llvm-dev`, with sudo) |
 
 ---
 
-## 3. Visão geral
+## 3. Overview
 
 ```text
-                 programa.cu (sem alterações)
+                 program.cu (unmodified)
                           │
                 ┌─────────┴──────────┐
-                │ nosso compilador   │  Clang (só como parser de C++)
-                │                    │  + headers CUDA 13 nossos
+                │ our compiler       │  Clang (only as a C++ parser)
+                │                    │  + our CUDA 13 headers
                 └─────────┬──────────┘
-          host code       │        device code (IR por thread)
+          host code       │        device code (per-thread IR)
               │           │              │
-              │           │     nossos passes LLVM: vetorização SIMT,
-              │           │     máscaras, barreiras, memória
+              │           │     our LLVM passes: SIMT vectorization,
+              │           │     masks, barriers, memory
               │           │              │
               ▼           │              ▼
-      binário da app ◄────┴──── "fatbin": .so nativo + bitcode por thread
+      app binary     ◄────┴──── "fatbin": native .so + per-thread bitcode
               │
-              │ linka com nosso libcudart
+              │ links with our libcudart
               ▼
-     ┌──────────────────────── interface de device ───────────────────────┐
-     │  backend "dentro do processo"   │   backend "daemon" (driver)      │
-     │  pool de workers local          │   socket + memória do driver     │
+     ┌──────────────────────── device interface ──────────────────────────┐
+     │  "in-process" backend           │   "daemon" backend (driver)      │
+     │  local worker pool              │   socket + driver memory         │
      └─────────────────────────────────┴──────────────────────────────────┘
                                          │
-                                  cpu-smi (futuro)
+                                  cpu-smi (future)
 ```
 
 ---
 
-## 4. Modelo de execução
+## 4. Execution model
 
 ### 4.1 Warp
 
-- **Warp = 32 threads semanticamente** (`warpSize == 32`). Muito código real assume isso.
-- Fisicamente: **2 registradores zmm por valor** (2 x 16 lanes de 32 bits) e máscara `__mmask32`. O compilador gera IR com `<32 x T>` / `<32 x i1>` e o backend do LLVM legaliza.
-- O warp anda em lockstep. Não há *independent thread scheduling* (Volta+): código que depende de lanes do mesmo warp progredirem independentemente (spinlock entre lanes) não é suportado. Limitação documentada.
+- **Warp = 32 threads semantically** (`warpSize == 32`). A lot of real code assumes this.
+- Physically: **2 zmm registers per value** (2 x 16 lanes of 32 bits) and a `__mmask32` mask. The compiler generates IR with `<32 x T>` / `<32 x i1>` and the LLVM backend legalizes it.
+- The warp advances in lockstep. There is no *independent thread scheduling* (Volta+): code that depends on lanes of the same warp making progress independently (a spinlock among lanes) is not supported. Documented limitation.
 
-### 4.2 Pares de warps (K) e SMT
+### 4.2 Warp pairs (K) and SMT
 
-- Cada thread de hardware executa **um par de warps intercalados (K=2)** para preencher a pipeline (no Zen 4, ~1,5 warps de operações independentes saturam as unidades de FP). K=2 também deixa o caminho aberto para emular wave64 da AMD (mesmo layout físico, semântica diferente nos intrínsecos de warp).
-- **Na POC usar K=1.** K=2 entra como otimização logo depois.
-- A ideia de dividir os 32 zmm em 2 bancos de software com "troca rápida" foi descartada: o SMT faz isso em hardware, com o arquivo de registradores completo para cada thread.
+- Each hardware thread executes **a pair of interleaved warps (K=2)** to fill the pipeline (on Zen 4, ~1.5 warps of independent operations saturate the FP units). K=2 also leaves the path open to emulate AMD's wave64 (same physical layout, different semantics in the warp intrinsics).
+- **In the POC use K=1.** K=2 comes in as an optimization soon after.
+- The idea of splitting the 32 zmm into 2 software banks with a "fast switch" was discarded: SMT does that in hardware, with the full register file for each thread.
 
-### 4.3 Blocos e cores
+### 4.3 Blocks and cores
 
-- **Um bloco por core físico.** As **duas threads SMT do core** executam pares de warps **do mesmo bloco**.
-- Shared memory e frames dos warps ficam num buffer local do bloco (quente no L1/L2 do core).
-- Distribuição de blocos entre cores: contador atômico global de `blockIdx` (um `fetch_add` por bloco).
-- Escalonamento dentro do bloco:
+- **One block per physical core.** The core's **two SMT threads** execute warp pairs **of the same block**.
+- Shared memory and the warps' frames live in a block-local buffer (hot in the core's L1/L2).
+- Distribution of blocks among cores: a global atomic `blockIdx` counter (one `fetch_add` per block).
+- Scheduling within the block:
   ```text
-  par = next_pair[fase].fetch_add(1)
-  se par < num_pares: executa o par até barreira ou fim
-  senão: espera na barreira de 2 participantes
+  pair = next_pair[phase].fetch_add(1)
+  if pair < num_pairs: execute the pair up to a barrier or the end
+  else: wait at the 2-participant barrier
   ```
-  O contador só cresce, então não há estado "em execução". O reset entre fases usa *sense reversal* ou contadores alternados por fase.
-- **Quem espera na barreira não pode girar livre**: rouba ciclos da thread irmã, que está terminando o último par. Usar `pause` no mínimo; o ideal é `MONITORX/MWAITX` (modo usuário na AMD).
-- **Blocos pequenos** (menos de 2 pares): um bloco por thread HW em vez de um por core.
-- Fixar as threads nos irmãos SMT lendo `/sys/devices/system/cpu/cpu*/topology/thread_siblings_list` (não assumir numeração).
-- Sem escalonamento ciente de CCD (decidido).
+  The counter only grows, so there is no "in execution" state. The reset between phases uses *sense reversal* or counters alternated per phase.
+- **Whoever waits at the barrier must not spin freely**: it steals cycles from the sibling thread, which is finishing the last pair. Use `pause` at a minimum; the ideal is `MONITORX/MWAITX` (user mode on AMD).
+- **Small blocks** (fewer than 2 pairs): one block per HW thread instead of one per core.
+- Pin the threads to SMT siblings by reading `/sys/devices/system/cpu/cpu*/topology/thread_siblings_list` (do not assume numbering).
+- No CCD-aware scheduling (decided).
 
-### 4.4 Barreiras (`__syncthreads`)
+### 4.4 Barriers (`__syncthreads`)
 
-- O kernel vira uma **máquina de estados**: cada trecho entre barreiras é um estado. Barreira dentro de loop funciona naturalmente (o loop volta a um estado anterior).
-- Na barreira o par **salva apenas os valores vivos** num frame por warp (no buffer do bloco) e devolve o controle ao escalonador.
-- Warps que terminaram (`return`) são marcados `done`, não contam para a barreira (semântica CUDA) e não são mais escalonados. Par com um warp `done` executa com a máscara dele zerada.
-- Os dois warps de um par sempre estão no mesmo estado (saem e chegam às mesmas barreiras).
+- The kernel becomes a **state machine**: each stretch between barriers is a state. A barrier inside a loop works naturally (the loop returns to an earlier state).
+- At the barrier the pair **saves only the live values** in a per-warp frame (in the block's buffer) and returns control to the scheduler.
+- Warps that finished (`return`) are marked `done`, do not count toward the barrier (CUDA semantics) and are no longer scheduled. A pair with a `done` warp executes with its mask zeroed.
+- The two warps of a pair are always in the same state (they leave and arrive at the same barriers).
 
-### 4.5 Divergência
+### 4.5 Divergence
 
-- `if` divergente: executa os dois lados com máscara (linearização). **Atalho de branch uniforme obrigatório**: se a máscara de um lado é toda zero, pula o bloco inteiro.
-- Loops divergentes: rodam enquanto houver lane ativa; a máscara perde lanes conforme saem.
-- Máscara efetiva de cada instrução = máscara ativa do warp, combinada com predicados.
-- Semântica padrão de escrita: **merge masking** (lane inativa preserva o valor). Zero masking só onde fizer sentido.
+- Divergent `if`: executes both sides with a mask (linearization). **Uniform-branch shortcut is mandatory**: if one side's mask is all zero, skip the whole block.
+- Divergent loops: run while there is an active lane; the mask loses lanes as they exit.
+- Effective mask of each instruction = the warp's active mask, combined with predicates.
+- Default write semantics: **merge masking** (an inactive lane preserves its value). Zero masking only where it makes sense.
 
-### 4.6 Futuro (fora da POC)
+### 4.6 Future (outside the POC)
 
-- **Memory yield**: em cadeias de loads dependentes (perseguição de ponteiros), emitir prefetch e passar a vez para outro par. Mesma máquina de estados das barreiras. Desligado por padrão; só vale onde medirmos ganho.
-- Coarsening/intercalação além de K=2, se medições mostrarem ganho.
+- **Memory yield**: in chains of dependent loads (pointer chasing), emit a prefetch and hand the turn to another pair. Same state machine as the barriers. Off by default; only worth it where we measure a gain.
+- Coarsening/interleaving beyond K=2, if measurements show a gain.
 
 ---
 
-## 5. Compilador
+## 5. Compiler
 
-### 5.1 Frontend
+### 5.1 Front end
 
-- **Clang como parser de C++**, em modo CUDA, com `-nocudainc -nocudalib`. Um `.cu` é C++ completo (templates, `constexpr`, biblioteca padrão no host): um parser próprio está fora de questão.
-- **Headers CUDA nossos** (`cuda_runtime.h`, `vector_types.h`, funções matemáticas, intrínsecos de warp, `CUDART_VERSION 13000`). A versão de CUDA simulada é a que esses headers declaram; o suporte do Clang ao SDK da NVIDIA deixa de importar.
-- Host: `<<<>>>` vira chamadas de launch que o nosso `libcudart` implementa; registro de kernels via o mecanismo que o Clang emite.
-- Device: IR LLVM **por thread**, com `threadIdx` etc. como intrínsecos. Fazemos o retarget para x86-64 (address spaces global/shared/constant/local).
+- **Clang as a C++ parser**, in CUDA mode, with `-nocudainc -nocudalib`. A `.cu` is full C++ (templates, `constexpr`, the standard library on the host): a parser of our own is out of the question.
+- **Our own CUDA headers** (`cuda_runtime.h`, `vector_types.h`, math functions, warp intrinsics, `CUDART_VERSION 13000`). The simulated CUDA version is the one these headers declare; Clang's support for the NVIDIA SDK ceases to matter.
+- Host: `<<<>>>` becomes launch calls that our `libcudart` implements; kernel registration through the mechanism Clang emits.
+- Device: LLVM IR **per thread**, with `threadIdx` etc. as intrinsics. We retarget to x86-64 (global/shared/constant/local address spaces).
 
-### 5.2 Pipeline de passes (nossos)
+### 5.2 Pass pipeline (ours)
 
-1. **Classificação de valores** (seção 5.3)
-2. **Linearização do CFG** com máscaras + atalho de branch uniforme
-3. **Alargamento** para `<32 x T>` (warp)
-4. **Memória**: escolhe load/store contíguo, strided ou gather/scatter
-5. **Máquina de estados** nas barreiras (frames com valores vivos)
-6. (depois) Intercalação K=2, memory yield
-7. O3 padrão + codegen `-mcpu=znver4`
+1. **Value classification** (section 5.3)
+2. **CFG linearization** with masks + uniform-branch shortcut
+3. **Widening** to `<32 x T>` (warp)
+4. **Memory**: chooses contiguous, strided or gather/scatter load/store
+5. **State machine** at barriers (frames with live values)
+6. (later) K=2 interleaving, memory yield
+7. Standard O3 + `-mcpu=znver4` codegen
 
-Não depender do autovetorizador do LLVM: ele não vetoriza uma função de kernel inteira. O IR gerado é explícito (`llvm.masked.load/store/gather/scatter`, intrínsecos `llvm.x86.avx512.*` onde for preciso controle exato). Alocação de registradores e scheduling ficam com o LLVM. Usar `llvm-mca` e inspeção de assembly para conferir.
+Do not depend on LLVM's auto-vectorizer: it does not vectorize a whole kernel function. The generated IR is explicit (`llvm.masked.load/store/gather/scatter`, `llvm.x86.avx512.*` intrinsics where exact control is needed). Register allocation and scheduling are left to LLVM. Use `llvm-mca` and assembly inspection to check.
 
-Referências do mesmo tipo de transformação: ISPC (SPMD em SIMD), Region Vectorizer / Whole-Function Vectorization (Moll, Hack, Karrenberg).
+References for the same kind of transformation: ISPC (SPMD on SIMD), Region Vectorizer / Whole-Function Vectorization (Moll, Hack, Karrenberg).
 
-### 5.3 Classificação de valores
+### 5.3 Value classification
 
-| Classe | Exemplo | Onde fica |
+| Class | Example | Where it lives |
 |---|---|---|
-| Constante | `2.0f`, `TILE` | imediato |
-| Uniforme | `blockIdx.x`, ponteiros de parâmetro, contador de loop uniforme | registrador escalar (GPR) ou broadcast |
-| Afim | `blockIdx.x*blockDim.x + threadIdx.x` | `base uniforme + stride * lane` |
-| Variável | `indices[i]`, `x * y` com `x` variável | zmm |
+| Constant | `2.0f`, `TILE` | immediate |
+| Uniform | `blockIdx.x`, parameter pointers, uniform loop counter | scalar register (GPR) or broadcast |
+| Affine | `blockIdx.x*blockDim.x + threadIdx.x` | `uniform base + stride * lane` |
+| Varying | `indices[i]`, `x * y` with varying `x` | zmm |
 
-A classe afim decide o acesso à memória: stride 1 = load/store contíguo mascarado; stride constante = load + permute ou gather; variável = gather/scatter. "Uniforme" existe em níveis (grid, bloco, warp); para gerar código importa o nível warp.
+The affine class decides the memory access: stride 1 = masked contiguous load/store; constant stride = load + permute or gather; varying = gather/scatter. "Uniform" exists at levels (grid, block, warp); for code generation the warp level matters.
 
-### 5.4 Memória
+### 5.4 Memory
 
-- Gather/scatter AVX-512 usam índices int32 + base escalar. Ponteiro por lane de 64 bits exigiria `i64gather` (8 lanes por instrução, 4 por warp): **reconhecer "base uniforme + offset int32"** é otimização obrigatória.
-- Gather/scatter mascarados não acessam lanes inativas (sem fault).
-- Conflito em scatter (duas lanes no mesmo endereço): AVX-512 escreve em ordem crescente de lane (a maior vence). Em CUDA é indefinido, então qualquer ordem é válida.
-- Gather é lento no Zen 4 e scatter mais ainda. Contíguo sempre que possível.
-- Não existe gather de byte: loads de `uint8_t` variáveis viram gather de dword + extração.
+- AVX-512 gather/scatter use int32 indices + a scalar base. A 64-bit per-lane pointer would require `i64gather` (8 lanes per instruction, 4 per warp): **recognizing "uniform base + int32 offset"** is a mandatory optimization.
+- Masked gather/scatter do not access inactive lanes (no fault).
+- Conflict in a scatter (two lanes at the same address): AVX-512 writes in increasing lane order (the highest wins). In CUDA it is undefined, so any order is valid.
+- Gather is slow on Zen 4 and scatter even more so. Contiguous whenever possible.
+- There is no byte gather: loads of varying `uint8_t` become a dword gather + extraction.
 
-### 5.5 Arrays locais por thread
+### 5.5 Per-thread local arrays
 
-Arrays privados de cada thread (`float acc[4]`) ficam na pilha do warp em **layout SoA** (`acc[i][lane]`), como a *local memory* da NVIDIA (intercalada por thread). Índice uniforme = load contíguo; índice variável = gather dentro desse layout. É uma decisão interna, invisível ao usuário.
+Private arrays of each thread (`float acc[4]`) live on the warp's stack in **SoA layout** (`acc[i][lane]`), like NVIDIA's *local memory* (interleaved per thread). Uniform index = contiguous load; varying index = gather within that layout. It is an internal decision, invisible to the user.
 
-### 5.6 Funções, ponto flutuante e matemática
+### 5.6 Functions, floating point and math
 
-- **Funções de device: inline de tudo** no começo. Depois, versões vetorizadas com a máscara como parâmetro. Recursão e ponteiros de função: muito depois.
-- **Ponto flutuante**: padrão igual ao nvcc (**FMA ligado**; o Zen 4 tem FMA), com flag equivalente a `-fmad=false`. Meta: dentro do ULP documentado pela NVIDIA, não bit a bit idêntico. Os samples usam `-fmad=false` para comparação exata.
-- **Biblioteca matemática vetorial própria** (sem SLEEF), escrita em IR/intrínsecos para ser inlined no kernel (não `.s` separado, que exigiria convenção de chamada e salvar zmm). Validar contra a RTX 5060.
-- `half`/`bf16` e qualquer tipo sem suporte nativo: emular (converter para float). Fica para depois.
+- **Device functions: inline everything** at first. Later, vectorized versions with the mask as a parameter. Recursion and function pointers: much later.
+- **Floating point**: default equal to nvcc (**FMA on**; Zen 4 has FMA), with a flag equivalent to `-fmad=false`. Goal: within the ULP documented by NVIDIA, not bit-for-bit identical. The samples use `-fmad=false` for exact comparison.
+- **Own vector math library** (without SLEEF), written in IR/intrinsics to be inlined into the kernel (not a separate `.s`, which would require a calling convention and saving zmm). Validate against the RTX 5060.
+- `half`/`bf16` and any type without native support: emulate (convert to float). Left for later.
 
-### 5.7 Intrínsecos de warp
+### 5.7 Warp intrinsics
 
-Primeiro: `__shfl_sync` e variantes (permutes entre as 2 metades, `vpermt2ps`), `__ballot_sync` (a própria máscara), `__any_sync`/`__all_sync`, `__activemask`, `__popc`, `__clz`, `__syncwarp` (no-op). `__match_any_sync` via `vpconflictd`. **Cooperative groups por último.**
+First: `__shfl_sync` and variants (permutes between the 2 halves, `vpermt2ps`), `__ballot_sync` (the mask itself), `__any_sync`/`__all_sync`, `__activemask`, `__popc`, `__clz`, `__syncwarp` (no-op). `__match_any_sync` via `vpconflictd`. **Cooperative groups last.**
 
-### 5.8 Atômicas
+### 5.8 Atomics
 
-- **Padrão / fallback**: loop escalar só sobre as lanes ativas (`tzcnt` + `blsr` na máscara), um `lock` por lane:
+- **Default / fallback**: a scalar loop only over the active lanes (`tzcnt` + `blsr` on the mask), one `lock` per lane:
 
   | CUDA | x86 |
   |---|---|
-  | `atomicAdd` int, resultado ignorado | `lock add` |
-  | `atomicAdd` int, resultado usado | `lock xadd` |
-  | `atomicAdd` float/double | loop `lock cmpxchg` |
+  | `atomicAdd` int, result ignored | `lock add` |
+  | `atomicAdd` int, result used | `lock xadd` |
+  | `atomicAdd` float/double | `lock cmpxchg` loop |
   | `atomicCAS` | `lock cmpxchg` |
   | `atomicExch` | `xchg` |
-  | `atomicAnd/Or/Xor` sem resultado | `lock and/or/xor` |
-  | com resultado, `atomicMin/Max` | loop `lock cmpxchg` |
+  | `atomicAnd/Or/Xor` without result | `lock and/or/xor` |
+  | with result, `atomicMin/Max` | `lock cmpxchg` loop |
 
-- **Otimização planejada**: endereço uniforme (global ou shared) = redução no SIMD + **um** `lock xadd` + soma de prefixo exclusiva para os valores de retorno.
-- **Shared memory também precisa de `lock`**: as duas threads SMT executam warps do mesmo bloco ao mesmo tempo. Sem `lock` só quando o bloco roda numa única thread HW (blocos pequenos); o compilador pode gerar as duas variantes e o runtime escolhe no launch.
-- `vpconflictd` para casos tipo histograma, só se medirmos ganho.
-- As atômicas de CUDA são *relaxed*; o `lock` do x86 é mais forte, o que é correto.
+- **Planned optimization**: uniform address (global or shared) = SIMD reduction + **one** `lock xadd` + exclusive prefix sum for the return values.
+- **Shared memory also needs `lock`**: the two SMT threads execute warps of the same block at the same time. No `lock` only when the block runs on a single HW thread (small blocks); the compiler may generate both variants and the runtime chooses at launch.
+- `vpconflictd` for histogram-like cases, only if we measure a gain.
+- CUDA atomics are *relaxed*; x86's `lock` is stronger, which is correct.
 
-### 5.9 Ordem de memória
+### 5.9 Memory ordering
 
-x86 é TSO. O compilador não pode reordenar acessos através de barreiras e de `__threadfence`; `volatile` respeitado.
+x86 is TSO. The compiler must not reorder accesses across barriers and `__threadfence`; `volatile` is respected.
 
-### 5.10 `printf` e `assert` no device
+### 5.10 `printf` and `assert` on the device
 
-Prioridade alta (sem isso fica difícil depurar o simulador). Buffer por bloco, descarregado no `cudaDeviceSynchronize`, como na GPU.
+High priority (without them it is hard to debug the simulator). Per-block buffer, flushed at `cudaDeviceSynchronize`, as on the GPU.
 
-### 5.11 Recursos não suportados
+### 5.11 Unsupported features
 
-Sempre **erro de compilação**, nunca resultado errado em silêncio. Isso inclui recursos do sm_120 que reportarmos (seção 6.6) mas não suportarmos.
+Always a **compile error**, never a silently wrong result. This includes sm_120 features that we report (section 6.6) but do not support.
 
 ---
 
-## 6. Driver e runtime
+## 6. Driver and runtime
 
-### 6.1 Dois backends, uma interface
+### 6.1 Two backends, one interface
 
-Uma **interface de device** (estilo CUDA driver API) com duas implementações, **construídas e testadas juntas**:
+A **device interface** (CUDA driver API style) with two implementations, **built and tested together**:
 
-- **Dentro do processo**: workers no próprio processo da aplicação.
-- **Daemon**: processo residente que reserva cores e VRAM; a aplicação fala com ele.
+- **In-process**: workers in the application's own process.
+- **Daemon**: resident process that reserves cores and VRAM; the application talks to it.
 
-Operações mínimas da interface: abrir device / consultar propriedades, alocar e liberar, memcpy (H2D, D2H, D2D), memset, carregar módulo, lançar kernel, sincronizar, consultar erro.
+Minimum operations of the interface: open device / query properties, allocate and free, memcpy (H2D, D2H, D2D), memset, load module, launch kernel, synchronize, query error.
 
-Todo teste roda nos dois backends. Se passa num e falha no outro, o problema está no transporte, não no compilador.
+Every test runs on both backends. If it passes on one and fails on the other, the problem is in the transport, not in the compiler.
 
 ### 6.2 VRAM
 
-- **Exclusiva do driver** (decidido): ponteiros de device só valem dentro do driver, como numa GPU dedicada sem memória unificada. Todo dado passa por `cudaMemcpy`.
-- **Alocador com pools**, preparado para depois:
+- **Exclusive to the driver** (decided): device pointers are only valid inside the driver, as on a dedicated GPU without unified memory. All data goes through `cudaMemcpy`.
+- **Allocator with pools**, prepared for later:
   ```text
   Device
-  ├── pool "private"  (vram_private)  só mapeado no driver       ← POC
-  └── pool "shared"   (vram_shared)   memfd no MESMO endereço     ← futuro
-                                      virtual no driver e no cliente
+  ├── pool "private"  (vram_private)  mapped only in the driver  ← POC
+  └── pool "shared"   (vram_shared)   memfd at the SAME virtual   ← future
+                                      address in driver and client
   ```
-- Backing com hugepages (2 MB ou 1 GB; ajuda o TLB nos gathers). `MFD_HUGETLB` exige `vm.nr_hugepages`; alternativa THP com `madvise`.
+- Backing with hugepages (2 MB or 1 GB; helps the TLB on gathers). `MFD_HUGETLB` requires `vm.nr_hugepages`; alternative is THP with `madvise`.
 
-### 6.3 Transporte (daemon)
+### 6.3 Transport (daemon)
 
-- **Controle**: socket Unix (`SOCK_SEQPACKET`) para requisições. Descritores (módulos, memfd) passam por `SCM_RIGHTS`. Depois: anel em memória compartilhada para launch de baixa latência.
-- **memcpy**: o driver usa `process_vm_readv/writev` direto na memória do cliente (uma cópia, papel do DMA). O Ubuntu usa `ptrace_scope=1`, então o cliente chama `prctl(PR_SET_PTRACER, pid_do_driver)` na inicialização. **Fallback**: anel de staging em memória compartilhada (duas cópias).
-- Depois: threads de cópia dedicadas no driver (*copy engines*) para `cudaMemcpyAsync` sobrepor cópia e kernel.
-- **Um driver por usuário**: o driver executa código enviado pelo cliente.
-- Kernel com acesso inválido pode derrubar o driver (não há validação barata por gather). Tratar o sinal como erro tipo `cudaErrorIllegalAddress` quando possível.
+- **Control**: Unix socket (`SOCK_SEQPACKET`) for requests. Descriptors (modules, memfd) pass through `SCM_RIGHTS`. Later: a shared-memory ring for low-latency launch.
+- **memcpy**: the driver uses `process_vm_readv/writev` directly on the client's memory (one copy, the role of DMA). Ubuntu uses `ptrace_scope=1`, so the client calls `prctl(PR_SET_PTRACER, driver_pid)` at initialization. **Fallback**: a staging ring in shared memory (two copies).
+- Later: dedicated copy threads in the driver (*copy engines*) so that `cudaMemcpyAsync` overlaps copy and kernel.
+- **One driver per user**: the driver executes code sent by the client.
+- A kernel with an invalid access may bring down the driver (there is no cheap validation for gathers). Treat the signal as an error such as `cudaErrorIllegalAddress` when possible.
 
-### 6.4 Módulos ("fatbin") e ABI de kernel
+### 6.4 Modules ("fatbin") and kernel ABI
 
-- A aplicação embute, por módulo:
-  - **`.so` nativo** (usado agora). Enviado ao driver como memfd e carregado com `dlopen("/proc/self/fd/N")`.
-  - **Bitcode LLVM do kernel por thread** (papel do PTX). Embutido desde já, usado no futuro para recompilar no launch com especialização (`blockDim`, `gridDim` como constantes) e cache em disco.
-- **Contrato estável** entre código gerado e runtime (definir cedo, é o que mais custa mudar):
-  - **Versão da ABI**: o runtime recusa módulo incompatível.
-  - **Metadados por kernel**: nome, tamanho/alinhamento de cada parâmetro, shared memory estática, tamanho do frame por warp (valores vivos), número de estados.
-  - **Ponto de entrada**: executa **um par de warps** a partir do estado salvo até a próxima barreira ou o fim, e retorna o motivo (`BARRIER` / `EXIT`). Recebe um contexto com `blockIdx`, dimensões, base da shared memory, frames do par, máscaras e parâmetros. O loop de escalonamento (seção 4.3) fica no runtime.
-- Antes do compilador existir, **2 ou 3 kernels escritos à mão nesse formato** servem para testar runtime e driver.
+- The application embeds, per module:
+  - **Native `.so`** (used now). Sent to the driver as a memfd and loaded with `dlopen("/proc/self/fd/N")`.
+  - **Per-thread LLVM bitcode of the kernel** (the role of PTX). Embedded from the start, used in the future to recompile at launch with specialization (`blockDim`, `gridDim` as constants) and a disk cache.
+- **Stable contract** between generated code and runtime (define early, it is what costs most to change):
+  - **ABI version**: the runtime refuses an incompatible module.
+  - **Per-kernel metadata**: name, size/alignment of each parameter, static shared memory, per-warp frame size (live values), number of states.
+  - **Entry point**: executes **one pair of warps** from the saved state up to the next barrier or the end, and returns the reason (`BARRIER` / `EXIT`). It receives a context with `blockIdx`, dimensions, the shared memory base, the pair's frames, masks and parameters. The scheduling loop (section 4.3) stays in the runtime.
+- Before the compiler exists, **2 or 3 hand-written kernels in this format** serve to test the runtime and driver.
 
-### 6.5 Configuração
+### 6.5 Configuration
 
-Arquivo provisório `~/.config/cpusim/device.toml`:
+Provisional file `~/.config/cpusim/device.toml`:
 
 ```toml
 [device]
-cores        = 12        # "SMs" = cores físicos reservados (com os 2 threads SMT)
+cores        = 12        # "SMs" = reserved physical cores (with both SMT threads)
 vram_private = "16GiB"
-vram_shared  = "0GiB"    # > 0 habilita o pool compartilhado (futuro)
-hugepages    = "2MiB"    # 2MiB, 1GiB ou none
+vram_shared  = "0GiB"    # > 0 enables the shared pool (future)
+hugepages    = "2MiB"    # 2MiB, 1GiB or none
 ```
 
-### 6.6 Propriedades do device
+### 6.6 Device properties
 
-- Base: **RTX 5060 (compute capability 12.0)**, configurável no driver. Para obter os valores, rodar uma vez um programa de consulta com o CUDA real e salvar os campos de `cudaGetDeviceProperties` (limites de threads por bloco, shared memory, etc.).
-- `multiProcessorCount` = cores configurados; `totalGlobalMem` = `vram_private`; `warpSize` = 32.
-- Com `vram_shared = 0` (agora): `integrated = 0`, `canMapHostMemory = 0`, `managedMemory = 0`, `concurrentManagedAccess = 0`. `cudaMallocManaged` e `cudaHostAlloc` mapeado retornam `cudaErrorNotSupported`.
+- Base: **RTX 5060 (compute capability 12.0)**, configurable in the driver. To obtain the values, run a query program once with the real CUDA and save the fields of `cudaGetDeviceProperties` (limits of threads per block, shared memory, etc.).
+- `multiProcessorCount` = configured cores; `totalGlobalMem` = `vram_private`; `warpSize` = 32.
+- With `vram_shared = 0` (now): `integrated = 0`, `canMapHostMemory = 0`, `managedMemory = 0`, `concurrentManagedAccess = 0`. `cudaMallocManaged` and mapped `cudaHostAlloc` return `cudaErrorNotSupported`.
 
-### 6.7 Runtime API
+### 6.7 Profiling
 
-Primeira superfície (a mesma que os samples usam): `cudaMalloc`, `cudaFree`, `cudaMemcpy`, `cudaMemset`, `cudaDeviceSynchronize`, `cudaGetLastError`, `cudaGetErrorString`, launch (`<<<>>>`). Streams: tudo serializado no stream padrão no começo.
+- For each kernel, `cpusim-devc` generates `__cpusim_entry_<name>` and an instrumented twin `__cpusim_prof_<name>`. In the instrumented one, each executed basic block adds `popcount(mask) x the block's static cost` to per-worker counters (`ctx->counters`): fp32/fp64 flops (FMA counts 2), special operations, integer operations, loads/stores and bytes, branches, block executions and active lanes (SIMD efficiency). The counts are per thread, as in GPU profilers, and measured on the per-thread code, before vectorization.
+- `CPUSIM_PROFILE=1`: the first launch of each (kernel, grid, block) runs instrumented; the following ones run the normal version and the driver returns the kernel time. The report combines counts and time (GFLOP/s, GB/s, arithmetic intensity). Each launch runs only once, so kernels that accumulate results remain correct. For data-dependent kernels, the counts are those of the first launch.
+- `cpu-smi -q` shows launched and instrumented kernels.
 
----
+### 6.8 Runtime API
 
-## 7. Memória unificada (futuro)
-
-Quando `vram_shared > 0`, o device se apresenta como **integrado**, como uma GPU integrada com memória dedicada mais memória compartilhada:
-
-- Pool compartilhado = memfd mapeado no **mesmo endereço virtual** no driver e no cliente. O cliente reserva cedo com `mmap(MAP_FIXED_NOREPLACE)`; se colidir, esse cliente cai para modo só-cópia.
-- `cudaMallocManaged`, `cudaHostAlloc` = zero-copy nessa região. `cudaMemPrefetchAsync`/`cudaMemAdvise` viram no-op.
-- Coerência vem de graça (é a mesma CPU); sinais de launch e sync com semântica release/acquire.
-- Globais `__device__`/`__managed__` colocadas pelo compilador na região compartilhada.
-- Opcional: substituir `malloc`/`new` do cliente para o heap inteiro ficar compartilhado (estilo HMM). Quebra programas que usam `fork()` esperando copy-on-write, por isso é flag.
-- Pilha e globais comuns do host nunca são compartilháveis entre processos. Só o modo dentro do processo dá SVM completo.
+First surface (the same one the samples use): `cudaMalloc`, `cudaFree`, `cudaMemcpy`, `cudaMemset`, `cudaDeviceSynchronize`, `cudaGetLastError`, `cudaGetErrorString`, launch (`<<<>>>`). Streams: everything serialized on the default stream at the beginning.
 
 ---
 
-## 8. Ordem de construção
+## 7. Unified memory (future)
 
-1. **Base do driver**: interface de device, configuração, alocação (pools), comunicação (socket, memcpy via `process_vm_*`), carregamento de módulo e launch. Backends daemon e dentro do processo juntos.
-2. **Runtime de execução**: pool de workers fixados nos irmãos SMT, escalonamento de blocos e pares, barreira de 2 participantes com `MWAITX`, frames. Testado com os kernels escritos à mão (seção 6.4).
-3. **`libcudart` mínimo** sobre a interface de device.
-4. **Compilador**, desenvolvido testando junto com o driver: frontend com headers nossos, classificação, linearização, alargamento, memória, máquina de estados.
-5. Samples da POC passando nos dois backends.
+When `vram_shared > 0`, the device presents itself as **integrated**, like an integrated GPU with dedicated memory plus shared memory:
+
+- Shared pool = memfd mapped at the **same virtual address** in the driver and in the client. The client reserves early with `mmap(MAP_FIXED_NOREPLACE)`; if it collides, that client falls back to copy-only mode.
+- `cudaMallocManaged`, `cudaHostAlloc` = zero-copy in that region. `cudaMemPrefetchAsync`/`cudaMemAdvise` become no-ops.
+- Coherence comes for free (it is the same CPU); launch and sync signals with release/acquire semantics.
+- `__device__`/`__managed__` globals placed by the compiler in the shared region.
+- Optional: replace the client's `malloc`/`new` so the whole heap is shared (HMM style). It breaks programs that use `fork()` expecting copy-on-write, which is why it is a flag.
+- Ordinary host stack and globals are never shareable between processes. Only the in-process mode gives full SVM.
 
 ---
 
-## 9. Prova de conceito (primeiro marco)
+## 8. Build order
 
-Fatia vertical mínima, ponta a ponta:
+1. **Driver base**: device interface, configuration, allocation (pools), communication (socket, memcpy via `process_vm_*`), module loading and launch. Daemon and in-process backends together.
+2. **Execution runtime**: worker pool pinned to SMT siblings, block and pair scheduling, 2-participant barrier with `MWAITX`, frames. Tested with the hand-written kernels (section 6.4).
+3. **Minimal `libcudart`** on top of the device interface.
+4. **Compiler**, developed testing together with the driver: front end with our headers, classification, linearization, widening, memory, state machine.
+5. POC samples passing on both backends.
 
-| Camada | Entra na POC | Fica para depois |
+---
+
+## 9. Proof of concept (first milestone)
+
+Minimal vertical slice, end to end:
+
+| Layer | In the POC | Left for later |
 |---|---|---|
-| Frontend | Clang + headers nossos mínimos | API completa |
-| Compilador | uniforme/afim/variável, `if` e loops com máscara, warp 32, load/store/gather/scatter, `__syncthreads`, K=1 | K=2, memory yield, intrínsecos de warp, atômicas, math |
-| Runtime e driver | `cudaMalloc/Memcpy/Memset/Free`, launch, sync, nos dois backends; pares de warps em SMT | streams, `cpu-smi`, config completa |
-| Samples-alvo | `matmul`, `transpose`, `heat2d`, `scan`, `mandelbrot`, `bitonic_sort` | `nbody` (math), `reduction` e `spmv` (shuffle), `histogram` (atômicas) |
+| Front end | Clang + our minimal headers | Full API |
+| Compiler | uniform/affine/varying, `if` and loops with masks, warp 32, load/store/gather/scatter, `__syncthreads`, K=1 | K=2, memory yield, warp intrinsics, atomics, math |
+| Runtime and driver | `cudaMalloc/Memcpy/Memset/Free`, launch, sync, on both backends; warp pairs on SMT | streams, `cpu-smi`, full config |
+| Target samples | `matmul`, `transpose`, `heat2d`, `scan`, `mandelbrot`, `bitonic_sort` | `nbody` (math), `reduction` and `spmv` (shuffle), `histogram` (atomics) |
 
-**Critério de aceite**: os 6 samples, sem alteração no fonte, compilados pelo nosso compilador, imprimem `PASS` nos dois backends.
+**Acceptance criterion**: the 6 samples, with no change to the source, compiled by our compiler, print `PASS` on both backends.
 
 ---
 
-## 10. Backlog (depois da POC, aproximadamente nesta ordem)
+## 10. Backlog (after the POC, roughly in this order)
 
-- K=2 (intercalação de pares)
-- Intrínsecos de warp, atômicas com agregação, biblioteca matemática própria → `nbody`, `reduction`, `spmv`, `histogram`
-- `printf`/`assert` no device (prioridade alta, pode entrar antes se a depuração exigir)
-- Shared memory dinâmica (`extern __shared__`)
-- Profiler: tempo por kernel e **eficiência SIMD** (lanes ativas / lanes totais)
-- `cpu-smi` (ocupação, VRAM privada e compartilhada, processos)
-- Streams com execução concorrente; vários processos no driver (fila única primeiro, depois divisão de cores ou revezamento)
-- Modo determinístico (ordem fixa de blocos)
-- Pool de VRAM compartilhada (seção 7)
-- JIT com especialização no launch a partir do bitcode embutido
-- Memory yield com prefetch
-- Emulação de `half`/`bf16` e demais tipos sem suporte
-- Funções de device não inlined, recursão, ponteiros de função
-- Cooperative groups (por último)
+- K=2 (pair interleaving)
+- Warp intrinsics, atomics with aggregation, own math library → `nbody`, `reduction`, `spmv`, `histogram`
+- `printf`/`assert` on the device (high priority, may come earlier if debugging demands it)
+- Dynamic shared memory (`extern __shared__`)
+- Profiler: time per kernel and **SIMD efficiency** (active lanes / total lanes)
+- `cpu-smi` (occupancy, private and shared VRAM, processes)
+- Streams with concurrent execution; several processes in the driver (single queue first, then core splitting or time slicing)
+- Deterministic mode (fixed block order)
+- Shared VRAM pool (section 7)
+- JIT with specialization at launch from the embedded bitcode
+- Memory yield with prefetch
+- Emulation of `half`/`bf16` and other unsupported types
+- Non-inlined device functions, recursion, function pointers
+- Cooperative groups (last)
 
-## 11. Fora de escopo
+## 11. Out of scope
 
-Thrust, CUB, cuBLAS e demais bibliotecas; PTX inline (`asm()`); Tensor Cores; paralelismo dinâmico; texturas; nomes de projeto e ferramentas (por enquanto).
+Thrust, CUB, cuBLAS and other libraries; inline PTX (`asm()`); Tensor Cores; dynamic parallelism; textures; project and tool names (for now).
 
-## 12. Riscos e pontos a verificar primeiro
+## 12. Risks and points to verify first
 
-- **Clang com `-nocudainc -nocudalib` e headers próprios**: confirmar logo no início compilando `samples/matmul.cu` (separar host e device, obter IR do device por thread).
-- Desempenho de gather/scatter no Zen 4 (scatter é microcodificado): medir cedo, define o quanto a classificação afim importa.
-- Custo da troca de estado nas barreiras e da barreira entre irmãos SMT.
-- `process_vm_readv` com `ptrace_scope` e `PR_SET_PTRACER`.
+- **Clang with `-nocudainc -nocudalib` and our own headers**: confirm right at the start by compiling `samples/matmul.cu` (separating host and device, obtaining the per-thread device IR).
+- Gather/scatter performance on Zen 4 (scatter is microcoded): measure early, it determines how much the affine classification matters.
+- Cost of the state switch at barriers and of the barrier between SMT siblings.
+- `process_vm_readv` with `ptrace_scope` and `PR_SET_PTRACER`.
 
-## 13. Referências
+## 13. References
 
-ISPC; Region Vectorizer / Whole-Function Vectorization (Karrenberg, Moll, Hack); GPU Ocelot (PTX para x86); MCUDA; CuPBoP; COX (warp functions em CPU); AdaptiveCpp (barreiras em CPU por compilador); POCL; AMAC / interleaving com corrotinas (para memory yield); ZLUDA (reimplementação da API CUDA).
+ISPC; Region Vectorizer / Whole-Function Vectorization (Karrenberg, Moll, Hack); GPU Ocelot (PTX to x86); MCUDA; CuPBoP; COX (warp functions on CPU); AdaptiveCpp (barriers on CPU by compiler); POCL; AMAC / interleaving with coroutines (for memory yield); ZLUDA (reimplementation of the CUDA API).
