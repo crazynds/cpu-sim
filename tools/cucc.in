@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""cucc: nvcc replacement for the CPU SIMT device.
+
+Compiles unmodified CUDA sources into a native program whose kernels run on
+the CPU, each warp in AVX-512 lanes:
+
+  device side:  clang (CUDA, our headers) -> per-thread IR -> cpusim-devc
+                -> warp code (.o) -> shared object -> "fatbin"
+  host side:    clang (CUDA host) with the fatbin embedded -> .o
+  link:         host objects + libcudart (ours)
+
+Usage mirrors nvcc for the common cases:
+  cucc [-c] [-o out] [-I dir] [-D def] [-std=c++20] [-O3] [-fmad=false] [-fopenmp] [-Xcompiler a,b]
+       [-arch=sm_XX] [--keep] [-v] files... [-l lib] [-L dir]
+"""
+import os
+import shlex
+import struct
+import subprocess
+import sys
+import tempfile
+
+CLANG = "@CPUSIM_CLANG@"
+DEVC = "@CPUSIM_DEVC@"
+INCLUDE = "@CPUSIM_INCLUDE_DIR@"
+CUDA_STUB = "@CPUSIM_CUDA_STUB@"
+LIBDIR = "@CPUSIM_LIB_DIR@"
+FATBIN_MAGIC = b"CPUSIMFB"
+
+# Clang's CUDA mode without the NVIDIA SDK: our headers, and an SDK version
+# passed straight to cc1 (the driver drops it under -nocudalib).
+CUDA_FLAGS = [
+    "-x", "cuda", "--cuda-gpu-arch=sm_70", "--cuda-path=" + CUDA_STUB,
+    "-nocudainc", "-nocudalib", "-Wno-unknown-cuda-version",
+    "-Xclang", "-target-sdk-version=12.5",
+    "-I", INCLUDE, "-include", "cuda_runtime.h",
+]
+
+
+def die(msg):
+    sys.stderr.write("cucc: error: " + msg + "\n")
+    sys.exit(1)
+
+
+class Options:
+    def __init__(self):
+        self.output = None
+        self.compile_only = False
+        self.keep = False
+        self.verbose = False
+        self.opt = "-O3"
+        self.std = "-std=c++17"
+        self.fmad = True
+        self.cpp = []        # -I, -D, -U
+        self.sources = []    # .cu / .cpp
+        self.inputs = []     # .o / .a passed to the linker
+        self.link = []       # -l, -L
+        self.host = []       # host-only flags (-fopenmp)
+        self.mcpu = "znver4"
+
+
+def parse(argv):
+    o = Options()
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+
+        def value():
+            nonlocal i
+            if i + 1 >= len(argv):
+                die(a + " needs a value")
+            i += 1
+            return argv[i]
+
+        if a == "-o":
+            o.output = value()
+        elif a == "-c":
+            o.compile_only = True
+        elif a in ("--keep", "-keep"):
+            o.keep = True
+        elif a == "-v":
+            o.verbose = True
+        elif a.startswith("-O"):
+            o.opt = a
+        elif a.startswith("-std="):
+            o.std = a
+        elif a.startswith("--std="):
+            o.std = "-std=" + a[6:]
+        elif a in ("-fmad=false", "--fmad=false"):
+            o.fmad = False
+        elif a in ("-fmad=true", "--fmad=true"):
+            o.fmad = True
+        elif a in ("-I", "-D", "-U"):
+            o.cpp += [a, value()]
+        elif a[:2] in ("-I", "-D", "-U"):
+            o.cpp.append(a)
+        elif a == "-l" or a == "-L":
+            o.link += [a, value()]
+        elif a[:2] in ("-l", "-L"):
+            o.link.append(a)
+        elif a.startswith("--mcpu="):
+            o.mcpu = a.split("=", 1)[1]
+        elif a.startswith(("-arch", "--gpu-architecture", "-gencode", "--generate-code", "-code")):
+            if "=" not in a and a in ("-arch", "--gpu-architecture", "-gencode", "--generate-code", "-code"):
+                value()
+        elif a == "-fopenmp":
+            o.host.append("-fopenmp")
+        elif a in ("-Xcompiler", "--compiler-options") or a.startswith(("-Xcompiler=", "--compiler-options=")):
+            # Host compiler options, comma separated as in nvcc.
+            v = a.split("=", 1)[1] if "=" in a else value()
+            o.host += [f for f in v.split(",") if f]
+        elif a in ("-lineinfo", "-g", "-G", "--use_fast_math", "-use_fast_math", "-Wno-deprecated-gpu-targets"):
+            pass
+        elif a in ("-x",):
+            value()
+        elif a.startswith("-"):
+            die("unsupported option " + a)
+        elif a.endswith((".cu", ".cpp", ".cc", ".cxx")):
+            o.sources.append(a)
+        elif a.endswith((".o", ".a", ".so")):
+            o.inputs.append(a)
+        else:
+            die("unknown input " + a)
+        i += 1
+    if not o.sources and not o.inputs:
+        die("no input files")
+    return o
+
+
+def run(cmd, o):
+    if o.verbose:
+        sys.stderr.write("+ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+
+
+def build_fatbin(manifest_path, so_path, bc_path, out_path):
+    manifest = open(manifest_path, "rb").read()
+    obj = open(so_path, "rb").read()
+    bitcode = open(bc_path, "rb").read() if bc_path else b""
+    # "cpusim-module <abi>": the version the device compiler generated code for.
+    abi = int(manifest.split(b"\n", 1)[0].split()[1])
+    header_size = 8 + 4 + 4 + 8 * 6
+    manifest_off = header_size
+    obj_off = (manifest_off + len(manifest) + 4095) // 4096 * 4096
+    bc_off = (obj_off + len(obj) + 63) // 64 * 64
+    header = FATBIN_MAGIC + struct.pack("<II6Q", abi, 0, manifest_off, len(manifest), obj_off, len(obj),
+                                        bc_off if bitcode else 0, len(bitcode))
+    data = header + manifest
+    data += b"\0" * (obj_off - len(data)) + obj
+    if bitcode:
+        data += b"\0" * (bc_off - len(data)) + bitcode
+    open(out_path, "wb").write(data)
+
+
+def compile_cu(src, obj_out, o, tmp):
+    base = os.path.join(tmp, os.path.splitext(os.path.basename(src))[0])
+    # "on" fuses a*b+c into fmuladd in the front end, per expression, before the
+    # kernel is specialized; with "fast" the backend decides per basic block, so
+    # the JIT and generic variants could round differently (tests/cuda/repro.cu).
+    contract = ["-ffp-contract=on" if o.fmad else "-ffp-contract=off"]
+    common = CUDA_FLAGS + [o.std] + o.cpp + contract
+
+    # Device: per-thread IR, unoptimized but with full metadata (O2 front end, no passes).
+    run([CLANG] + common + ["--cuda-device-only", "-O2", "-Xclang", "-disable-llvm-passes",
+                            "-emit-llvm", "-c", src, "-o", base + ".dev.bc"], o)
+    devc = [DEVC, base + ".dev.bc", "-o", base + ".dev.o", "--manifest", base + ".manifest", "--mcpu", o.mcpu]
+    if os.environ.get("CPUSIM_SPECIALIZE"):  # experiments: one block shape for every kernel
+        devc += ["--specialize", os.environ["CPUSIM_SPECIALIZE"]]
+    if o.keep:
+        devc += ["--emit-ll", base + ".warp.ll", "--emit-scalar-ll", base + ".thread.ll", "--emit-raw-ll", base + ".raw.ll",
+                 "--emit-asm", base + ".warp.s"]
+    run(devc, o)
+    # libmvec/libm: the vector and scalar math the device code calls;
+    # libcpusim_tensor: mma_sync. Only recorded as dependencies when used.
+    run([CLANG, "-shared", "-nostdlib", "-o", base + ".kernels.so", base + ".dev.o",
+         "-Wl,--as-needed", "-lmvec", "-lm", "-L", LIBDIR, "-lcpusim_tensor", "-Wl,-rpath," + LIBDIR], o)
+    build_fatbin(base + ".manifest", base + ".kernels.so", base + ".dev.bc", base + ".fatbin")
+
+    # Host: the fatbin goes into .nv_fatbin and is registered at startup.
+    run([CLANG] + common + o.host + ["--cuda-host-only", o.opt, "-Xclang", "-fcuda-include-gpubinary",
+                            "-Xclang", base + ".fatbin", "-c", src, "-o", obj_out], o)
+
+
+def main():
+    o = parse(sys.argv[1:])
+    if o.compile_only and o.output and len(o.sources) > 1:
+        die("-o with -c needs a single source")
+    tmp = tempfile.mkdtemp(prefix="cucc-")
+    try:
+        objects = []
+        for src in o.sources:
+            if o.compile_only:
+                obj = o.output or os.path.splitext(os.path.basename(src))[0] + ".o"
+            else:
+                obj = os.path.join(tmp, os.path.basename(src) + ".o")
+            if src.endswith(".cu"):
+                compile_cu(src, obj, o, tmp)
+            else:
+                run([CLANG, "-c", o.std, o.opt, "-I", INCLUDE] + o.cpp + o.host + [src, "-o", obj], o)
+            objects.append(obj)
+        if o.compile_only:
+            return
+        out = o.output or "a.out"
+        if "-fopenmp" in o.host:  # OpenMP: clang's libomp, found next to clang at run time too
+            omp_lib = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(CLANG))), "lib")
+            o.link = ["-fopenmp", "-L", omp_lib, "-Wl,-rpath," + omp_lib] + o.link
+        run([CLANG, "-o", out] + objects + o.inputs + ["-L", LIBDIR, "-Wl,-rpath," + LIBDIR] + o.link
+            + ["-lcpusim_cudart", "-lpthread"], o)
+    finally:
+        if o.keep:
+            sys.stderr.write("cucc: intermediate files kept in " + tmp + "\n")
+        else:
+            subprocess.run(["rm", "-rf", tmp])
+
+
+if __name__ == "__main__":
+    main()
