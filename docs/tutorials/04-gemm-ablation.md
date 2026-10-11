@@ -5,9 +5,9 @@ Tutorial 3 compares the `cucc` GEMM with OpenMP. This one takes the `cucc` versi
 ## Build and run
 
 ```sh
-build/cucc -O3 -std=c++20 bench/gemm_explore.cu -o gemm_explore
-./gemm_explore list
-./gemm_explore 1-copies 6144
+build/cucc -O3 -std=c++20 bench/gemm_explore.cu -o build/bench/gemm_explore
+build/bench/gemm_explore list
+build/bench/gemm_explore 1-copies 6144
 ```
 
 Each run prints one line:
@@ -24,7 +24,7 @@ Run the steps in order with a pause between them, and repeat the series: the clo
 
 ```sh
 for s in 1-copies 2-managed 3-warp-pack 4-stcs 5-kc512 6-6x64 7-kc768; do
-    sleep 20; ./gemm_explore $s 6144
+    sleep 20; build/bench/gemm_explore $s 6144
 done
 ```
 
@@ -46,7 +46,7 @@ Alternatives to compare with `7-kc768`: `x-12x32-kc768` (the old tile with the n
 ## What to look for
 
 - **Where the total goes.** The `copies`, `pack` and `kernel` columns of step 1 show what the first version spent its time on, and steps 2 to 4 remove the first two.
-- **The kernel against the peak.** Run `./peak fp32` (tutorial 2) before the series, and note `clocks.sm` from `cpu-smi` during steps 5 to 7. How close the kernel gets to the peak at its own clock tells whether a step saved cycles or saved power.
+- **The kernel against the peak.** Run `build/bench/peak fp32` (tutorial 2) before the series, and note `clocks.sm` from `cpu-smi` during steps 5 to 7. How close the kernel gets to the peak at its own clock tells whether a step saved cycles or saved power.
 - **`__stcs` depends on the cache.** Streaming stores send the packed copy to memory; when the copies (8n² bytes for both) fit in the last-level cache, that pushes them out right before the kernel reads them. Compare `3-warp-pack` and `4-stcs` at a size whose copies fit in your cache (`cpu-smi` does not show it; `lscpu | grep L3`) and at one whose copies do not. This is why the duel version decides from `l2CacheSize`.
 - **Every line must say `ok`.**
 
@@ -55,7 +55,7 @@ Alternatives to compare with `7-kc768`: `x-12x32-kc768` (the old tile with the n
 Dump the generated code and look for `vmovntps` and `sfence` in the packing kernels:
 
 ```sh
-mkdir -p /tmp/asm && (cd /tmp/asm && CPUSIM_DUMP_ASM=1 "$OLDPWD/gemm_explore" 4-stcs 1536) && grep -c vmovntps /tmp/asm/cpusim-asm-*.txt
+mkdir -p /tmp/asm && (cd /tmp/asm && CPUSIM_DUMP_ASM=1 "$OLDPWD/build/bench/gemm_explore" 4-stcs 1536) && grep -c vmovntps /tmp/asm/cpusim-asm-*.txt
 ```
 
 (`CPUSIM_DUMP_ASM` writes one listing per block shape into the current directory.) The `sfence` at the end of those kernels is required: non-temporal stores are weakly ordered, and the next kernel reads the packed data from other cores. `tests/cuda/streaming.cu` checks that every store path is correct.

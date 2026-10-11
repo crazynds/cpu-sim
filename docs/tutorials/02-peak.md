@@ -13,9 +13,9 @@ The clock is the unknown: under an all-core AVX-512 load a CPU holds less than i
 ## Build and run
 
 ```sh
-build/cucc -O3 -std=c++20 bench/peak.cu -o peak
-./peak            # fp32 and bf16, about 2 s each
-./peak fp32 5     # only fp32, 5 s
+build/cucc -O3 -std=c++20 bench/peak.cu -o build/bench/peak
+build/bench/peak            # fp32 and bf16, about 2 s each
+build/bench/peak fp32 5     # only fp32, 5 s
 ```
 
 with `cpu-smi` in another terminal (tutorial 1) to see the clock the device holds during the run:
@@ -32,20 +32,20 @@ The output gives the device, its compute capability and multiprocessors, and:
 The same source builds for a GPU, for the same measurement there:
 
 ```sh
-nvcc -O3 -std=c++20 -arch=native bench/peak.cu -o peak_gpu && ./peak_gpu
+nvcc -O3 -std=c++20 -arch=native bench/peak.cu -o build/bench/peak_gpu && build/bench/peak_gpu
 ```
 
 ## Things to check
 
 - **The clock**: divide the `fp32 FMA` result by (multiprocessors × 32 FLOPs × FMA units per core) and compare with `clocks.sm` from `cpu-smi`. If they agree, the kernel retires FMAs at the hardware rate and the number is the true ceiling.
 - **Scaling with cores**: set `cores = 1` (then 2, 4, ...) in `~/.config/cpusim/device.toml` (create it with `build/cpusimd --init-config`, tutorial 1), restart the driver and run again. The device always uses both SMT threads of each core it takes, so the result is per physical core; it should grow linearly until power limits lower the clock.
-- **Thermal drift**: run `./peak fp32 30` and watch `clocks.sm`. The difference between the first seconds and the end is how much your cooling costs a long benchmark.
+- **Thermal drift**: run `build/bench/peak fp32 30` and watch `clocks.sm`. The difference between the first seconds and the end is how much your cooling costs a long benchmark.
 
 ## Using the peak as a reference
 
 A GEMM is compute bound, so its ceiling is this peak at the clock it holds while running. Two ways to compare:
 
-1. **Same thermal state**: run `./peak fp32`, then the GEMM right away, and divide the GEMM's GFLOPS by the peak.
+1. **Same thermal state**: run `build/bench/peak fp32`, then the GEMM right away, and divide the GEMM's GFLOPS by the peak.
 2. **Same clock**: a GEMM usually holds a lower clock than this kernel, because it also moves data (loads, cache traffic, DRAM), which costs power. Note `clocks.sm` during the GEMM, compute the peak at that clock with the formula above, and divide. If the GEMM is close to the peak at its own clock, the code wastes few cycles and what is left is power, not code; that is why tutorial 4 looks for fewer memory operations per FMA and less memory traffic.
 
 `clocks.sm` comes from cpufreq (`scaling_cur_freq`), an estimate the kernel driver refreshes every few milliseconds: use it for trends and ratios, not for exact efficiencies.

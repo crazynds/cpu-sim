@@ -24,10 +24,13 @@ Also needed: GCC 13+, CMake 3.24+, LLVM/Clang 19 (setup in the [README](../../RE
 
 ## Build and test
 
+Every command in these tutorials runs from the repository root, and the benchmark programs are built into `build/bench/` (ignored by git):
+
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
+mkdir -p build/bench
 ```
 
 CMake may print `Could NOT find FFI / LibEdit / zstd / LibXml2 / CURL`: those are optional dependencies that LLVM's CMake package probes for, and the project does not use them. What matters is the `LLVM 19.x.x: <path>` line and `Configuring done`.

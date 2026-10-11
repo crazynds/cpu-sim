@@ -44,20 +44,20 @@ where `kernel x` = OpenMP time / `cucc` kernel time and `total x` = OpenMP time 
 To run by hand:
 
 ```sh
-build/cucc -O3 -std=c++20 -fopenmp bench/gemm_fp32.cu -o gemm_cpu
-nvcc -O3 -std=c++20 -arch=native -Xcompiler -fopenmp bench/gemm_fp32.cu -lcublas -o gemm_gpu
-./gemm_gpu cuda
-./gemm_cpu cuda 1536 3072
-./gemm_cpu omp 1536 3072
+build/cucc -O3 -std=c++20 -fopenmp bench/gemm_fp32.cu -o build/bench/gemm_cpu
+nvcc -O3 -std=c++20 -arch=native -Xcompiler -fopenmp bench/gemm_fp32.cu -lcublas -o build/bench/gemm_gpu
+build/bench/gemm_gpu cuda
+build/bench/gemm_cpu cuda 1536 3072
+build/bench/gemm_cpu omp 1536 3072
 ```
 
-`./gemm_cpu omp` uses every hardware thread by default; `OMP_NUM_THREADS` changes it. To give OpenMP exactly the device's CPUs, take the list from `cpu-smi -q` (`Logical CPUs`) and pin the threads to it; for a device on CPUs 4-7 and 12-15, for example: `OMP_PLACES="{4}:4:1,{12}:4:1" OMP_PROC_BIND=close OMP_NUM_THREADS=8`.
+`build/bench/gemm_cpu omp` uses every hardware thread by default; `OMP_NUM_THREADS` changes it. To give OpenMP exactly the device's CPUs, take the list from `cpu-smi -q` (`Logical CPUs`) and pin the threads to it; for a device on CPUs 4-7 and 12-15, for example: `OMP_PLACES="{4}:4:1,{12}:4:1" OMP_PROC_BIND=close OMP_NUM_THREADS=8`.
 
 ## Reading the results
 
 - **check must be `ok`** in every line. A `FAIL` invalidates the line.
 - **A result is real if the ratio keeps its side of 1 across pairs.** Single numbers move with the clock (tutorial 1); the ratio within a pair is what to compare.
-- **Compare the kernel GFLOPS with `./peak fp32`** (tutorial 2) run right before: that is how far each CPU contender is from the hardware.
+- **Compare the kernel GFLOPS with `build/bench/peak fp32`** (tutorial 2) run right before: that is how far each CPU contender is from the hardware.
 - **Kernel versus total**: the gap between the two `cucc` columns is the packing; for OpenMP the packing is inside its single number. For the GPU the gap is mostly PCIe copies.
 
 ## Reproduce the "before"
@@ -66,9 +66,9 @@ The first version of the duel used the same kernel as `samples/cpu_gemm.cu` (12Ã
 
 ```sh
 git show ae2890d:bench/gemm_fp32.cu > /tmp/gemm_fp32_before.cu
-build/cucc -O3 -std=c++20 -fopenmp /tmp/gemm_fp32_before.cu -o gemm_before
-./gemm_before cuda 6144; sleep 30
-./gemm_cpu cuda 6144
+build/cucc -O3 -std=c++20 -fopenmp /tmp/gemm_fp32_before.cu -o build/bench/gemm_before
+build/bench/gemm_before cuda 6144; sleep 30
+build/bench/gemm_cpu cuda 6144
 ```
 
 Tutorial 4 breaks the difference down step by step.
