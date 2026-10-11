@@ -129,7 +129,7 @@ add_test(NAME runtime_daemon
 # Self-checking tests of single features (tests/cuda), each run with every
 # lane width, without JIT and on the daemon backend.
 if(TARGET cpusim-devc)
-    foreach(feature IN ITEMS warp_ops math division local_arrays streams async managed types wmma streaming)
+    foreach(feature IN ITEMS warp_ops math division local_arrays streams async managed types wmma wmma_shapes streaming)
         add_test(NAME cuda_${feature}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_feature_test.sh ${CMAKE_BINARY_DIR}/cucc
                     $<TARGET_FILE:cpusimd> ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/${feature}.cu)
@@ -137,7 +137,10 @@ if(TARGET cpusim-devc)
     endforeach()
     # Tensor cores on CPUs with fewer dot product instructions: lower compute
     # capability, and the kernels that need more must not launch.
-    set_tests_properties(cuda_wmma PROPERTIES ENVIRONMENT "FEATURE_ENVS=CPUSIM_TENSOR=int8 CPUSIM_TENSOR=fp16")
+    # The tensor core tests compile many large kernels (the first run also
+    # JIT-compiles them): more time.
+    set_tests_properties(cuda_wmma cuda_wmma_shapes PROPERTIES
+        ENVIRONMENT "FEATURE_ENVS=CPUSIM_TENSOR=int8 CPUSIM_TENSOR=fp16" TIMEOUT 240)
     # Compares durations (concurrent streams): alone, or other tests' load
     # decides the result.
     set_tests_properties(cuda_async PROPERTIES RUN_SERIAL TRUE)
