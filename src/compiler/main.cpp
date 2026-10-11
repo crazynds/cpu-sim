@@ -19,6 +19,8 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/MC/TargetRegistry.h>
+#include <llvm/IR/Dominators.h>
+#include <llvm/IR/PatternMatch.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
@@ -167,6 +169,96 @@ void widen_mask_selects(Module& m) {
                 sel->replaceAllUsesWith(b.CreateBitCast(r, vt));
                 sel->eraseFromParent();
             }
+}
+
+// Masks under a uniform guard. The warp code tests a uniform condition c by
+// giving the taken side the mask select(c, m, 0) and running a block only if
+// any lane of its mask is set. Inside, c is then known to hold, so the mask
+// is m (often a constant: all lanes), but LLVM does not see it: the select
+// sits before the branch. Here, for each edge of a conditional branch, the
+// scalar conditions known to hold along it (through `and`/`or`, `not`, and
+// "some lane of select(c, x, 0) is set") turn select(c, x, y) into x in the
+// code that edge dominates. Masked loads and stores with a constant mask then
+// become plain ones. Run on the warp code after SROA and InstCombine.
+namespace {
+// The value a mask M has whenever some lane of it is set, if there is one:
+// x for select(c, x, 0) (c then holds, recorded in `holds`), and for a phi
+// whose incoming values are each zero (or poison) or reduce to the same x.
+Value* when_nonzero(Value* m, SmallPtrSetImpl<Value*>& holds, unsigned depth = 0) {
+    using namespace PatternMatch;
+    Value *c, *x;
+    if (depth > 6) return nullptr;
+    if (match(m, m_Select(m_Value(c), m_Value(x), m_Zero())) && !c->getType()->isVectorTy()) {
+        holds.insert(c);
+        Value* inner = when_nonzero(x, holds, depth + 1);
+        return inner ? inner : x;
+    }
+    if (auto* phi = dyn_cast<PHINode>(m)) {
+        Value* common = nullptr;
+        for (Value* in : phi->incoming_values()) {
+            if (auto* k = dyn_cast<Constant>(in); k && (k->isNullValue() || isa<UndefValue>(k))) continue;
+            Value* r = when_nonzero(in, holds, depth + 1);
+            if (!r) r = in;
+            if (common && common != r) return nullptr;
+            common = r;
+        }
+        return common;
+    }
+    return nullptr;
+}
+
+struct Facts {
+    SmallPtrSet<Value*, 8> holds;          // scalar conditions known true
+    SmallVector<std::pair<Value*, Value*>, 4> masks;  // mask -> its value
+};
+
+void implied(Value* v, bool val, Facts& f, unsigned depth = 0) {
+    using namespace PatternMatch;
+    if (depth > 8 || !v->getType()->isIntegerTy(1)) return;
+    if (val) f.holds.insert(v);
+    Value *a, *b, *m;
+    if (val && match(v, m_LogicalAnd(m_Value(a), m_Value(b)))) {
+        implied(a, true, f, depth + 1), implied(b, true, f, depth + 1);
+    } else if (!val && match(v, m_LogicalOr(m_Value(a), m_Value(b)))) {
+        implied(a, false, f, depth + 1), implied(b, false, f, depth + 1);
+    } else if (match(v, m_Not(m_Value(a)))) {
+        implied(a, !val, f, depth + 1);
+    } else if (auto* cmp = dyn_cast<ICmpInst>(v); cmp && match(cmp, m_ICmp(m_BitCast(m_Value(m)), m_Zero())) &&
+                                                  m->getType()->isVectorTy()) {
+        // Some lane of m is set.
+        if ((cmp->getPredicate() == ICmpInst::ICMP_NE) == val)
+            if (Value* x = when_nonzero(m, f.holds)) f.masks.push_back({m, x});
+    }
+}
+}  // namespace
+
+bool refine_uniform_masks(Function& f) {
+    DominatorTree dt(f);
+    bool changed = false;
+    auto replace = [&](Value* from, Value* to, const BasicBlockEdge& edge) {
+        auto* def = dyn_cast<Instruction>(to);
+        for (Use& use : make_early_inc_range(from->uses()))
+            if (dt.dominates(edge, use) && (!def || dt.dominates(def, use))) {
+                use.set(to);
+                changed = true;
+            }
+    };
+    for (BasicBlock& bb : f) {
+        auto* br = dyn_cast<BranchInst>(bb.getTerminator());
+        if (!br || !br->isConditional() || br->getSuccessor(0) == br->getSuccessor(1)) continue;
+        for (unsigned side = 0; side < 2; ++side) {
+            Facts facts;
+            implied(br->getCondition(), side == 0, facts);
+            BasicBlockEdge edge(&bb, br->getSuccessor(side));
+            for (auto& [m, x] : facts.masks) replace(m, x, edge);
+            for (Value* c : facts.holds)
+                for (User* u : make_early_inc_range(c->users()))
+                    if (auto* sel = dyn_cast<SelectInst>(u);
+                        sel && sel->getCondition() == c && sel->getType()->isVectorTy())
+                        replace(sel, sel->getTrueValue(), edge);
+        }
+    }
+    return changed;
 }
 
 // Small fixed-size copies to or from a local (struct copies: `auto p = a[i]`,
@@ -494,6 +586,12 @@ int main(int argc, char** argv) {
 
     if (!opt.emit_raw_ll.empty()) write_ll(*m, opt.emit_raw_ll);
     if (verifyModule(*m, &errs())) die("internal error: generated IR does not verify");
+    for (Function& f : *m)
+        if (!f.isDeclaration()) {
+            run_function_pipeline(f, tm.get(), "sroa,early-cse,instcombine");
+            if (refine_uniform_masks(f) && verifyFunction(f, &errs()))
+                die("internal error: IR does not verify after refining masks in " + f.getName().str());
+        }
     run_pipeline(*m, tm.get(), "O3");
     widen_mask_selects(*m);
     if (!opt.emit_ll.empty()) write_ll(*m, opt.emit_ll);
