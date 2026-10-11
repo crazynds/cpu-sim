@@ -2,7 +2,7 @@
 // Clang produces for the device side of a .cu file and emits a native x86
 // object with one warp entry point per kernel, plus the module manifest.
 //
-//   cpusim-devc device.bc -o kernels.o --manifest kernels.manifest [--emit-ll out.ll] [--mcpu znver4]
+//   cpusim-devc device.bc -o kernels.o --manifest kernels.manifest [--emit-ll out.ll] [--mcpu native|znver4|...]
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -47,7 +47,7 @@ namespace {
 
 struct Options {
     std::string input, output, manifest, emit_ll, emit_scalar_ll, emit_raw_ll, emit_asm;
-    std::string cpu = "znver4";
+    std::string cpu = "native";  // the CPU this runs on (the JIT runs where the kernels run)
     uint32_t specialize[3] = {0, 0, 0};
 };
 

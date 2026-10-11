@@ -382,7 +382,7 @@ void dump_asm(Module& m, const std::array<uint32_t, 3>& block) {
         }
 
         std::ostringstream h;
-        h << "# cpusim: x86-64 (znver4) assembly of the device code\n"
+        h << "# cpusim: x86-64 assembly of the device code (for the host CPU)\n"
           << "# program: " << program_invocation_short_name << ", module " << hash << ", block shape: " << shape
           << (generic ? " (generic code, not specialized)\n" : " (JIT specialized)\n")
           << "# kernels:";

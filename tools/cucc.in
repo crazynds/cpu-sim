@@ -56,7 +56,7 @@ class Options:
         self.inputs = []     # .o / .a passed to the linker
         self.link = []       # -l, -L
         self.host = []       # host-only flags (-fopenmp)
-        self.mcpu = "znver4"
+        self.mcpu = "native"  # the device code targets this machine's CPU (--mcpu=znver4 etc. for another)
 
 
 def parse(argv):
