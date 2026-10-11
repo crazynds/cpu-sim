@@ -2,9 +2,9 @@
 //   cuda: the best each CUDA toolchain offers
 //         - nvcc (GPU): cuBLAS with TF32 tensor cores (cublasGemmEx,
 //           CUBLAS_COMPUTE_32F_FAST_TF32);
-//         - cucc (CPU simulator): the kernel written for the simulator's
-//           execution model (samples/cpu_gemm.cu): packing kernels plus a
-//           one-warp-per-block BLIS-like micro-kernel, 12 x 32 per warp;
+//         - cucc (CPU simulator): CUDA written for the simulator: managed
+//           memory instead of copies, packing kernels with streaming stores,
+//           and a BLIS-like micro-kernel of 6 x 64 per block of 64 threads;
 //   omp:  C++ with OpenMP and AVX-512, BLIS-like (packing, KC/MC/NC cache
 //         blocks, 8 x 32 micro-kernel in 16 zmm registers).
 // Inputs are small integers, so every product and sum is exact in fp32 (and
@@ -13,7 +13,7 @@
 //
 // Per size: time per kernel (mean of the timed repetitions), total time of
 // one multiplication from host data to host result (copies and packing
-// included), and GFLOPS of the kernel.
+// included where the contender needs them), and GFLOPS of the kernel.
 //
 //   build/cucc -O3 -std=c++20 -fopenmp bench/gemm_fp32.cu -o gemm_cpu
 //   nvcc -O3 -std=c++20 -arch=native -Xcompiler -fopenmp bench/gemm_fp32.cu -lcublas -o gemm_gpu
@@ -43,28 +43,42 @@ static double now_s() { return std::chrono::duration<double>(std::chrono::steady
 
 /* ------------------------------------------------- cucc: written for the simulator */
 
-constexpr int SMR = 12, SNR = 32;            // micro-tile: 12 rows x 32 columns, one column per thread
-constexpr int SKC = 256, SMC = 96, SNC = 512;  // k per pass, rows and columns per block
+// One block is one row of NR = 64 threads, one column of C per thread, and
+// accumulates MR = 6 rows: with 64 lanes a value is 4 zmm registers, so 24 zmm
+// of accumulators. Per step of k: 4 vector loads of B and 6 broadcasts of A for
+// 24 FMAs (a 12 x 32 tile needs 14 loads for the same 24 FMAs, and memory
+// operations cost power, which lowers the clock). The block walks k in passes of
+// KC; A and B are packed first so each step reads contiguous memory.
+constexpr int SMR = 6, SNR = 64, SKC = 768, SNC = 512;
 
-__global__ void pack_a(const float* A, float* Ap, int M, int K) {
-    const long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
-    if (i >= (long)M * K) return;
-    const int m = int(i / K), k = int(i % K);
-    Ap[(long)(m / SMR) * K * SMR + (long)k * SMR + m % SMR] = A[i];
+// One block per (micro-panel of 6 rows, 32 values of k). Lane l of step j writes
+// element 32 j + l of the 192 contiguous floats, so the store is one streaming
+// (non-temporal) store per step: the packed copy goes to memory without first
+// reading the lines it overwrites.
+__global__ void __launch_bounds__(32) pack_a(const float* A, float* Ap, int K) {
+    const int lane = threadIdx.x, panel = blockIdx.x, k0 = blockIdx.y * 32;
+    float* dst = Ap + (long)panel * K * SMR + (long)k0 * SMR;
+#pragma unroll
+    for (int j = 0; j < SMR; ++j) {
+        const int o = 32 * j + lane;
+        __stcs(dst + o, A[(long)(panel * SMR + o % SMR) * K + k0 + o / SMR]);
+    }
 }
-__global__ void pack_b(const float* B, float* Bp, int K, int N) {
-    const long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
-    if (i >= (long)K * N) return;
-    const int k = int(i / N), n = int(i % N);
-    Bp[(long)(n / SNR) * K * SNR + (long)k * SNR + n % SNR] = B[i];
+// One block per (panel of 64 columns, 256 values of k): each row is a copy of 256 bytes.
+__global__ void __launch_bounds__(SNR) pack_b(const float* B, float* Bp, int K, int N) {
+    const int lane = threadIdx.x, panel = blockIdx.x, k0 = blockIdx.y * 256;
+    const float* src = B + (long)k0 * N + panel * SNR + lane;
+    float* dst = Bp + (long)panel * K * SNR + (long)k0 * SNR + lane;
+    for (int k = 0; k < 256; ++k) __stcs(dst + k * SNR, src[(long)k * N]);
 }
-__global__ void __launch_bounds__(32) sgemm(const float* Ap, const float* Bp, float* C, int N, int K) {
+// C[m0 : m0 + mc, n0 : n0 + SNC] = A * B, for mc rows (a multiple of 6) per block.
+__global__ void __launch_bounds__(SNR) sgemm(const float* Ap, const float* Bp, float* C, int N, int K, int mc) {
     const int lane = threadIdx.x;
-    const int m0 = blockIdx.x * SMC, n0 = blockIdx.y * SNC;
+    const int m0 = blockIdx.x * mc, n0 = blockIdx.y * SNC;
     for (int pc = 0; pc < K; pc += SKC)
         for (int jr = 0; jr < SNC; jr += SNR) {
             const float* b = Bp + (long)((n0 + jr) / SNR) * K * SNR + (long)pc * SNR + lane;
-            for (int ir = 0; ir < SMC; ir += SMR) {
+            for (int ir = 0; ir < mc; ir += SMR) {
                 const float* a = Ap + (long)((m0 + ir) / SMR) * K * SMR + (long)pc * SMR;
                 float* c = C + (long)(m0 + ir) * N + n0 + jr + lane;
                 float acc[SMR];
@@ -81,6 +95,8 @@ __global__ void __launch_bounds__(32) sgemm(const float* Ap, const float* Bp, fl
             }
         }
 }
+// Rows per block: enough blocks to keep the 28 workers busy at small sizes.
+static int rows_per_block(int n) { return n <= 1536 ? 24 : 96; }
 
 /* ------------------------------------------------------- OpenMP + AVX-512 */
 
@@ -176,7 +192,8 @@ struct Result {
     double kernel_s, total_s;
 };
 
-// One multiplication of the CUDA contender, host to host; then `reps`
+#ifdef __NVCC__
+// One multiplication host to host (copies over PCIe included), then `reps`
 // kernels timed alone.
 static Result run_cuda(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C, int n, int reps) {
     const size_t bytes = size_t(n) * n * sizeof(float);
@@ -184,7 +201,6 @@ static Result run_cuda(const std::vector<float>& A, const std::vector<float>& B,
     CHECK(cudaMalloc(&dA, bytes));
     CHECK(cudaMalloc(&dB, bytes));
     CHECK(cudaMalloc(&dC, bytes));
-#ifdef __NVCC__
     cublasHandle_t h;
     cublasCreate(&h);
     const float one = 1.0f, zero = 0.0f;
@@ -193,28 +209,15 @@ static Result run_cuda(const std::vector<float>& A, const std::vector<float>& B,
         cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &one, dB, CUDA_R_32F, n, dA, CUDA_R_32F, n, &zero, dC,
                      CUDA_R_32F, n, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT);
     };
-    auto prepare = [&] {};
-#else
-    float *dAp, *dBp;
-    CHECK(cudaMalloc(&dAp, bytes));
-    CHECK(cudaMalloc(&dBp, bytes));
-    auto prepare = [&] {
-        pack_a<<<unsigned((size_t(n) * n + 255) / 256), 256>>>(dA, dAp, n, n);
-        pack_b<<<unsigned((size_t(n) * n + 255) / 256), 256>>>(dB, dBp, n, n);
-    };
-    auto kernel = [&] { sgemm<<<dim3(n / SMC, n / SNC), 32>>>(dAp, dBp, dC, n, n); };
-#endif
-    // Warm-up (library setup on the GPU; JIT and choice of variant on the CPU).
+    // Warm-up (library setup).
     CHECK(cudaMemcpy(dA, A.data(), bytes, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dB, B.data(), bytes, cudaMemcpyHostToDevice));
-    prepare();
     kernel();
     CHECK(cudaDeviceSynchronize());
 
     double t0 = now_s();
     CHECK(cudaMemcpy(dA, A.data(), bytes, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dB, B.data(), bytes, cudaMemcpyHostToDevice));
-    prepare();
     kernel();
     CHECK(cudaMemcpy(C.data(), dC, bytes, cudaMemcpyDeviceToHost));
     const double total = now_s() - t0;
@@ -229,14 +232,55 @@ static Result run_cuda(const std::vector<float>& A, const std::vector<float>& B,
     float ms = 0;
     CHECK(cudaEventElapsedTime(&ms, e0, e1));
     CHECK(cudaGetLastError());
-#ifdef __NVCC__
     cublasDestroy(h);
-#else
-    cudaFree(dAp), cudaFree(dBp);
-#endif
     cudaFree(dA), cudaFree(dB), cudaFree(dC);
     return {ms / 1e3 / reps, total};
 }
+#else
+// On the simulator the device is the CPU and managed memory is the host's
+// memory: an application written for it keeps A, B and C in cudaMallocManaged
+// buffers that the host fills and reads directly, with no copies (as the
+// OpenMP version works on the host's arrays). Copying the inputs into those
+// buffers stands for the application producing them there, so it is not
+// timed. Total = packing + multiplication; kernel = the multiplication alone.
+static Result run_cuda(const std::vector<float>& hA, const std::vector<float>& hB, std::vector<float>& hC, int n,
+                       int reps) {
+    const size_t elems = size_t(n) * n, bytes = elems * sizeof(float);
+    float *A, *B, *C, *Ap, *Bp;
+    CHECK(cudaMallocManaged(&A, bytes));
+    CHECK(cudaMallocManaged(&B, bytes));
+    CHECK(cudaMallocManaged(&C, bytes));
+    CHECK(cudaMalloc(&Ap, bytes));  // packed copies (scratch, like a BLAS workspace)
+    CHECK(cudaMalloc(&Bp, bytes));
+    std::copy(hA.begin(), hA.end(), A);
+    std::copy(hB.begin(), hB.end(), B);
+    const int mc = rows_per_block(n);
+    auto prepare = [&] {
+        pack_a<<<dim3(n / SMR, n / 32), 32>>>(A, Ap, n);
+        pack_b<<<dim3(n / SNR, n / 256), SNR>>>(B, Bp, n, n);
+    };
+    auto kernel = [&] { sgemm<<<dim3(n / mc, n / SNC), SNR>>>(Ap, Bp, C, n, n, mc); };
+    // Warm-up (JIT and choice of variant).
+    prepare();
+    kernel();
+    CHECK(cudaDeviceSynchronize());
+
+    double t0 = now_s();
+    prepare();
+    kernel();
+    CHECK(cudaDeviceSynchronize());
+    const double total = now_s() - t0;
+
+    t0 = now_s();
+    for (int r = 0; r < reps; ++r) kernel();
+    CHECK(cudaDeviceSynchronize());
+    const double each = (now_s() - t0) / reps;
+    CHECK(cudaGetLastError());
+    std::copy(C, C + elems, hC.begin());  // for the check only
+    cudaFree(A), cudaFree(B), cudaFree(C), cudaFree(Ap), cudaFree(Bp);
+    return {each, total};
+}
+#endif
 
 static Result run_omp(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C, int n, int reps) {
     matmul_omp_fast(A.data(), B.data(), C.data(), n);  // warm-up
