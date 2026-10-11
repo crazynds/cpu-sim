@@ -503,13 +503,15 @@ int main(int argc, char** argv) {
             return !d;
         };
         // The compute capability the kernel's tensor core types need, as on
-        // a GPU: fp16 since sm_70, int8 since sm_72, bf16 since sm_80.
+        // a GPU: fp16 since sm_70, int8 since sm_72, bf16, tf32 and double
+        // since sm_80.
         int min_sm = 0;
         for (BasicBlock& bb : *k.scalar)
             for (Instruction& inst : bb)
                 if (cpusim::is_mma(&inst) || cpusim::is_mmav(&inst)) {
                     StringRef types = cast<CallInst>(inst).getCalledFunction()->getName();
-                    min_sm = std::max(min_sm, types.contains("bf16") ? 80 : types.contains("8_") ? 72 : 70);
+                    const bool sm80 = types.contains("bf16") || types.contains("tf32") || types.contains("f64");
+                    min_sm = std::max(min_sm, sm80 ? 80 : types.contains("8_") ? 72 : 70);
                 }
         for (BasicBlock& bb : *k.scalar)
             for (Instruction& inst : bb)

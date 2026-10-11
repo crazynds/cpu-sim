@@ -1796,27 +1796,33 @@ bool WarpBuilder::emit_mma(CallInst* call, Value* mask) {
     return true;
 }
 
-// __cpusim_mmav_<in>_<acc>(j, a, b0..b7, c0..c7): element j of one warp's
-// D = A * B + C (16 x 16 x 16), with B and C as values and A by pointer (its
-// fragment, a per-thread array). Element e of a fragment, over a warp's 32
-// lanes, is rows 2e and 2e + 1 of the tile (mma.h), so C's values are already
-// accumulators, a row per 16 lanes, and B's hold two rows of k each. A's
-// values are broadcast from its fragment in memory (lane-major: row r at
-// (r / 2) * W + (r % 2) * 16 elements), which the load units do; loading A
-// one step ahead (mma.h's note) keeps those loads off stores still in flight.
-// The first of the 8 calls computes all of D; the others take their element.
+// __cpusim_mmav_<in>_<acc>(j, a, b..., c...): element j of one warp's
+// D = A * B + C, with B and C as values and A by pointer (its fragment, a
+// per-thread array). Element e of a fragment, over a warp's 32 lanes, is
+// 32 / C whole rows of its tile, C its columns (mma.h), so C's values are
+// already accumulators, a row per C lanes, and B's hold rows of k. A's values
+// are broadcast from its fragment in memory, which the load units do; loading
+// A one step ahead (mma.h's note) keeps those loads off stores still in
+// flight. The first call computes all of D; the others take their element.
 //
 // Per type, one dot-product instruction per (row, group of k):
 //   bf16: vdpbf16ps, pairs of k. B's two rows interleaved with vpermw; A's
 //         pair broadcast as the third operand ({1to16} memory form).
 //   s8, u8: vpdpbusd, quads of k, unsigned bytes x signed bytes. A goes in as
-//         it is, on the side of its signedness (s8: the signed side, folded
-//         as a {1to16} memory operand; u8: the unsigned side, a broadcast
-//         load); B's four rows interleaved with vpermb and xor 0x80 for the
-//         other side (B + 128 unsigned, B - 128 signed), and the 128 * (row
-//         sum of A) that adds or removes is fixed at the end, a vpermd per
-//         row. (A xor 0x80 with a column-sum fix would need a vector xor per
-//         vpdpbusd, on the same pipes: half the speed.)
+//         it is, a broadcast load per quad, on the side of its signedness;
+//         B's four rows interleaved with vpermb and xor 0x80 for the other
+//         side (B + 128 unsigned, B - 128 signed); the 128 * (row sum of A)
+//         that adds or removes comes from vpsadbw and is applied at the end
+//         with broadcast loads. (A xor 0x80 with a column-sum fix would need
+//         a vector xor per vpdpbusd, and a per-row broadcast out of a register
+//         a shuffle: both on vpdpbusd's pipes.)
+//   fp16: no fp16 dot product without AVX512-FP16: A converted to fp32 once
+//         per mma into a scratch area, B's rows converted, then one FMA per
+//         (row, k) with A broadcast from the scratch area.
+//   tf32 (16 x 16 x 8): the same with fp32 values whose 13 low mantissa bits
+//         are cleared (the tensor core ignores them).
+//   f64 (8 x 8 x 4): one FMA of 8 doubles per (row, k), A broadcast from its
+//         fragment.
 Value* WarpBuilder::emit_mmav(CallInst* call) {
     std::vector<Value*> key{b_.GetInsertBlock()};
     for (unsigned i = 1; i < call->arg_size(); ++i) key.push_back(call->getArgOperand(i));
@@ -1845,21 +1851,36 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
     } else {
         return fail("tensor core fragment chosen per lane", call), nullptr;
     }
+    // The tile shape: elements of B and of C per lane, rows and columns of the
+    // accumulator, columns of A (= k). A fragment's element j holds 32 / cols
+    // whole rows of its tile (mma.h).
+    struct Shape {
+        unsigned nb, nc, rows, cols, ka;
+    };
+    const Shape sh = types == "tf32_f32"  ? Shape{4, 8, 16, 16, 8}
+                     : types == "f64_f64" ? Shape{1, 2, 8, 8, 4}
+                                          : Shape{8, 8, 16, 16, 16};
+    if (call->arg_size() != 2 + sh.nb + sh.nc) return fail("tensor core call with the wrong arguments", call), nullptr;
     Value *bv[8], *c[8];
-    for (unsigned e = 0; e < 8; ++e) {
-        bv[e] = vector(call->getArgOperand(2 + e));
-        c[e] = vector(call->getArgOperand(10 + e));
-    }
+    for (unsigned e = 0; e < sh.nb; ++e) bv[e] = vector(call->getArgOperand(2 + e));
+    for (unsigned e = 0; e < sh.nc; ++e) c[e] = vector(call->getArgOperand(2 + sh.nb + e));
     // Byte address of A's row r, element (column) k, in warp w's part.
     auto a_at = [&](unsigned l0, unsigned r, unsigned k) {
-        return b_.CreateConstInBoundsGEP1_64(i8, sa.base, ((r / 2) * W + l0 + (r % 2) * 16 + k) * ea);
+        const unsigned per = 32 / sh.ka;  // rows per element
+        return b_.CreateConstInBoundsGEP1_64(i8, sa.base, ((r / per) * W + l0 + (r % per) * sh.ka + k) * ea);
+    };
+    // Row k of B (sh.cols values), out of B's elements.
+    auto b_row = [&](unsigned l0, unsigned k) {
+        const unsigned per = 32 / sh.cols;
+        return slice(bv[k / per], l0 + (k % per) * sh.cols, sh.cols);
     };
 
-    std::array<std::vector<Value*>, 8> parts;  // per element: 16-lane rows, in lane order
+    std::array<std::vector<Value*>, 8> parts;  // per element of C: its rows, in lane order
     for (unsigned w = 0; w < W / CPUSIM_WARP_SIZE; ++w) {
         const unsigned l0 = w * CPUSIM_WARP_SIZE;
+        const unsigned per = 32 / sh.cols;  // accumulator rows per element
         Value* acc[16];
-        for (unsigned r = 0; r < 16; ++r) acc[r] = slice(c[r / 2], l0 + (r % 2) * 16, 16);
+        for (unsigned r = 0; r < sh.rows; ++r) acc[r] = slice(c[r / per], l0 + (r % per) * sh.cols, sh.cols);
         if (types == "bf16_f32") {
             auto* v32bf = FixedVectorType::get(b_.getBFloatTy(), 32);
             SmallVector<uint16_t, 32> pairs;
@@ -1966,12 +1987,58 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
                     av->setVolatile(true);
                     acc[r] = b_.CreateCall(fma, {b_.CreateVectorSplat(16, av), bk[k], acc[r]});
                 }
+        } else if (types == "tf32_f32") {
+            auto* f32 = b_.getFloatTy();
+            auto* v16f = FixedVectorType::get(f32, 16);
+            auto* v32f = FixedVectorType::get(f32, 32);
+            Function* fma = Intrinsic::getDeclaration(&m_, Intrinsic::fma, {v16f});
+            // The tensor core uses a 10-bit mantissa and ignores the 13 low
+            // bits of what it is given (rounding is __float_to_tf32's job).
+            auto tf32 = [&](Value* v) {
+                auto* vt = cast<FixedVectorType>(v->getType());
+                auto* it = FixedVectorType::get(i32, vt->getNumElements());
+                return b_.CreateBitCast(b_.CreateAnd(b_.CreateBitCast(v, it), ConstantInt::get(it, 0xffffe000u)), vt);
+            };
+            // A (16 x 8), truncated, into the scratch area row-major: row r of
+            // A at r * 32 bytes; each broadcast below is then a load.
+            Value* scratch = mma_scratch();
+            for (unsigned e = 0; e < 4; ++e) {  // element e: rows 4e .. 4e + 3
+                Value* av = b_.CreateAlignedLoad(v32f, a_at(l0, 4 * e, 0), Align(4));
+                b_.CreateAlignedStore(tf32(av), b_.CreateConstInBoundsGEP1_64(i8, scratch, e * 128), Align(64));
+            }
+            Value* bk[8];
+            for (unsigned k = 0; k < 8; ++k) bk[k] = tf32(b_row(l0, k));
+            for (unsigned k = 0; k < 8; ++k)
+                for (unsigned r = 0; r < 16; ++r) {
+                    // Volatile: forwarded from the stores above, the
+                    // broadcasts would come out of registers, with shuffles.
+                    LoadInst* av = b_.CreateAlignedLoad(f32, b_.CreateConstInBoundsGEP1_64(i8, scratch, (r * 8 + k) * 4),
+                                                        Align(4));
+                    av->setVolatile(true);
+                    acc[r] = b_.CreateCall(fma, {b_.CreateVectorSplat(16, av), bk[k], acc[r]});
+                }
+        } else if (types == "f64_f64") {
+            auto* f64 = b_.getDoubleTy();
+            auto* v8d = FixedVectorType::get(f64, 8);
+            Function* fma = Intrinsic::getDeclaration(&m_, Intrinsic::fma, {v8d});
+            // 8 x 8 x 4: an accumulator row is one register of 8 doubles.
+            Value* bk[4];
+            for (unsigned k = 0; k < 4; ++k) bk[k] = b_row(l0, k);
+            for (unsigned k = 0; k < 4; ++k)
+                for (unsigned r = 0; r < 8; ++r) {
+                    // Volatile: the fragment stays in memory, each value a
+                    // broadcast load rather than a shuffle out of registers.
+                    LoadInst* av = b_.CreateAlignedLoad(f64, a_at(l0, r, k), Align(8));
+                    av->setVolatile(true);
+                    acc[r] = b_.CreateCall(fma, {b_.CreateVectorSplat(8, av), bk[k], acc[r]});
+                }
         } else {
             return fail("tensor core types not supported inline: " + types.str(), call), nullptr;
         }
-        for (unsigned e = 0; e < 8; ++e) parts[e].push_back(acc[2 * e]), parts[e].push_back(acc[2 * e + 1]);
+        for (unsigned e = 0; e < sh.nc; ++e)
+            for (unsigned i = 0; i < per; ++i) parts[e].push_back(acc[e * per + i]);
     }
-    for (unsigned e = 0; e < 8; ++e) out[e] = concat_chunks(parts[e]);
+    for (unsigned e = 0; e < sh.nc; ++e) out[e] = concat_chunks(parts[e]);
     return out[j];
 }
 
