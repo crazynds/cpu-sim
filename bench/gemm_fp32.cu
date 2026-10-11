@@ -3,8 +3,9 @@
 //         - nvcc (GPU): cuBLAS with TF32 tensor cores (cublasGemmEx,
 //           CUBLAS_COMPUTE_32F_FAST_TF32);
 //         - cucc (CPU simulator): CUDA written for the simulator: managed
-//           memory instead of copies, packing kernels with streaming stores,
-//           and a BLIS-like micro-kernel of 6 x 64 per block of 64 threads;
+//           memory instead of copies, packing kernels (streaming stores
+//           when the copies exceed L3) and a BLIS-like micro-kernel of
+//           6 x 64 per block of 64 threads;
 //   omp:  C++ with OpenMP and AVX-512, BLIS-like (packing, KC/MC/NC cache
 //         blocks, 8 x 32 micro-kernel in 16 zmm registers).
 // Inputs are small integers, so every product and sum is exact in fp32 (and
@@ -52,24 +53,32 @@ static double now_s() { return std::chrono::duration<double>(std::chrono::steady
 constexpr int SMR = 6, SNR = 64, SKC = 768, SNC = 512;
 
 // One block per (micro-panel of 6 rows, 32 values of k). Lane l of step j writes
-// element 32 j + l of the 192 contiguous floats, so the store is one streaming
-// (non-temporal) store per step: the packed copy goes to memory without first
-// reading the lines it overwrites.
+// element 32 j + l of the 192 contiguous floats. With STREAM the stores are
+// streaming (non-temporal): the packed copy goes to memory without first
+// reading the lines it overwrites. That pays when the copies do not fit in L3;
+// when they do, it would evict them right before the multiplication reads them.
+template <bool STREAM>
 __global__ void __launch_bounds__(32) pack_a(const float* A, float* Ap, int K) {
     const int lane = threadIdx.x, panel = blockIdx.x, k0 = blockIdx.y * 32;
     float* dst = Ap + (long)panel * K * SMR + (long)k0 * SMR;
 #pragma unroll
     for (int j = 0; j < SMR; ++j) {
         const int o = 32 * j + lane;
-        __stcs(dst + o, A[(long)(panel * SMR + o % SMR) * K + k0 + o / SMR]);
+        const float v = A[(long)(panel * SMR + o % SMR) * K + k0 + o / SMR];
+        if (STREAM) __stcs(dst + o, v);
+        else dst[o] = v;
     }
 }
 // One block per (panel of 64 columns, 256 values of k): each row is a copy of 256 bytes.
+template <bool STREAM>
 __global__ void __launch_bounds__(SNR) pack_b(const float* B, float* Bp, int K, int N) {
     const int lane = threadIdx.x, panel = blockIdx.x, k0 = blockIdx.y * 256;
     const float* src = B + (long)k0 * N + panel * SNR + lane;
     float* dst = Bp + (long)panel * K * SNR + (long)k0 * SNR + lane;
-    for (int k = 0; k < 256; ++k) __stcs(dst + k * SNR, src[(long)k * N]);
+    for (int k = 0; k < 256; ++k) {
+        if (STREAM) __stcs(dst + k * SNR, src[(long)k * N]);
+        else dst[k * SNR] = src[(long)k * N];
+    }
 }
 // C[m0 : m0 + mc, n0 : n0 + SNC] = A * B, for mc rows (a multiple of 6) per block.
 __global__ void __launch_bounds__(SNR) sgemm(const float* Ap, const float* Bp, float* C, int N, int K, int mc) {
@@ -95,8 +104,13 @@ __global__ void __launch_bounds__(SNR) sgemm(const float* Ap, const float* Bp, f
             }
         }
 }
-// Rows per block: enough blocks to keep the 28 workers busy at small sizes.
-static int rows_per_block(int n) { return n <= 1536 ? 24 : 96; }
+// Rows per block: 96 when that gives enough blocks to keep every multiprocessor
+// (worker core) busy to the end, fewer at small sizes.
+static int rows_per_block(int n, int multiprocessors) {
+    for (int mc : {96, 48, 24})
+        if ((n / mc) * (n / SNC) >= 8 * multiprocessors) return mc;
+    return 24;
+}
 
 /* ------------------------------------------------------- OpenMP + AVX-512 */
 
@@ -254,10 +268,20 @@ static Result run_cuda(const std::vector<float>& hA, const std::vector<float>& h
     CHECK(cudaMalloc(&Bp, bytes));
     std::copy(hA.begin(), hA.end(), A);
     std::copy(hB.begin(), hB.end(), B);
-    const int mc = rows_per_block(n);
+    cudaDeviceProp prop;
+    CHECK(cudaGetDeviceProperties(&prop, 0));
+    const int mc = rows_per_block(n, prop.multiProcessorCount);
+    // Streaming stores only when the two packed copies do not fit in the cache
+    // (on the simulator l2CacheSize is the CPU's last-level cache).
+    const bool stream = 2 * bytes > size_t(prop.l2CacheSize);
     auto prepare = [&] {
-        pack_a<<<dim3(n / SMR, n / 32), 32>>>(A, Ap, n);
-        pack_b<<<dim3(n / SNR, n / 256), SNR>>>(B, Bp, n, n);
+        if (stream) {
+            pack_a<true><<<dim3(n / SMR, n / 32), 32>>>(A, Ap, n);
+            pack_b<true><<<dim3(n / SNR, n / 256), SNR>>>(B, Bp, n, n);
+        } else {
+            pack_a<false><<<dim3(n / SMR, n / 32), 32>>>(A, Ap, n);
+            pack_b<false><<<dim3(n / SNR, n / 256), SNR>>>(B, Bp, n, n);
+        }
     };
     auto kernel = [&] { sgemm<<<dim3(n / mc, n / SNC), SNR>>>(Ap, Bp, C, n, n, mc); };
     // Warm-up (JIT and choice of variant).
