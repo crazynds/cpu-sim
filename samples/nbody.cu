@@ -64,6 +64,7 @@ __global__ void nbody_step(const float4* pos_in, const float4* vel_in, float4* p
 static void cpu_step(const std::vector<float4>& pos, const std::vector<float4>& vel,
                      std::vector<float4>& pos_out, std::vector<float4>& vel_out, float dt) {
     int n = static_cast<int>(pos.size());
+#pragma omp parallel for schedule(static)
     for (int i = 0; i < n; ++i) {
         float3 acc = make_float3(0.0f, 0.0f, 0.0f);
         for (int j = 0; j < n; ++j) acc = body_interaction(pos[i], pos[j], acc);
@@ -72,7 +73,11 @@ static void cpu_step(const std::vector<float4>& pos, const std::vector<float4>& 
 }
 
 int main() {
+#ifdef SAMPLE_TEST
+    const int n = 20000;   // tests: same code paths, seconds
+#else
     const int n = 175000;  // not a multiple of BLOCK on purpose
+#endif
     const int steps = 1;
     const float dt = 0.01f;
 
