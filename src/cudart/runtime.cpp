@@ -98,6 +98,9 @@ struct SymbolDesc {
     std::string name;
     uint64_t size = 0, align = 1;
     uint64_t address = 0;
+    bool managed = false;  // __managed__: kept equal to `host` around launches
+    void* host = nullptr;  // its host copy (the registered shadow)
+    std::vector<uint8_t> initial;  // managed: its initial value, for the host copy
 };
 
 struct Module {
@@ -452,6 +455,11 @@ Error load_generic(Module& m, cpusim::Device* d) {
         e = d->bind_symbols(m.handle, m.symbol_table(), true);
         if (e != Error::Success) return e;
     }
+    // __managed__ variables: their host copies (registered by the program).
+    for (auto& sym : m.symbols)
+        if (sym.managed)
+            for (auto& [host, var] : registry().variables)
+                if (var.module == &m && var.name == sym.name) sym.host = const_cast<void*>(host);
     m.loaded = true;
     return Error::Success;
 }
@@ -522,6 +530,10 @@ bool parse_manifest(const char* text, size_t size, Module* m) {
         if (word == "symbol") {
             SymbolDesc sym;
             if (!(ls >> sym.name >> sym.size >> sym.align)) return false;
+            std::string flag, hex;
+            sym.managed = (ls >> flag) && flag == "managed";
+            if (sym.managed && (ls >> hex) && hex.size() == 2 * sym.size)
+                for (size_t i = 0; i < sym.size; ++i) sym.initial.push_back(uint8_t(std::stoul(hex.substr(2 * i, 2), nullptr, 16)));
             m->symbols.push_back(sym);
             continue;
         }
@@ -751,22 +763,69 @@ cudaError_t cudaMemAdvise(const void*, size_t, cudaMemoryAdvise, int) { return c
 // ordinary memory.
 cudaError_t cudaHostAlloc(void** ptr, size_t size, unsigned int) { return cudaMallocHost(ptr, size); }
 
+namespace {
+struct MappedRange {
+    char* host;
+    char* shadow;  // == host in-process
+    size_t size;
+};
+std::mutex mapped_mutex;
+std::vector<MappedRange> mapped_ranges;
+}  // namespace
+
 cudaError_t cudaHostGetDevicePointer(void** dev, void* host, unsigned int) {
     if (!dev) return record(Error::InvalidValue);
     REQUIRE_DEVICE(d);
+    {
+        std::lock_guard lock(mapped_mutex);
+        for (const auto& r : mapped_ranges)
+            if (static_cast<char*>(host) >= r.host && static_cast<char*>(host) < r.host + r.size) {
+                *dev = r.shadow + (static_cast<char*>(host) - r.host);
+                return cudaSuccess;
+            }
+    }
     if (!d->is_managed_pointer(host)) return record(Error::InvalidValue);  // not from cudaHostAlloc
     *dev = host;
     return cudaSuccess;
 }
 
-// Page locking means nothing here; registered memory is not mapped for kernels
-// (they may run in the driver's process, which cannot see it).
+// Page locking means nothing here. Mapped registration (kernels use the
+// memory in place): in-process, the program's memory is the kernels'; with
+// the driver, kernels run in its process and see a copy in the shared pool,
+// made equal to the program's memory around every launch (copied in before,
+// back after), so a kernel reads what the program wrote before launching it
+// and the program reads what the kernel wrote once it is done.
 cudaError_t cudaHostRegister(void* ptr, size_t size, unsigned int flags) {
-    if (flags & cudaHostRegisterMapped) return record(Error::NotSupported);
+    if (!ptr || !size) return record(Error::InvalidValue);
+    if (flags & cudaHostRegisterMapped) {
+        REQUIRE_DEVICE(d);
+        char* shadow = static_cast<char*>(ptr);
+        if (std::strcmp(d->backend_name(), "inprocess") != 0) {
+            uint64_t p = 0;
+            if (Error e = d->malloc_managed(size, &p); e != Error::Success) return record(e);
+            shadow = reinterpret_cast<char*>(p);
+            std::memcpy(shadow, ptr, size);
+        }
+        std::lock_guard lock(mapped_mutex);
+        mapped_ranges.push_back({static_cast<char*>(ptr), shadow, size});
+    }
     cpusim::cudart::pinned_add(ptr, size, false);
     return cudaSuccess;
 }
 cudaError_t cudaHostUnregister(void* ptr) {
+    {
+        std::lock_guard lock(mapped_mutex);
+        for (auto it = mapped_ranges.begin(); it != mapped_ranges.end(); ++it)
+            if (it->host == ptr) {
+                if (it->shadow != it->host) {
+                    runtime().sched.wait_all();
+                    std::memcpy(it->host, it->shadow, it->size);
+                    cudaFree(it->shadow);
+                }
+                mapped_ranges.erase(it);
+                break;
+            }
+    }
     return cpusim::cudart::pinned_remove(ptr) ? cudaSuccess : record(Error::InvalidValue);
 }
 
@@ -778,6 +837,7 @@ cudaError_t cudaMallocHost(void** ptr, size_t size) {
     uint64_t p = 0;
     if (Error e = d->malloc_managed(size, &p); e == Error::Success) {
         *ptr = reinterpret_cast<void*>(p);
+        cpusim::cudart::pinned_add(*ptr, size, false);  // page-locked host memory, for the queries
     } else if (e == Error::NotSupported) {
         // Recorded so asynchronous copies from it are not staged.
         *ptr = std::malloc(size);
@@ -792,7 +852,10 @@ cudaError_t cudaMallocHost(void** ptr, size_t size) {
 cudaError_t cudaFreeHost(void* ptr) {
     if (!ptr) return cudaSuccess;
     cudaError_t init_err = cudaSuccess;
-    if (cpusim::Device* d = device(&init_err); d && d->is_managed_pointer(ptr)) return cudaFree(ptr);
+    if (cpusim::Device* d = device(&init_err); d && d->is_managed_pointer(ptr)) {
+        cpusim::cudart::pinned_remove(ptr);
+        return cudaFree(ptr);
+    }
     // Only what cudaMallocHost allocated itself (not a registered buffer).
     if (!cpusim::cudart::pinned_owned(ptr)) return record(Error::InvalidValue);
     runtime().sched.wait_all();  // no copy still reading it
@@ -906,7 +969,91 @@ struct CUevent_st {
     std::mutex mutex;
     cpusim::cudart::CompletionPtr pending;  // null: never recorded
     std::shared_ptr<std::chrono::steady_clock::time_point> when;
+    CUgraph_st* captured = nullptr;  // recorded in a stream being captured into this graph
 };
+
+// ---- CUDA Graphs
+//
+// A node is an operation with its arguments copied (a kernel's parameter
+// values, as cudaLaunchKernel copies them). Nodes are kept in the order they
+// were added: each one after the nodes it depends on (in a capture, the
+// program issued them in that order; explicit nodes name earlier ones). A
+// launch enqueues them in that order on its stream.
+struct CUgraphNode_st {
+    enum Kind { Kernel, Memcpy, Memset, Host, Empty } kind = Empty;
+    const void* func = nullptr;
+    dim3 grid, block;
+    size_t shared = 0;
+    std::vector<uint8_t> args;                         // parameter values, packed
+    std::vector<std::pair<size_t, size_t>> arg_slots;  // offset, size in `args`
+    void* dst = nullptr;
+    const void* src = nullptr;
+    size_t count = 0;
+    cudaMemcpyKind copy_kind = cudaMemcpyDefault;
+    cudaMemsetParams memset{};
+    std::vector<uint8_t> pattern;  // one row of a memset with elements wider than a byte
+    cudaHostFn_t fn = nullptr;
+    void* data = nullptr;
+};
+
+struct CUgraph_st {
+    std::vector<std::unique_ptr<CUgraphNode_st>> nodes;
+};
+
+struct CUgraphExec_st {
+    std::vector<CUgraphNode_st> nodes;
+    std::map<const CUgraphNode_st*, size_t> index;  // the graph's node -> ours
+};
+
+namespace {
+std::mutex capture_mutex;
+std::map<cudaStream_t, CUgraph_st*> capturing_streams;
+
+// The graph `stream` is being captured into, or null.
+CUgraph_st* capturing(cudaStream_t stream) {
+    std::lock_guard lock(capture_mutex);
+    auto it = capturing_streams.find(stream);
+    return it == capturing_streams.end() ? nullptr : it->second;
+}
+
+CUgraphNode_st* add_node(CUgraph_st* g, CUgraphNode_st::Kind kind) {
+    g->nodes.push_back(std::make_unique<CUgraphNode_st>());
+    g->nodes.back()->kind = kind;
+    return g->nodes.back().get();
+}
+
+// A kernel node's parameters copied from `args` (the sizes come from the
+// kernel's manifest entry).
+cudaError_t set_kernel(CUgraphNode_st* n, const void* func, dim3 grid, dim3 block, size_t shared, void** args) {
+    std::vector<std::pair<uint64_t, uint64_t>> params;
+    {
+        Registry& r = registry();
+        std::lock_guard lock(r.mutex);
+        auto it = r.functions.find(func);
+        if (it == r.functions.end() || !it->second.kernel) return record(Error::InvalidDeviceFunction);
+        params = it->second.kernel->params;
+    }
+    n->func = func, n->grid = grid, n->block = block, n->shared = shared;
+    n->args.clear();
+    n->arg_slots.clear();
+    for (size_t i = 0; i < params.size(); ++i) {
+        const size_t at = (n->args.size() + 15) & ~size_t(15);
+        n->args.resize(at + params[i].second);
+        std::memcpy(n->args.data() + at, args[i], params[i].second);
+        n->arg_slots.push_back({at, params[i].second});
+    }
+    return cudaSuccess;
+}
+
+void set_memset(CUgraphNode_st* n, const cudaMemsetParams& p) {
+    n->memset = p;
+    n->pattern.clear();
+    if (p.elementSize > 1) {
+        n->pattern.resize(p.width * p.elementSize);
+        for (size_t i = 0; i < p.width; ++i) std::memcpy(n->pattern.data() + i * p.elementSize, &p.value, p.elementSize);
+    }
+}
+}  // namespace
 
 extern "C" {
 
@@ -964,6 +1111,17 @@ cudaError_t cudaStreamQuery(cudaStream_t stream) {
 
 cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned int) {
     if (!event) return record(Error::InvalidResourceHandle);
+    {
+        // An event recorded during a capture: this stream joins the capture
+        // (a fork); its operations go into the same graph.
+        std::lock_guard lock(event->mutex);
+        if (event->captured) {
+            std::lock_guard clock(capture_mutex);
+            capturing_streams[stream] = event->captured;
+            return cudaSuccess;
+        }
+    }
+    if (capturing(stream)) return cudaSuccess;  // ordering inside a graph is its node order
     cpusim::cudart::EnqueueOptions opt;
     {
         std::lock_guard lock(event->mutex);
@@ -975,6 +1133,11 @@ cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned
 
 cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void* data) {
     if (!fn) return record(Error::InvalidValue);
+    if (CUgraph_st* g = capturing(stream)) {
+        CUgraphNode_st* n = add_node(g, CUgraphNode_st::Host);
+        n->fn = fn, n->data = data;
+        return cudaSuccess;
+    }
     runtime().sched.enqueue(stream, [fn, data] {
         fn(data);
         return cudaSuccess;
@@ -994,6 +1157,11 @@ cudaError_t cudaStreamAddCallback(cudaStream_t stream, cudaStreamCallback_t cb, 
 cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
     if (count == 0) return cudaSuccess;
     if (!dst || !src) return record(Error::InvalidValue);
+    if (CUgraph_st* g = capturing(stream)) {
+        CUgraphNode_st* n = add_node(g, CUgraphNode_st::Memcpy);
+        n->dst = dst, n->src = src, n->count = count, n->copy_kind = kind;
+        return cudaSuccess;
+    }
     REQUIRE_DEVICE(d);
     queue_copy(d, dst, src, count, kind, stream, false);
     return cudaSuccess;
@@ -1001,6 +1169,10 @@ cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t count, cudaMemcpy
 
 cudaError_t cudaMemsetAsync(void* ptr, int value, size_t count, cudaStream_t stream) {
     if (count == 0) return cudaSuccess;
+    if (CUgraph_st* g = capturing(stream)) {
+        set_memset(add_node(g, CUgraphNode_st::Memset), {ptr, count, unsigned(value & 0xff), 1, count, 1});
+        return cudaSuccess;
+    }
     REQUIRE_DEVICE(d);
     if (!d->is_device_pointer(ptr) && !d->is_managed_pointer(ptr)) return record(Error::InvalidValue);
     queue_memset(d, ptr, value, count, stream);
@@ -1023,6 +1195,11 @@ cudaError_t cudaEventDestroy(cudaEvent_t event) {
 
 cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
     if (!event) return record(Error::InvalidResourceHandle);
+    if (CUgraph_st* g = capturing(stream)) {
+        std::lock_guard lock(event->mutex);
+        event->captured = g;
+        return cudaSuccess;
+    }
     auto when = std::make_shared<std::chrono::steady_clock::time_point>();
     auto done = runtime().sched.enqueue(stream, [when] {
         *when = std::chrono::steady_clock::now();  // everything before it in the stream ran
@@ -1031,6 +1208,7 @@ cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
     std::lock_guard lock(event->mutex);
     event->pending = done;
     event->when = when;
+    event->captured = nullptr;
     return cudaSuccess;
 }
 
@@ -1117,6 +1295,10 @@ void __cudaRegisterVar(void** handle, char* host_var, char*, const char* device_
     Registry& r = registry();
     std::lock_guard lock(r.mutex);
     r.variables[host_var] = {m, device_name, size};
+    // A __managed__ variable's host copy starts from its initial value.
+    for (const auto& sym : m->symbols)
+        if (sym.managed && sym.name == device_name && sym.initial.size() == size)
+            std::memcpy(host_var, sym.initial.data(), size);
 }
 
 unsigned __cudaPushCallConfiguration(dim3 grid, dim3 block, size_t shared, void* stream) {
@@ -1138,6 +1320,7 @@ cudaError_t __cudaPopCallConfiguration(dim3* grid, dim3* block, size_t* shared, 
 cudaError_t cudaLaunchKernel(const void* func, dim3 grid, dim3 block, void** args, size_t shared,
                              cudaStream_t stream) {
     REQUIRE_DEVICE(d);
+    if (CUgraph_st* g = capturing(stream)) return set_kernel(add_node(g, CUgraphNode_st::Kernel), func, grid, block, shared, args);
     {
         // A bad configuration is reported by the launch itself, as in CUDA.
         const auto& p = d->properties();
@@ -1198,12 +1381,32 @@ cudaError_t cudaLaunchKernel(const void* func, dim3 grid, dim3 block, void** arg
     cfg.debug = debug;
 
     Profiler& prof = profiler();
+    // __managed__ variables of the kernel's module: the host's values in,
+    // the kernel's out (see the device header).
+    struct Managed {
+        uint64_t address;
+        void* host;
+        uint64_t size;
+    };
+    std::vector<Managed> managed;
+    for (const auto& sym : m.symbols)
+        if (sym.managed && sym.host) managed.push_back({sym.address, sym.host, sym.size});
     if (!prof.enabled && !debug) {
         // Queued on its stream; returns right away.
         auto buf = std::make_shared<std::vector<uint8_t>>(std::move(params));
-        runtime().sched.enqueue(stream, [d, function, cfg, buf, name = k.name]() -> cudaError_t {
+        runtime().sched.enqueue(stream, [d, function, cfg, buf, name = k.name, managed]() -> cudaError_t {
+            for (const Managed& v : managed) d->memcpy_htod(v.address, v.host, v.size);
+            std::vector<MappedRange> copies;
+            {
+                std::lock_guard lock(mapped_mutex);
+                for (const auto& r : mapped_ranges)
+                    if (r.shadow != r.host) copies.push_back(r);
+            }
+            for (const auto& r : copies) std::memcpy(r.shadow, r.host, r.size);
             cpusim::LaunchResult result;
             Error e = d->launch(function, cfg, buf->data(), buf->size(), &result);
+            for (const auto& r : copies) std::memcpy(r.host, r.shadow, r.size);
+            for (const Managed& v : managed) d->memcpy_dtoh(v.host, v.address, v.size);
             if (e != Error::Success && result.report[0])
                 std::fprintf(stderr, "cpusim: kernel %s failed:\n  %s\n", name.c_str(), result.report);
             return static_cast<cudaError_t>(e);
@@ -1249,6 +1452,7 @@ cudaError_t cudaLaunchKernel(const void* func, dim3 grid, dim3 block, void** arg
 // ---- kernel attributes and occupancy
 
 namespace {
+constexpr int kResidentPerSM = 2;  // workers (logical CPUs) per multiprocessor
 // The registered kernel behind a host stub, or null.
 KernelDesc* kernel_of(const void* func) {
     Registry& r = registry();
@@ -1318,7 +1522,10 @@ cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* blocks, 
         return cudaSuccess;
     }
     const int warps = (block_size + 31) / 32;
-    int n = std::min(p.maxBlocksPerMultiProcessor, p.maxThreadsPerMultiProcessor / (warps * 32));
+    // Blocks run whole, one per worker (logical CPU): two per multiprocessor
+    // at a time, whatever the size. A program that sizes a persistent or
+    // cooperative grid from this gets every block resident.
+    int n = std::min({p.maxBlocksPerMultiProcessor, p.maxThreadsPerMultiProcessor / (warps * 32), kResidentPerSM});
     if (shared) n = std::min<int>(n, int(p.sharedMemPerMultiprocessor / shared));
     *blocks = std::max(n, 0);
     return cudaSuccess;
@@ -1329,11 +1536,18 @@ cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* blocks, const voi
     return cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(blocks, func, block_size, dynamic_shared, 0);
 }
 
-// Every block of the grid runs at the same time on a GPU, which
-// cooperative_groups::this_grid().sync() relies on. Launched as any other
-// kernel here (grid-wide synchronization is not supported).
+// Every block of the grid must be resident at once (this_grid().sync()
+// waits for all of them): at most the occupancy times the multiprocessors.
 cudaError_t cudaLaunchCooperativeKernel(const void* func, dim3 grid, dim3 block, void** args, size_t shared,
                                         cudaStream_t stream) {
+    REQUIRE_DEVICE(d);
+    int per_sm = 0;
+    if (cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, func, int(block.x * block.y * block.z),
+                                                                      shared);
+        e != cudaSuccess)
+        return e;
+    if (uint64_t(grid.x) * grid.y * grid.z > uint64_t(per_sm) * d->properties().multiProcessorCount)
+        return record(Error::CooperativeLaunchTooLarge);
     return cudaLaunchKernel(func, grid, block, args, shared, stream);
 }
 
@@ -1460,15 +1674,16 @@ cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes* a, const void
     REQUIRE_DEVICE(d);
     *a = {};
     a->device = 0;
-    if (d->is_managed_pointer(ptr)) {
+    if (cpusim::cudart::pinned_contains(ptr, 1)) {  // page-locked: usable by kernels in place
+        a->type = cudaMemoryTypeHost;
+        a->hostPointer = const_cast<void*>(ptr);
+        a->devicePointer = d->is_managed_pointer(ptr) ? const_cast<void*>(ptr) : nullptr;
+    } else if (d->is_managed_pointer(ptr)) {
         a->type = cudaMemoryTypeManaged;
         a->devicePointer = a->hostPointer = const_cast<void*>(ptr);
     } else if (d->is_device_pointer(ptr)) {
         a->type = cudaMemoryTypeDevice;
         a->devicePointer = const_cast<void*>(ptr);
-    } else if (cpusim::cudart::pinned_contains(ptr, 1)) {
-        a->type = cudaMemoryTypeHost;
-        a->hostPointer = const_cast<void*>(ptr);
     } else {
         a->type = cudaMemoryTypeUnregistered;
         a->device = -2;
@@ -1580,6 +1795,192 @@ cudaError_t cudaMemcpyFromSymbol(void* dst, const void* symbol, size_t count, si
     if (cudaError_t e = cudaMemcpyFromSymbolAsync(dst, symbol, count, offset, kind, nullptr); e != cudaSuccess)
         return e;
     return cudaStreamSynchronize(nullptr);
+}
+
+// ---- CUDA Graphs (the nodes and capture state are above)
+
+cudaError_t cudaStreamBeginCapture(cudaStream_t stream, enum cudaStreamCaptureMode) {
+    if (!is_object(stream)) return record(Error::NotSupported);  // not the legacy default stream
+    std::lock_guard lock(capture_mutex);
+    if (capturing_streams.count(stream)) return record(Error::InvalidValue);
+    capturing_streams[stream] = new CUgraph_st;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* graph) {
+    if (!graph) return record(Error::InvalidValue);
+    std::lock_guard lock(capture_mutex);
+    auto it = capturing_streams.find(stream);
+    if (it == capturing_streams.end()) return record(Error::InvalidValue);
+    CUgraph_st* g = it->second;
+    // Every stream that joined this capture leaves it.
+    for (auto i = capturing_streams.begin(); i != capturing_streams.end();)
+        i = i->second == g ? capturing_streams.erase(i) : std::next(i);
+    *graph = g;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus* status) {
+    if (!status) return record(Error::InvalidValue);
+    *status = capturing(stream) ? cudaStreamCaptureStatusActive : cudaStreamCaptureStatusNone;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphCreate(cudaGraph_t* graph, unsigned int) {
+    if (!graph) return record(Error::InvalidValue);
+    *graph = new CUgraph_st;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
+    delete graph;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t* nodes, size_t* count) {
+    if (!graph || !count) return record(Error::InvalidValue);
+    if (!nodes) {
+        *count = graph->nodes.size();
+        return cudaSuccess;
+    }
+    const size_t n = std::min(*count, graph->nodes.size());
+    for (size_t i = 0; i < n; ++i) nodes[i] = graph->nodes[i].get();
+    *count = n;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphAddKernelNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t*, size_t,
+                                   const struct cudaKernelNodeParams* p) {
+    if (!node || !graph || !p) return record(Error::InvalidValue);
+    CUgraphNode_st* n = add_node(graph, CUgraphNode_st::Kernel);
+    *node = n;
+    return set_kernel(n, p->func, p->gridDim, p->blockDim, p->sharedMemBytes, p->kernelParams);
+}
+
+cudaError_t cudaGraphAddMemsetNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t*, size_t,
+                                   const struct cudaMemsetParams* p) {
+    if (!node || !graph || !p || (p->elementSize != 1 && p->elementSize != 2 && p->elementSize != 4))
+        return record(Error::InvalidValue);
+    CUgraphNode_st* n = add_node(graph, CUgraphNode_st::Memset);
+    set_memset(n, *p);
+    *node = n;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphAddMemcpyNode1D(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t*, size_t,
+                                     void* dst, const void* src, size_t count, enum cudaMemcpyKind kind) {
+    if (!node || !graph) return record(Error::InvalidValue);
+    CUgraphNode_st* n = add_node(graph, CUgraphNode_st::Memcpy);
+    n->dst = dst, n->src = src, n->count = count, n->copy_kind = kind;
+    *node = n;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphAddHostNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t*, size_t,
+                                 const struct cudaHostNodeParams* p) {
+    if (!node || !graph || !p || !p->fn) return record(Error::InvalidValue);
+    CUgraphNode_st* n = add_node(graph, CUgraphNode_st::Host);
+    n->fn = p->fn, n->data = p->userData;
+    *node = n;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphAddEmptyNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t*, size_t) {
+    if (!node || !graph) return record(Error::InvalidValue);
+    *node = add_node(graph, CUgraphNode_st::Empty);
+    return cudaSuccess;
+}
+
+namespace {
+// A kernel node's parameters as cudaLaunchKernel takes them.
+std::vector<void*> kernel_args(CUgraphNode_st& n) {
+    std::vector<void*> a;
+    for (auto [at, size] : n.arg_slots) a.push_back(n.args.data() + at);
+    return a;
+}
+}  // namespace
+
+cudaError_t cudaGraphKernelNodeGetParams(cudaGraphNode_t node, struct cudaKernelNodeParams* p) {
+    if (!node || !p || node->kind != CUgraphNode_st::Kernel) return record(Error::InvalidValue);
+    p->func = const_cast<void*>(node->func);
+    p->gridDim = node->grid, p->blockDim = node->block;
+    p->sharedMemBytes = unsigned(node->shared);
+    p->kernelParams = nullptr, p->extra = nullptr;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphKernelNodeSetParams(cudaGraphNode_t node, const struct cudaKernelNodeParams* p) {
+    if (!node || !p || node->kind != CUgraphNode_st::Kernel) return record(Error::InvalidValue);
+    return set_kernel(node, p->func, p->gridDim, p->blockDim, p->sharedMemBytes, p->kernelParams);
+}
+
+cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph, unsigned long long) {
+    if (!exec || !graph) return record(Error::InvalidValue);
+    auto* e = new CUgraphExec_st;
+    for (auto& n : graph->nodes) {
+        e->index[n.get()] = e->nodes.size();
+        e->nodes.push_back(*n);
+    }
+    *exec = e;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* exec, cudaGraph_t graph, unsigned long long flags) {
+    return cudaGraphInstantiate(exec, graph, flags);
+}
+
+cudaError_t cudaGraphExecKernelNodeSetParams(cudaGraphExec_t exec, cudaGraphNode_t node,
+                                             const struct cudaKernelNodeParams* p) {
+    if (!exec || !node || !p) return record(Error::InvalidValue);
+    auto it = exec->index.find(node);
+    if (it == exec->index.end() || exec->nodes[it->second].kind != CUgraphNode_st::Kernel)
+        return record(Error::InvalidValue);
+    return set_kernel(&exec->nodes[it->second], p->func, p->gridDim, p->blockDim, p->sharedMemBytes, p->kernelParams);
+}
+
+cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream) {
+    if (!exec) return record(Error::InvalidResourceHandle);
+    for (CUgraphNode_st& n : exec->nodes) {
+        cudaError_t e = cudaSuccess;
+        switch (n.kind) {
+            case CUgraphNode_st::Kernel: {
+                std::vector<void*> a = kernel_args(n);
+                e = cudaLaunchKernel(n.func, n.grid, n.block, a.data(), n.shared, stream);
+                break;
+            }
+            case CUgraphNode_st::Memcpy:
+                e = cudaMemcpyAsync(n.dst, n.src, n.count, n.copy_kind, stream);
+                break;
+            case CUgraphNode_st::Memset: {
+                const cudaMemsetParams& m = n.memset;
+                const size_t pitch = m.pitch ? m.pitch : m.width * m.elementSize;
+                if (m.elementSize == 1) {
+                    e = cudaMemset2DAsync(m.dst, pitch, int(m.value), m.width, m.height, stream);
+                } else {
+                    for (size_t y = 0; y < m.height && e == cudaSuccess; ++y)
+                        e = cudaMemcpyAsync(static_cast<char*>(m.dst) + y * pitch, n.pattern.data(), n.pattern.size(),
+                                            cudaMemcpyHostToDevice, stream);
+                }
+                break;
+            }
+            case CUgraphNode_st::Host:
+                e = cudaLaunchHostFunc(stream, n.fn, n.data);
+                break;
+            case CUgraphNode_st::Empty:
+                break;
+        }
+        if (e != cudaSuccess) return e;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphUpload(cudaGraphExec_t exec, cudaStream_t) {
+    return exec ? cudaSuccess : record(Error::InvalidResourceHandle);
+}
+
+cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
+    delete exec;
+    return cudaSuccess;
 }
 
 const char* cudaGetErrorString(cudaError_t error) { return cpusim::error_string(static_cast<Error>(error)); }

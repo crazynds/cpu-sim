@@ -1,0 +1,2 @@
+// <cuda/atomic>: cuda::atomic, cuda::atomic_ref with thread scopes (see <cuda/std/atomic>).
+#include "std/atomic"

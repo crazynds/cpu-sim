@@ -16,7 +16,10 @@
 #define __global__ __attribute__((global))
 #define __shared__ __attribute__((shared))
 #define __constant__ __attribute__((constant))
-#define __managed__ __attribute__((managed))
+/* Clang keeps __managed__ for HIP: here a __device__ variable the compiler
+ * marks (its section), which the runtime keeps equal to its host copy at the
+ * kernels' boundaries (copied in before each launch, back after it). */
+#define __managed__ __device__ __attribute__((section("cpusim_managed")))
 #define __launch_bounds__(...) __attribute__((launch_bounds(__VA_ARGS__)))
 #define __forceinline__ __inline__ __attribute__((always_inline))
 #define __noinline__ __attribute__((noinline))

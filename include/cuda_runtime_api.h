@@ -51,6 +51,7 @@ typedef enum cudaError {
     cudaErrorLaunchTimeout = 702,
     cudaErrorAssert = 710,
     cudaErrorLaunchFailure = 719,
+    cudaErrorCooperativeLaunchTooLarge = 720,
     cudaErrorNotSupported = 801,
     cudaErrorUnknown = 999
 } cudaError_t;
@@ -435,6 +436,67 @@ cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* numBlock
                                                                    size_t dynamicSMemSize, unsigned int flags);
 cudaError_t cudaLaunchCooperativeKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem,
                                         cudaStream_t stream);
+
+/* CUDA Graphs: stream capture and explicit construction. A graph runs its
+ * nodes in the order they were added (an order its dependencies allow). */
+typedef struct CUgraph_st* cudaGraph_t;
+typedef struct CUgraphExec_st* cudaGraphExec_t;
+typedef struct CUgraphNode_st* cudaGraphNode_t;
+enum cudaStreamCaptureMode {
+    cudaStreamCaptureModeGlobal = 0,
+    cudaStreamCaptureModeThreadLocal = 1,
+    cudaStreamCaptureModeRelaxed = 2
+};
+enum cudaStreamCaptureStatus {
+    cudaStreamCaptureStatusNone = 0,
+    cudaStreamCaptureStatusActive = 1,
+    cudaStreamCaptureStatusInvalidated = 2
+};
+struct cudaKernelNodeParams {
+    void* func;
+    dim3 gridDim;
+    dim3 blockDim;
+    unsigned int sharedMemBytes;
+    void** kernelParams;
+    void** extra;
+};
+struct cudaMemsetParams {
+    void* dst;
+    size_t pitch;
+    unsigned int value;
+    unsigned int elementSize;
+    size_t width;
+    size_t height;
+};
+struct cudaHostNodeParams {
+    cudaHostFn_t fn;
+    void* userData;
+};
+#define cudaGraphInstantiateFlagAutoFreeOnLaunch 1
+cudaError_t cudaStreamBeginCapture(cudaStream_t stream, enum cudaStreamCaptureMode mode);
+cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* graph);
+cudaError_t cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus* status);
+cudaError_t cudaGraphCreate(cudaGraph_t* graph, unsigned int flags);
+cudaError_t cudaGraphDestroy(cudaGraph_t graph);
+cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t* nodes, size_t* numNodes);
+cudaError_t cudaGraphAddKernelNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps, size_t numDeps,
+                                   const struct cudaKernelNodeParams* params);
+cudaError_t cudaGraphAddMemsetNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps, size_t numDeps,
+                                   const struct cudaMemsetParams* params);
+cudaError_t cudaGraphAddMemcpyNode1D(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                     size_t numDeps, void* dst, const void* src, size_t count, enum cudaMemcpyKind kind);
+cudaError_t cudaGraphAddHostNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps, size_t numDeps,
+                                 const struct cudaHostNodeParams* params);
+cudaError_t cudaGraphAddEmptyNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps, size_t numDeps);
+cudaError_t cudaGraphKernelNodeGetParams(cudaGraphNode_t node, struct cudaKernelNodeParams* params);
+cudaError_t cudaGraphKernelNodeSetParams(cudaGraphNode_t node, const struct cudaKernelNodeParams* params);
+cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph, unsigned long long flags CPUSIM_DEFAULT(0));
+cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* exec, cudaGraph_t graph, unsigned long long flags);
+cudaError_t cudaGraphExecKernelNodeSetParams(cudaGraphExec_t exec, cudaGraphNode_t node,
+                                             const struct cudaKernelNodeParams* params);
+cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream);
+cudaError_t cudaGraphUpload(cudaGraphExec_t exec, cudaStream_t stream);
+cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec);
 
 cudaError_t cudaGetLastError(void);
 cudaError_t cudaPeekAtLastError(void);

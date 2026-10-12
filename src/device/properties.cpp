@@ -86,7 +86,7 @@ DeviceProperties make_properties(const Config& cfg, const Topology& topo, int co
     p.sharedMemPerMultiprocessor = 100 * 1024;
     p.regsPerMultiprocessor = 65536;
     p.computePreemptionSupported = 0;
-    p.cooperativeLaunch = 0;
+    p.cooperativeLaunch = 1;
     p.sharedMemPerBlockOptin = 99 * 1024;
     p.maxBlocksPerMultiProcessor = 24;
     p.reservedSharedMemPerBlock = 1024;

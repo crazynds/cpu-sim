@@ -26,6 +26,7 @@ enum class Error : int {
     IllegalAddress = 700,
     Assert = 710,
     LaunchFailure = 719,
+    CooperativeLaunchTooLarge = 720,
     NotSupported = 801,
     Unknown = 999,
 };

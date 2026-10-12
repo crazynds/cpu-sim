@@ -26,6 +26,7 @@ const char* error_name(Error e) {
         case Error::IllegalAddress: return "cudaErrorIllegalAddress";
         case Error::Assert: return "cudaErrorAssert";
         case Error::LaunchFailure: return "cudaErrorLaunchFailure";
+        case Error::CooperativeLaunchTooLarge: return "cudaErrorCooperativeLaunchTooLarge";
         case Error::NotSupported: return "cudaErrorNotSupported";
         case Error::Unknown: return "cudaErrorUnknown";
     }
@@ -56,6 +57,7 @@ const char* error_string(Error e) {
         case Error::IllegalAddress: return "an illegal memory access was encountered";
         case Error::Assert: return "device-side assert triggered";
         case Error::LaunchFailure: return "unspecified launch failure";
+        case Error::CooperativeLaunchTooLarge: return "too many blocks in cooperative launch";
         case Error::NotSupported: return "operation not supported";
         case Error::Unknown: return "unknown error";
     }

@@ -1,0 +1,182 @@
+// <cuda/std/atomic> (libcu++), the part device code uses, on the compiler's
+// __atomic builtins: the SIMT compiler turns them into locked instructions
+// (relaxed ones on one address become one per warp). Scopes do not matter on
+// a CPU: every atomic is coherent across all of them.
+#ifndef CPUSIM_CUDA_STD_ATOMIC
+#define CPUSIM_CUDA_STD_ATOMIC
+
+#include "cuda_runtime.h"
+
+namespace cuda {
+
+enum thread_scope { thread_scope_system = 0, thread_scope_device = 1, thread_scope_block = 2, thread_scope_thread = 3 };
+
+namespace std {
+
+enum memory_order {
+    memory_order_relaxed = __ATOMIC_RELAXED,
+    memory_order_consume = __ATOMIC_CONSUME,
+    memory_order_acquire = __ATOMIC_ACQUIRE,
+    memory_order_release = __ATOMIC_RELEASE,
+    memory_order_acq_rel = __ATOMIC_ACQ_REL,
+    memory_order_seq_cst = __ATOMIC_SEQ_CST
+};
+
+namespace __detail {
+// The failure order of a compare-and-exchange given only the success one.
+__host__ __device__ constexpr int failure_order(memory_order o) {
+    return o == memory_order_acq_rel ? __ATOMIC_ACQUIRE : o == memory_order_release ? __ATOMIC_RELAXED : int(o);
+}
+
+// The operations on an object of type T at `p`.
+template <class T>
+struct ops {
+    __host__ __device__ static T load(const T* p, memory_order o) {
+        T r;
+        __atomic_load(const_cast<T*>(p), &r, int(o));
+        return r;
+    }
+    __host__ __device__ static void store(T* p, T v, memory_order o) { __atomic_store(p, &v, int(o)); }
+    __host__ __device__ static T exchange(T* p, T v, memory_order o) {
+        T r;
+        __atomic_exchange(p, &v, &r, int(o));
+        return r;
+    }
+    __host__ __device__ static bool cas(T* p, T& expected, T desired, bool weak, memory_order s, memory_order f) {
+        return __atomic_compare_exchange(p, &expected, &desired, weak, int(s), int(f));
+    }
+};
+}  // namespace __detail
+
+template <class T, thread_scope Scope = thread_scope_system>
+class atomic_ref_base {
+public:
+    __host__ __device__ explicit atomic_ref_base(T& obj) : p_(&obj) {}
+    __host__ __device__ T load(memory_order o = memory_order_seq_cst) const { return __detail::ops<T>::load(p_, o); }
+    __host__ __device__ void store(T v, memory_order o = memory_order_seq_cst) const { __detail::ops<T>::store(p_, v, o); }
+    __host__ __device__ operator T() const { return load(); }
+    __host__ __device__ T operator=(T v) const {
+        store(v);
+        return v;
+    }
+    __host__ __device__ T exchange(T v, memory_order o = memory_order_seq_cst) const {
+        return __detail::ops<T>::exchange(p_, v, o);
+    }
+    __host__ __device__ bool compare_exchange_weak(T& expected, T desired, memory_order o = memory_order_seq_cst) const {
+        return __detail::ops<T>::cas(p_, expected, desired, true, o, memory_order(__detail::failure_order(o)));
+    }
+    __host__ __device__ bool compare_exchange_weak(T& expected, T desired, memory_order s, memory_order f) const {
+        return __detail::ops<T>::cas(p_, expected, desired, true, s, f);
+    }
+    __host__ __device__ bool compare_exchange_strong(T& expected, T desired, memory_order o = memory_order_seq_cst) const {
+        return __detail::ops<T>::cas(p_, expected, desired, false, o, memory_order(__detail::failure_order(o)));
+    }
+    __host__ __device__ bool compare_exchange_strong(T& expected, T desired, memory_order s, memory_order f) const {
+        return __detail::ops<T>::cas(p_, expected, desired, false, s, f);
+    }
+    __host__ __device__ T fetch_add(T v, memory_order o = memory_order_seq_cst) const {
+        return __atomic_fetch_add(p_, v, int(o));
+    }
+    __host__ __device__ T fetch_sub(T v, memory_order o = memory_order_seq_cst) const {
+        return __atomic_fetch_sub(p_, v, int(o));
+    }
+    __host__ __device__ T fetch_and(T v, memory_order o = memory_order_seq_cst) const {
+        return __atomic_fetch_and(p_, v, int(o));
+    }
+    __host__ __device__ T fetch_or(T v, memory_order o = memory_order_seq_cst) const {
+        return __atomic_fetch_or(p_, v, int(o));
+    }
+    __host__ __device__ T fetch_xor(T v, memory_order o = memory_order_seq_cst) const {
+        return __atomic_fetch_xor(p_, v, int(o));
+    }
+    __host__ __device__ T fetch_min(T v, memory_order o = memory_order_seq_cst) const {
+        return __atomic_fetch_min(p_, v, int(o));
+    }
+    __host__ __device__ T fetch_max(T v, memory_order o = memory_order_seq_cst) const {
+        return __atomic_fetch_max(p_, v, int(o));
+    }
+    __host__ __device__ T operator++(int) const { return fetch_add(T(1)); }
+    __host__ __device__ T operator--(int) const { return fetch_sub(T(1)); }
+    __host__ __device__ T operator++() const { return fetch_add(T(1)) + T(1); }
+    __host__ __device__ T operator--() const { return fetch_sub(T(1)) - T(1); }
+    __host__ __device__ T operator+=(T v) const { return fetch_add(v) + v; }
+    __host__ __device__ T operator-=(T v) const { return fetch_sub(v) - v; }
+
+protected:
+    T* p_;
+};
+
+template <class T, thread_scope Scope = thread_scope_system>
+class atomic_ref : public atomic_ref_base<T, Scope> {
+    using atomic_ref_base<T, Scope>::atomic_ref_base;
+};
+
+template <class T, thread_scope Scope = thread_scope_system>
+class atomic {
+public:
+    atomic() = default;
+    __host__ __device__ constexpr atomic(T v) : v_(v) {}
+    atomic(const atomic&) = delete;
+    atomic& operator=(const atomic&) = delete;
+    __host__ __device__ T load(memory_order o = memory_order_seq_cst) const { return ref().load(o); }
+    __host__ __device__ void store(T v, memory_order o = memory_order_seq_cst) { ref().store(v, o); }
+    __host__ __device__ operator T() const { return load(); }
+    __host__ __device__ T operator=(T v) {
+        store(v);
+        return v;
+    }
+    __host__ __device__ T exchange(T v, memory_order o = memory_order_seq_cst) { return ref().exchange(v, o); }
+    __host__ __device__ bool compare_exchange_weak(T& e, T d, memory_order o = memory_order_seq_cst) {
+        return ref().compare_exchange_weak(e, d, o);
+    }
+    __host__ __device__ bool compare_exchange_strong(T& e, T d, memory_order o = memory_order_seq_cst) {
+        return ref().compare_exchange_strong(e, d, o);
+    }
+    __host__ __device__ T fetch_add(T v, memory_order o = memory_order_seq_cst) { return ref().fetch_add(v, o); }
+    __host__ __device__ T fetch_sub(T v, memory_order o = memory_order_seq_cst) { return ref().fetch_sub(v, o); }
+    __host__ __device__ T fetch_and(T v, memory_order o = memory_order_seq_cst) { return ref().fetch_and(v, o); }
+    __host__ __device__ T fetch_or(T v, memory_order o = memory_order_seq_cst) { return ref().fetch_or(v, o); }
+    __host__ __device__ T fetch_xor(T v, memory_order o = memory_order_seq_cst) { return ref().fetch_xor(v, o); }
+    __host__ __device__ T fetch_min(T v, memory_order o = memory_order_seq_cst) { return ref().fetch_min(v, o); }
+    __host__ __device__ T fetch_max(T v, memory_order o = memory_order_seq_cst) { return ref().fetch_max(v, o); }
+    __host__ __device__ T operator++(int) { return fetch_add(T(1)); }
+    __host__ __device__ T operator++() { return fetch_add(T(1)) + T(1); }
+    __host__ __device__ T operator+=(T v) { return fetch_add(v) + v; }
+
+private:
+    __host__ __device__ atomic_ref<T, Scope> ref() const { return atomic_ref<T, Scope>(const_cast<T&>(v_)); }
+    T v_;
+};
+
+class atomic_flag {
+public:
+    atomic_flag() = default;
+    __host__ __device__ bool test_and_set(memory_order o = memory_order_seq_cst) {
+        return __atomic_exchange_n(&v_, 1u, int(o)) != 0;
+    }
+    __host__ __device__ bool test(memory_order o = memory_order_seq_cst) const {
+        return __atomic_load_n(const_cast<unsigned*>(&v_), int(o)) != 0;
+    }
+    __host__ __device__ void clear(memory_order o = memory_order_seq_cst) { __atomic_store_n(&v_, 0u, int(o)); }
+
+private:
+    unsigned v_ = 0;
+};
+
+__host__ __device__ inline void atomic_thread_fence(memory_order o) { __atomic_thread_fence(int(o)); }
+
+}  // namespace std
+
+using std::atomic_flag;
+using std::memory_order;
+template <class T, thread_scope Scope = thread_scope_system>
+using atomic = std::atomic<T, Scope>;
+template <class T, thread_scope Scope = thread_scope_system>
+using atomic_ref = std::atomic_ref<T, Scope>;
+__host__ __device__ inline void atomic_thread_fence(std::memory_order o, thread_scope = thread_scope_system) {
+    __atomic_thread_fence(int(o));
+}
+
+}  // namespace cuda
+
+#endif
