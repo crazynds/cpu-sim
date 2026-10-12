@@ -5,12 +5,14 @@
 //   cpusim-devc device.bc -o kernels.o --manifest kernels.manifest [--emit-ll out.ll] [--mcpu native|znver4|...]
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InstIterator.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
@@ -30,9 +32,12 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/ReplaceConstant.h>
 #include <llvm/IR/IntrinsicsNVPTX.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
+#include <llvm/Transforms/Utils/LowerMemIntrinsics.h>
 
 #include "compiler/simt.h"
 #include "device/kernel_abi.h"
@@ -261,32 +266,277 @@ bool refine_uniform_masks(Function& f) {
     return changed;
 }
 
-// Small fixed-size copies to or from a local (struct copies: `auto p = a[i]`,
-// `a[i] = p`) as 4-byte loads and stores, which SROA then turns into
-// registers; it leaves the local in memory when it is copied with memcpy.
-bool expand_local_memcpys(Function& f) {
+// memcpy, memmove and memset as plain loads and stores, which the SIMT pass
+// widens like any other access: struct copies (`a[i] = p`, `float4` copies
+// through a reinterpret_cast), and the copies to or from a local that SROA
+// then turns into registers. Up to 256 bytes, in 4-byte pieces when the size
+// allows (then 2, then 1); longer or variable sizes become a loop.
+bool expand_mem_intrinsics(Function& f, TargetMachine* tm) {
     bool changed = false;
-    for (BasicBlock& bb : f)
-        for (Instruction& inst : make_early_inc_range(bb)) {
-            auto* cpy = dyn_cast<MemCpyInst>(&inst);
-            auto* len = cpy ? dyn_cast<ConstantInt>(cpy->getLength()) : nullptr;
-            if (!len || len->getZExtValue() > 256 || len->getZExtValue() % 4 != 0 || cpy->isVolatile()) continue;
-            if (!isa<AllocaInst>(getUnderlyingObject(cpy->getDest())) &&
-                !isa<AllocaInst>(getUnderlyingObject(cpy->getSource())))
-                continue;
-            IRBuilder<> b(cpy);
-            Type* i32 = b.getInt32Ty();
-            const Align da = cpy->getDestAlign().valueOrOne(), sa = cpy->getSourceAlign().valueOrOne();
-            for (uint64_t off = 0; off < len->getZExtValue(); off += 4) {
-                Value* v = b.CreateAlignedLoad(i32, b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), cpy->getSource(), off),
-                                               commonAlignment(sa, off));
-                b.CreateAlignedStore(v, b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), cpy->getDest(), off),
-                                     commonAlignment(da, off));
-            }
-            cpy->eraseFromParent();
+    std::vector<MemIntrinsic*> calls;
+    for (Instruction& inst : instructions(f))
+        if (auto* mi = dyn_cast<MemIntrinsic>(&inst)) calls.push_back(mi);
+    for (MemIntrinsic* mi : calls) {
+        auto* len = dyn_cast<ConstantInt>(mi->getLength());
+        const bool vol = mi->isVolatile();
+        if (!len || len->getZExtValue() > 256) {
+            TargetTransformInfo tti = tm->getTargetTransformInfo(f);
+            if (auto* cpy = dyn_cast<MemCpyInst>(mi)) expandMemCpyAsLoop(cpy, tti);
+            else if (auto* mv = dyn_cast<MemMoveInst>(mi)) {
+                if (!expandMemMoveAsLoop(mv, tti)) continue;
+            } else if (auto* ms = dyn_cast<MemSetInst>(mi)) expandMemSetAsLoop(ms);
+            else continue;
+            mi->eraseFromParent();
             changed = true;
+            continue;
         }
+        const uint64_t n = len->getZExtValue();
+        const uint64_t unit = n % 4 == 0 ? 4 : n % 2 == 0 ? 2 : 1;
+        IRBuilder<> b(mi);
+        Type* t = b.getIntNTy(unsigned(unit * 8));
+        const Align da = mi->getDestAlign().valueOrOne();
+        auto dst = [&](uint64_t off) { return b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), mi->getDest(), off); };
+        if (auto* ms = dyn_cast<MemSetInst>(mi)) {
+            Value* byte = b.CreateZExt(ms->getValue(), t);
+            Value* v = byte;
+            for (uint64_t k = 1; k < unit; ++k) v = b.CreateOr(v, b.CreateShl(byte, k * 8));
+            for (uint64_t off = 0; off < n; off += unit) b.CreateAlignedStore(v, dst(off), commonAlignment(da, off), vol);
+        } else {
+            auto* mt = cast<MemTransferInst>(mi);
+            const Align sa = mt->getSourceAlign().valueOrOne();
+            // All loads first: a memmove's ranges may overlap.
+            std::vector<Value*> vals;
+            for (uint64_t off = 0; off < n; off += unit)
+                vals.push_back(b.CreateAlignedLoad(t, b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), mt->getSource(), off),
+                                                   commonAlignment(sa, off), vol));
+            for (uint64_t off = 0, k = 0; off < n; off += unit, ++k)
+                b.CreateAlignedStore(vals[k], dst(off), commonAlignment(da, off), vol);
+        }
+        mi->eraseFromParent();
+        changed = true;
+    }
     return changed;
+}
+
+// NVVM's atomic increment and decrement become LLVM's uinc_wrap and
+// udec_wrap, and its memory barriers full fences, which x86 code generation
+// knows.
+void lower_nvvm_atomics(Module& m) {
+    std::vector<IntrinsicInst*> calls;
+    for (Function& f : m)
+        for (Instruction& i : instructions(f))
+            if (auto* ii = dyn_cast<IntrinsicInst>(&i)) switch (ii->getIntrinsicID()) {
+                    case Intrinsic::nvvm_atomic_load_inc_32:
+                    case Intrinsic::nvvm_atomic_load_dec_32:
+                    case Intrinsic::nvvm_membar_cta:
+                    case Intrinsic::nvvm_membar_gl:
+                    case Intrinsic::nvvm_membar_sys:
+                        calls.push_back(ii);
+                        break;
+                    default:
+                        break;
+                }
+    for (IntrinsicInst* ii : calls) {
+        IRBuilder<> b(ii);
+        Intrinsic::ID id = ii->getIntrinsicID();
+        if (id == Intrinsic::nvvm_atomic_load_inc_32 || id == Intrinsic::nvvm_atomic_load_dec_32) {
+            auto op = id == Intrinsic::nvvm_atomic_load_inc_32 ? AtomicRMWInst::UIncWrap : AtomicRMWInst::UDecWrap;
+            Value* r = b.CreateAtomicRMW(op, ii->getArgOperand(0), ii->getArgOperand(1), MaybeAlign(4),
+                                         AtomicOrdering::Monotonic);
+            ii->replaceAllUsesWith(r);
+        } else {
+            b.CreateFence(AtomicOrdering::SequentiallyConsistent);
+        }
+        ii->eraseFromParent();
+    }
+}
+
+// __device__ and __constant__ variables (every global the device code can
+// write, or the host can, through cudaMemcpyToSymbol) live in the VRAM, one
+// copy per program, as on a GPU: every module of the program (the generic one
+// and each block shape's) reaches them through a pointer of its own,
+// `__cpusim_sym_<name>`, which the runtime sets when it loads the module.
+// `__cpusim_init_<name>` keeps the initial value, copied to the VRAM when the
+// generic module is loaded. Returns the manifest lines: "symbol <name> <size>
+// <alignment>".
+std::string lower_device_globals(Module& m) {
+    LLVMContext& ctx = m.getContext();
+    const DataLayout& dl = m.getDataLayout();
+    std::vector<GlobalVariable*> syms;
+    for (GlobalVariable& g : m.globals()) {
+        if (g.isDeclaration() || g.isConstant() || g.getAddressSpace() == 3 || !g.hasName()) continue;
+        if (g.getName().starts_with("llvm.") || g.getName().starts_with("__cpusim")) continue;
+        syms.push_back(&g);
+    }
+    if (syms.empty()) return "";
+    // Clang lists them in llvm.compiler.used to keep them; they go away here.
+    for (const char* n : {"llvm.used", "llvm.compiler.used"})
+        if (GlobalVariable* u = m.getNamedGlobal(n)) u->eraseFromParent();
+    std::string lines;
+    MDNode* empty = MDNode::get(ctx, {});
+    for (GlobalVariable* g : syms) {
+        const std::string name = g->getName().str();
+        Type* t = g->getValueType();
+        const uint64_t size = dl.getTypeAllocSize(t);
+        const uint64_t align = std::max<uint64_t>(g->getAlign().valueOrOne().value(), dl.getABITypeAlign(t).value());
+        auto* init = new GlobalVariable(m, t, true, GlobalValue::ExternalLinkage,
+                                        g->hasInitializer() ? g->getInitializer() : Constant::getNullValue(t),
+                                        "__cpusim_init_" + name);
+        init->setVisibility(GlobalValue::ProtectedVisibility);
+        init->setAlignment(Align(align));
+        auto* pty = PointerType::get(ctx, g->getAddressSpace());
+        auto* slot = new GlobalVariable(m, pty, false, GlobalValue::ExternalLinkage, ConstantPointerNull::get(pty),
+                                        "__cpusim_sym_" + name);
+        slot->setVisibility(GlobalValue::ProtectedVisibility);
+        convertUsersOfConstantsToInstructions({g});
+        DenseMap<Function*, Value*> loads;
+        for (Use& u : make_early_inc_range(g->uses())) {
+            auto* i = dyn_cast<Instruction>(u.getUser());
+            if (!i) continue;
+            Value*& l = loads[i->getFunction()];
+            if (!l) {
+                IRBuilder<> b(&*i->getFunction()->getEntryBlock().getFirstInsertionPt());
+                LoadInst* ld = b.CreateAlignedLoad(pty, slot, Align(8), name);
+                ld->setMetadata(LLVMContext::MD_invariant_load, empty);
+                ld->setMetadata(LLVMContext::MD_nonnull, empty);
+                l = ld;
+            }
+            u.set(l);
+        }
+        // Still referenced from another global's initializer: the initial copy.
+        if (!g->use_empty()) g->replaceAllUsesWith(ConstantExpr::getPointerBitCastOrAddrSpaceCast(init, g->getType()));
+        g->eraseFromParent();
+        lines += "symbol " + name + " " + std::to_string(size) + " " + std::to_string(align) + "\n";
+    }
+    return lines;
+}
+
+// __syncthreads_count / _and / _or as per-thread code around an ordinary
+// barrier: each thread adds its vote to a counter in shared memory (one
+// atomic per warp: the address is the same for every lane), the barrier, then
+// every thread reads the total. Three counters in turn: the one the next call
+// but one will use is cleared right after this call's barrier, when every
+// thread has read it (before the previous barrier) and nobody adds to it yet
+// (not before the next one). The kernel clears the first two at its start,
+// followed by a barrier.
+void lower_barrier_votes(Module& m, Function& kernel) {
+    std::vector<IntrinsicInst*> votes;
+    for (Instruction& i : instructions(kernel))
+        if (auto* ii = dyn_cast<IntrinsicInst>(&i))
+            if (ii->getIntrinsicID() == Intrinsic::nvvm_barrier0_popc ||
+                ii->getIntrinsicID() == Intrinsic::nvvm_barrier0_and ||
+                ii->getIntrinsicID() == Intrinsic::nvvm_barrier0_or)
+                votes.push_back(ii);
+    if (votes.empty()) return;
+    LLVMContext& ctx = m.getContext();
+    Type* i32 = Type::getInt32Ty(ctx);
+    auto* counters_ty = ArrayType::get(i32, 3);
+    auto* counters = new GlobalVariable(m, counters_ty, false, GlobalValue::InternalLinkage, UndefValue::get(counters_ty),
+                                        "__cpusim_barrier_votes." + kernel.getName(), nullptr,
+                                        GlobalValue::NotThreadLocal, 3);
+    counters->setAlignment(Align(16));
+    Function* barrier = Intrinsic::getDeclaration(&m, Intrinsic::nvvm_barrier0);
+    auto counter = [&](IRBuilder<>& b, Value* index) {
+        Value* p = b.CreateGEP(counters_ty, counters, {b.getInt32(0), index});
+        return b.CreateAddrSpaceCast(p, PointerType::get(ctx, 0));
+    };
+
+    IRBuilder<> eb(&*kernel.getEntryBlock().getFirstInsertionPt());
+    AllocaInst* generation = eb.CreateAlloca(i32, nullptr, "vote.generation");
+    eb.CreateStore(eb.getInt32(0), generation);
+    for (int k = 0; k < 2; ++k) eb.CreateStore(eb.getInt32(0), counter(eb, eb.getInt32(k)));
+    eb.CreateCall(barrier);
+
+    for (IntrinsicInst* v : votes) {
+        IRBuilder<> b(v);
+        const Intrinsic::ID id = v->getIntrinsicID();
+        Value* gen = b.CreateLoad(i32, generation);
+        b.CreateStore(b.CreateAdd(gen, b.getInt32(1)), generation);
+        Value* slot = b.CreateURem(gen, b.getInt32(3));
+        Value* nonzero = b.CreateICmpNE(v->getArgOperand(0), b.getInt32(0));
+        // _and counts the threads whose vote fails.
+        Value* one = b.CreateZExt(id == Intrinsic::nvvm_barrier0_and ? b.CreateNot(nonzero) : nonzero, i32);
+        b.CreateAtomicRMW(AtomicRMWInst::Add, counter(b, slot), one, MaybeAlign(4), AtomicOrdering::Monotonic);
+        b.CreateCall(barrier);
+        Value* total = b.CreateLoad(i32, counter(b, slot));
+        cast<LoadInst>(total)->setAtomic(AtomicOrdering::Monotonic);
+        b.CreateStore(b.getInt32(0), counter(b, b.CreateURem(b.CreateAdd(gen, b.getInt32(2)), b.getInt32(3))));
+        Value* r = id == Intrinsic::nvvm_barrier0_popc ? total
+                   : id == Intrinsic::nvvm_barrier0_and ? b.CreateZExt(b.CreateICmpEQ(total, b.getInt32(0)), i32)
+                                                        : b.CreateZExt(b.CreateICmpNE(total, b.getInt32(0)), i32);
+        v->replaceAllUsesWith(r);
+        v->eraseFromParent();
+    }
+}
+
+// Device printf: Clang packs the arguments in a local struct and calls
+// vprintf(format, &struct). Each call becomes
+//   h = __cpusim_printf_begin(format); __cpusim_printf_<kind>(h, value)...;
+//   __cpusim_printf_end(h)
+// with every argument passed by value (integers widened to 64 bits with their
+// size, doubles, pointers), calls the SIMT pass makes once per active lane.
+void lower_printf(Function& f) {
+    Module& m = *f.getParent();
+    LLVMContext& ctx = m.getContext();
+    std::vector<CallInst*> calls;
+    for (Instruction& i : instructions(f))
+        if (auto* c = dyn_cast<CallInst>(&i); c && c->getCalledFunction() && c->getCalledFunction()->getName() == "vprintf")
+            calls.push_back(c);
+    if (calls.empty()) return;
+    Type* i64 = Type::getInt64Ty(ctx);
+    Type* i32 = Type::getInt32Ty(ctx);
+    Type* ptr = PointerType::get(ctx, 0);
+    FunctionCallee begin = m.getOrInsertFunction("__cpusim_printf_begin", i64, ptr);
+    FunctionCallee arg_int = m.getOrInsertFunction("__cpusim_printf_int", Type::getVoidTy(ctx), i64, i64, i32);
+    FunctionCallee arg_float =
+        m.getOrInsertFunction("__cpusim_printf_float", Type::getVoidTy(ctx), i64, Type::getDoubleTy(ctx));
+    FunctionCallee arg_ptr = m.getOrInsertFunction("__cpusim_printf_pointer", Type::getVoidTy(ctx), i64, ptr);
+    FunctionCallee end = m.getOrInsertFunction("__cpusim_printf_end", i32, i64);
+    const DataLayout& dl = m.getDataLayout();
+    for (CallInst* call : calls) {
+        // The stores into the argument struct, by offset.
+        std::map<int64_t, StoreInst*> stores;
+        std::vector<Instruction*> dead;
+        auto* buf = dyn_cast<AllocaInst>(getUnderlyingObject(call->getArgOperand(1)));
+        bool ok = isa<ConstantPointerNull>(call->getArgOperand(1)) || buf;
+        if (buf) {
+            SmallVector<std::pair<Value*, int64_t>, 8> work{{buf, 0}};
+            while (ok && !work.empty()) {
+                auto [v, off] = work.pop_back_val();
+                for (User* u : v->users()) {
+                    if (auto* g = dyn_cast<GetElementPtrInst>(u)) {
+                        APInt o(64, 0);
+                        if (!g->accumulateConstantOffset(dl, o)) ok = false;
+                        else work.push_back({g, off + o.getSExtValue()}), dead.push_back(g);
+                    } else if (auto* st = dyn_cast<StoreInst>(u); st && st->getPointerOperand() == v) {
+                        stores[off] = st;
+                    } else if (auto* ii = dyn_cast<IntrinsicInst>(u); ii && ii->isLifetimeStartOrEnd()) {
+                        dead.push_back(ii);
+                    } else if (u != call) {
+                        ok = false;
+                    }
+                }
+            }
+        }
+        if (!ok) continue;  // left alone: the SIMT pass reports it
+        IRBuilder<> b(call);
+        Value* h = b.CreateCall(begin, {call->getArgOperand(0)});
+        for (auto& [off, st] : stores) {
+            Value* v = st->getValueOperand();
+            Type* t = v->getType();
+            if (t->isPointerTy()) b.CreateCall(arg_ptr, {h, v});
+            else if (t->isFloatingPointTy()) b.CreateCall(arg_float, {h, b.CreateFPExt(v, b.getDoubleTy())});
+            else if (t->isIntegerTy())
+                b.CreateCall(arg_int, {h, b.CreateSExtOrTrunc(v, i64), b.getInt32(int32_t(dl.getTypeStoreSize(t)))});
+        }
+        Value* r = b.CreateCall(end, {h});
+        call->replaceAllUsesWith(r);
+        call->eraseFromParent();
+        for (auto& [off, st] : stores) st->eraseFromParent();
+        for (auto it = dead.rbegin(); it != dead.rend(); ++it)
+            if ((*it)->use_empty()) (*it)->eraseFromParent();
+        if (buf && buf->use_empty()) buf->eraseFromParent();
+    }
 }
 
 bool has_alloca(const Function& f) {
@@ -446,11 +696,14 @@ int main(int argc, char** argv) {
     for (auto& k : kernels)
         for (int i = 0; i < 3; ++i) k.spec_block[i] = opt.specialize[i];
     retarget(*m, tm.get(), kernels);
+    lower_nvvm_atomics(*m);
+    const std::string symbol_lines = lower_device_globals(*m);
 
     // Per-thread clean up before vectorizing: inline everything, promote locals
     // to registers, simplify. No unrolling or vectorization here: those would
     // obscure the per-thread structure the SIMT pass works on.
     run_pipeline(*m, tm.get(), "always-inline,globaldce");
+    for (auto& k : kernels) lower_barrier_votes(*m, *k.scalar);
     for (auto& k : kernels) cpusim::lower_shared_memory(*m, k);
     run_pipeline(*m, tm.get(),
                  "globaldce,"
@@ -466,9 +719,12 @@ int main(int argc, char** argv) {
     for (auto& k : kernels) per_thread.push_back(k.scalar);
     for (Function& f : *m)
         if (!f.isDeclaration() && f.hasFnAttribute(Attribute::AlwaysInline)) per_thread.push_back(&f);
+    for (Function* f : per_thread) lower_printf(*f);
     for (Function* f : per_thread)
-        if (has_alloca(*f)) {
-            expand_local_memcpys(*f);
+        if (expand_mem_intrinsics(*f, tm.get()) && !has_alloca(*f))
+            run_function_pipeline(*f, tm.get(),
+                                  "early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,lower-switch,lcssa");
+        else if (has_alloca(*f)) {
             run_function_pipeline(*f, tm.get(),
                                   "loop-simplify,lcssa,loop(loop-rotate,indvars,loop-unroll-full),sroa<modify-cfg>,"
                                   "early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,gvn,"
@@ -477,7 +733,7 @@ int main(int argc, char** argv) {
     for (Function* f : per_thread) removeUnreachableBlocks(*f);
     if (!opt.emit_scalar_ll.empty()) write_ll(*m, opt.emit_scalar_ll);
 
-    std::string manifest = "cpusim-module " + std::to_string(CPUSIM_KERNEL_ABI) + "\n";
+    std::string manifest = "cpusim-module " + std::to_string(CPUSIM_KERNEL_ABI) + "\n" + symbol_lines;
     int failures = 0;
     for (auto& k : kernels) {
         std::string why;
@@ -595,6 +851,7 @@ int main(int argc, char** argv) {
         manifest += "kernel " + k.name + " " + std::to_string(k.param_bytes) + " " + std::to_string(k.params.size());
         for (const auto& p : k.params) manifest += " " + std::to_string(p.offset) + ":" + std::to_string(p.size);
         if (min_sm) manifest += " sm=" + std::to_string(min_sm);
+        if (k.shared_bytes) manifest += " smem=" + std::to_string(k.shared_bytes);
         manifest += "\n";
     }
     if (failures) return 1;
@@ -603,20 +860,25 @@ int main(int argc, char** argv) {
     for (auto& k : kernels) k.scalar->eraseFromParent();
     // So are the per-thread device functions left after inlining (recursive
     // ones, or those whose address is taken): their vector versions replaced
-    // every call. An address still in use (a table of function pointers, the
-    // comparisons that pick the target of a call through a pointer) becomes
-    // that of a byte of its own: equal for equal functions, which is all a
-    // device function pointer is used for here.
+    // every call. An address still in use (a table of function pointers, a
+    // vtable, the comparisons that pick the target of a call through a
+    // pointer) becomes a number made from the function's name: the same in
+    // every module of the program (the generic one and each block shape's),
+    // so a pointer stored by one kernel is called right by any other. Its
+    // upper bits make it a non-canonical address, never a real one.
     {
         std::vector<Function*> left;
         for (Function& f : *m)
             if (!f.isDeclaration() && f.hasFnAttribute(Attribute::AlwaysInline)) left.push_back(&f);
         for (Function* f : left) f->dropAllReferences();
         for (Function* f : left) {
-            if (!f->use_empty())
-                f->replaceAllUsesWith(new GlobalVariable(*m, Type::getInt8Ty(ctx), true, GlobalValue::InternalLinkage,
-                                                         ConstantInt::get(Type::getInt8Ty(ctx), 0),
-                                                         "__cpusim_fnaddr_" + f->getName()));
+            if (!f->use_empty()) {
+                uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a
+                for (char c : f->getName()) h = (h ^ uint8_t(c)) * 0x100000001b3ull;
+                const uint64_t id = 0x8000000000000000ull | (h & 0x00007ffffffffff0ull);
+                f->replaceAllUsesWith(
+                    ConstantExpr::getIntToPtr(ConstantInt::get(Type::getInt64Ty(ctx), id), f->getType()));
+            }
             f->eraseFromParent();
         }
     }

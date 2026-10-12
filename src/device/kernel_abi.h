@@ -23,7 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CPUSIM_KERNEL_ABI 9
+#define CPUSIM_KERNEL_ABI 10
 #define CPUSIM_WARP_SIZE 32   // CUDA's warp: lane ids, warp intrinsics
 #define CPUSIM_MAX_LANES 512  // widest group of threads one entry call runs
 

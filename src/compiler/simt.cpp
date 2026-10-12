@@ -91,6 +91,30 @@ private:
     // code by a WarpBuilder of its own (build_pending_functions).
     Function* vector_fn(Function* f);
     bool emit_call(CallInst* call, Value* mask);
+
+    // ---- atomics: one locked instruction per active lane, or one for the
+    // warp when every lane updates the same address.
+    bool emit_atomic(Instruction& inst, Value* mask);
+    Value* emit_uniform_rmw(AtomicRMWInst* rmw, Value* mask);
+    DenseMap<const Value*, std::pair<Value*, Value*>> cmpxchg_parts_;  // cmpxchg -> (old values, success)
+    // An empty asm with a memory clobber: volatile accesses stay in order
+    // and are never merged, hoisted or removed.
+    // Divisors x86's idiv traps on and a GPU does not (the result is then
+    // unspecified): zero, and -1 under the most negative dividend. Replaced
+    // by 1, which gives the wrapped result for the latter.
+    Value* trapping_divisor(Instruction::BinaryOps op, Value* n, Value* d) {
+        Value* bad = b_.CreateICmpEQ(d, Constant::getNullValue(d->getType()));
+        if (op == Instruction::SDiv || op == Instruction::SRem) {
+            const unsigned bits = d->getType()->getScalarSizeInBits();
+            Value* min = ConstantInt::get(d->getType(), APInt::getSignedMinValue(bits));
+            bad = b_.CreateOr(bad, b_.CreateAnd(b_.CreateICmpEQ(d, Constant::getAllOnesValue(d->getType())),
+                                                b_.CreateICmpEQ(n, min)));
+        }
+        return bad;
+    }
+    void compiler_barrier() {
+        b_.CreateCall(InlineAsm::get(FunctionType::get(b_.getVoidTy(), false), "", "~{memory}", true));
+    }
     Value* call_vector_fn(Function* f, CallInst* call, Value* mask);
 
     // ---- emission
@@ -125,6 +149,28 @@ private:
     DenseMap<const AllocaInst*, uint64_t> private_frame_offset_;  // in the frame (variants that suspend)
     DenseMap<const AllocaInst*, Value*> private_stack_;           // or in the stack
     bool check_private_array(AllocaInst* a);
+    // Per-thread arrays whose address goes to a call (a function that is not
+    // inlined): W copies one after the other, lane l's at base + l * size,
+    // so each lane's pointer is a real one.
+    DenseSet<const AllocaInst*> escaping_;
+    static bool escapes(const AllocaInst* a) {
+        SmallVector<const Value*, 8> work{a};
+        while (!work.empty()) {
+            const Value* v = work.pop_back_val();
+            for (const User* u : v->users()) {
+                if (isa<GetElementPtrInst>(u) || isa<BitCastInst>(u)) work.push_back(u);
+                else if (auto* st = dyn_cast<StoreInst>(u); st && st->getValueOperand() == v) return true;
+                else if (auto* call = dyn_cast<CallInst>(u)) {
+                    if (auto* ii = dyn_cast<IntrinsicInst>(call); ii && ii->isLifetimeStartOrEnd()) continue;
+                    if (is_mma(call) || is_mmav(call)) continue;
+                    return true;
+                } else if (isa<PtrToIntInst>(u) || isa<PHINode>(u) || isa<SelectInst>(u)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
     Value* private_base(const AllocaInst* a);
     SplitAddress split_address(Value* ptr);
     // Varying byte offsets as a sum of terms coef * lanes[i] (coef: uniform
@@ -304,6 +350,18 @@ bool is_device_call(const CallInst* call) {
     return !f->isIntrinsic() && !f->isDeclaration() && !f->isVarArg();
 }
 
+// A function of the process the kernel runs in (malloc, free, the device
+// printf calls): called once per active lane with that lane's arguments.
+bool is_external_call(const CallInst* call) {
+    const Function* f = call->getCalledFunction();
+    if (!f || !f->isDeclaration() || f->isIntrinsic() || f->isVarArg()) return false;
+    StringRef n = f->getName();
+    if (n.starts_with("__cpusim_")) return n.starts_with("__cpusim_printf_");
+    for (Type* t : f->getFunctionType()->params())
+        if (!(t->isIntegerTy() || t->isFloatingPointTy() || t->isPointerTy())) return false;
+    return true;
+}
+
 // Versions of device functions declared by vector_fn and not built yet.
 struct PendingFunction {
     Function* decl;
@@ -342,6 +400,20 @@ std::string libmvec_name(const CallInst& call, unsigned* arity) {
     Function* f = call.getCalledFunction();
     Type* t = call.getType();
     if (!f || !(t->isFloatTy() || t->isDoubleTy())) return "";
+    // libmvec's double versions err by up to ~4 ulp, CUDA's by 1 or 2: a
+    // double function stays a call of the C library's, per lane. Unless it is
+    // a float function computed in double (the device header's way: float
+    // arguments widened, the result rounded back to float), where those ulp
+    // of a double vanish in the rounding.
+    if (t->isDoubleTy()) {
+        const bool from_float = all_of(call.args(), [](const Use& u) {
+            auto* e = dyn_cast<FPExtInst>(u.get());
+            return e && e->getSrcTy()->isFloatTy();
+        });
+        const bool to_float = call.hasOneUse() && isa<FPTruncInst>(*call.user_begin()) &&
+                              call.user_back()->getType()->isFloatTy();
+        if (!from_float || !to_float) return "";
+    }
     std::string base;
     if (f->isIntrinsic()) {
         // llvm.exp.f32 -> exp
@@ -537,15 +609,27 @@ bool WarpBuilder::check_supported() {
                     continue;
                 else if (unsigned n; !libmvec_name(*call, &n).empty()) continue;
                 else if (!callee->isIntrinsic() && !callee->isDeclaration() && !callee->isVarArg()) continue;  // emit_call
+                else if (is_external_call(call)) continue;  // emit_atomic: once per lane
                 else if (!callee->isIntrinsic()) fail("call to an external device function", call);
                 else if (callee->getIntrinsicID() == Intrinsic::nvvm_barrier0_popc ||
                          callee->getIntrinsicID() == Intrinsic::nvvm_barrier0_and ||
                          callee->getIntrinsicID() == Intrinsic::nvvm_barrier0_or)
                     fail("__syncthreads_count/_and/_or are not supported yet");
             } else if (auto* a = dyn_cast<AllocaInst>(&inst)) {
-                if (!check_private_array(a)) return false;
-            } else if (inst.isAtomic() || isa<FenceInst>(inst)) {
-                fail("atomics are not supported yet", &inst);
+                if (escapes(a)) {
+                    // Each lane needs a real address for it: lane-major
+                    // layout will not do. Lives in this call's stack.
+                    if (!a->isStaticAlloca()) fail("per-thread arrays of variable size are not supported", a);
+                    else if (!barrier_blocks_.empty() && !block_wide_)
+                        fail("a per-thread array passed to a function, in a kernel that waits at barriers", a);
+                    escaping_.insert(a);
+                } else if (!check_private_array(a)) {
+                    return false;
+                }
+            } else if (auto* cx = dyn_cast<AtomicCmpXchgInst>(&inst)) {
+                for (User* u : cx->users())
+                    if (!isa<ExtractValueInst>(u) || cast<Instruction>(u)->getParent() != cx->getParent())
+                        fail("compare-and-swap result used other than by its fields", u);
             }
         }
     }
@@ -821,8 +905,11 @@ void WarpBuilder::rematerialize_invariants() {
             if (is_invariant(&inst, 0) || (uni_->is_varying(&inst) && remat_ok(&inst, 0))) candidates.push_back(&inst);
     for (Instruction* inst : candidates) {
         SmallVector<Use*, 8> far;
+        // Not into a phi: it reads the value at the end of a predecessor, not
+        // in its own block (a slot carries it, as any value crossing blocks).
         for (Use& u : inst->uses())
-            if (cast<Instruction>(u.getUser())->getParent() != inst->getParent()) far.push_back(&u);
+            if (cast<Instruction>(u.getUser())->getParent() != inst->getParent() && !isa<PHINode>(u.getUser()))
+                far.push_back(&u);
         for (Use* u : far) u->set(clone_into(inst, cast<Instruction>(u->getUser())->getParent()));
     }
 }
@@ -1808,6 +1895,147 @@ bool WarpBuilder::emit_call(CallInst* call, Value* mask) {
     b_.CreateCondBr(any_lane(rem2), loop, done);
     b_.SetInsertPoint(done);
     return result(acc2) && error_.empty();
+}
+
+// ---------------------------------------------------------------- atomics
+
+// Every lane updates the same address: the active lanes' operands combined
+// (inactive lanes contribute the identity), one atomic with the total, and
+// each lane's old value = the value before the warp's update combined with
+// the lanes before it (an exclusive scan). CUDA leaves the order of a warp's
+// atomics unspecified, so any order of the lanes is one the GPU could pick.
+Value* WarpBuilder::emit_uniform_rmw(AtomicRMWInst* rmw, Value* mask) {
+    using Op = AtomicRMWInst::BinOp;
+    Type* t = rmw->getType();
+    const Op op = rmw->getOperation();
+    Constant* id = nullptr;
+    Intrinsic::ID reduce = Intrinsic::not_intrinsic, combine_id = Intrinsic::not_intrinsic;
+    Instruction::BinaryOps combine = Instruction::BinaryOpsEnd;
+    if (t->isIntegerTy()) {
+        const unsigned bits = t->getIntegerBitWidth();
+        switch (op) {
+            case Op::Add: case Op::Sub:
+                id = ConstantInt::get(t, 0), reduce = Intrinsic::vector_reduce_add, combine = Instruction::Add;
+                break;
+            case Op::Or: id = ConstantInt::get(t, 0), reduce = Intrinsic::vector_reduce_or, combine = Instruction::Or; break;
+            case Op::Xor: id = ConstantInt::get(t, 0), reduce = Intrinsic::vector_reduce_xor, combine = Instruction::Xor; break;
+            case Op::And:
+                id = ConstantInt::get(t, APInt::getAllOnes(bits)), reduce = Intrinsic::vector_reduce_and,
+                combine = Instruction::And;
+                break;
+            case Op::Max:
+                id = ConstantInt::get(t, APInt::getSignedMinValue(bits)), reduce = Intrinsic::vector_reduce_smax,
+                combine_id = Intrinsic::smax;
+                break;
+            case Op::Min:
+                id = ConstantInt::get(t, APInt::getSignedMaxValue(bits)), reduce = Intrinsic::vector_reduce_smin,
+                combine_id = Intrinsic::smin;
+                break;
+            case Op::UMax:
+                id = ConstantInt::get(t, 0), reduce = Intrinsic::vector_reduce_umax, combine_id = Intrinsic::umax;
+                break;
+            case Op::UMin:
+                id = ConstantInt::get(t, APInt::getAllOnes(bits)), reduce = Intrinsic::vector_reduce_umin,
+                combine_id = Intrinsic::umin;
+                break;
+            default:
+                return nullptr;
+        }
+    } else if (op == Op::FAdd) {
+        id = ConstantFP::getNegativeZero(t), combine = Instruction::FAdd;
+    } else {
+        return nullptr;
+    }
+    auto comb = [&](Value* a, Value* b) {
+        return combine_id != Intrinsic::not_intrinsic ? b_.CreateBinaryIntrinsic(combine_id, a, b)
+                                                      : b_.CreateBinOp(combine, a, b);
+    };
+    Constant* ids = ConstantVector::getSplat(ElementCount::getFixed(W), id);
+    Value* v = b_.CreateSelect(mask, vector(rmw->getValOperand()), ids);
+    Value* total = op == Op::FAdd ? b_.CreateFAddReduce(id, v)
+                                  : b_.CreateCall(Intrinsic::getDeclaration(&m_, reduce, {v->getType()}), {v});
+    if (auto* fp = dyn_cast<Instruction>(total); fp && op == Op::FAdd) fp->setHasAllowReassoc(true);
+    AtomicRMWInst* one = b_.CreateAtomicRMW(op, scalar(rmw->getPointerOperand()), total, rmw->getAlign(),
+                                            rmw->getOrdering(), rmw->getSyncScopeID());
+    one->setVolatile(rmw->isVolatile());
+    if (rmw->use_empty()) return one;
+    // Inclusive scan in log2(W) steps, then shifted by one lane.
+    Value* x = v;
+    for (unsigned d = 1; d < W; d *= 2) {
+        SmallVector<int, 512> idx;
+        for (unsigned i = 0; i < W; ++i) idx.push_back(i < d ? int(W + i) : int(i - d));
+        x = comb(x, b_.CreateShuffleVector(x, ids, idx));
+    }
+    SmallVector<int, 512> idx;
+    for (unsigned i = 0; i < W; ++i) idx.push_back(i == 0 ? int(W) : int(i - 1));
+    Value* before = b_.CreateShuffleVector(x, ids, idx);
+    Value* old = b_.CreateVectorSplat(W, one);
+    return op == Op::Sub ? b_.CreateSub(old, before) : comb(old, before);
+}
+
+// Atomic read-modify-write, compare-and-swap, atomic load or store: the
+// per-thread instruction once per active lane, lowest lane first, with that
+// lane's operands; the results gathered in a stack array.
+bool WarpBuilder::emit_atomic(Instruction& inst, Value* mask) {
+    // An atomic load of one address for the whole warp: one load (the value
+    // is uniform, as the analysis says).
+    if (auto* ld = dyn_cast<LoadInst>(&inst); ld && !uni_->is_varying(ld->getPointerOperand())) {
+        Instruction* one = inst.clone();
+        one->setOperand(0, scalar(ld->getPointerOperand()));
+        b_.Insert(one);
+        (uni_->is_varying(&inst) ? vector_map_ : scalar_map_)[&inst] =
+            uni_->is_varying(&inst) ? b_.CreateVectorSplat(W, one) : one;
+        return true;
+    }
+    if (auto* rmw = dyn_cast<AtomicRMWInst>(&inst); rmw && !uni_->is_varying(rmw->getPointerOperand()))
+        if (Value* v = emit_uniform_rmw(rmw, mask)) {
+            if (!inst.use_empty()) vector_map_[&inst] = v;
+            return true;
+        }
+    auto* cx = dyn_cast<AtomicCmpXchgInst>(&inst);
+    Type* t = cx ? cx->getCompareOperand()->getType() : inst.getType();
+    const DataLayout& dl = m_.getDataLayout();
+    IRBuilder<> ab(alloca_block_->getTerminator());
+    AllocaInst* results = nullptr;
+    AllocaInst* success = nullptr;
+    if (!t->isVoidTy() && !inst.use_empty()) {
+        results = ab.CreateAlloca(ArrayType::get(t, W), nullptr, "atomic.results");
+        results->setAlignment(Align(64));
+        if (cx) success = ab.CreateAlloca(ArrayType::get(b_.getInt8Ty(), W), nullptr, "atomic.success");
+    }
+    BasicBlock* pre = b_.GetInsertBlock();
+    BasicBlock* loop = BasicBlock::Create(ctx_, "atomic.lane", w_);
+    BasicBlock* done = BasicBlock::Create(ctx_, "atomic.done", w_);
+    Value* bits = b_.CreateBitCast(mask, b_.getIntNTy(W));
+    b_.CreateCondBr(b_.CreateICmpNE(bits, b_.getIntN(W, 0)), loop, done);
+    b_.SetInsertPoint(loop);
+    PHINode* rem = b_.CreatePHI(bits->getType(), 2, "atomic.rem");
+    rem->addIncoming(bits, pre);
+    Value* lane = b_.CreateTrunc(b_.CreateBinaryIntrinsic(Intrinsic::cttz, rem, b_.getTrue()), b_.getInt32Ty());
+    Instruction* one = inst.clone();
+    for (Use& u : one->operands())
+        u.set(uni_->is_varying(u.get()) ? b_.CreateExtractElement(vector(u.get()), lane) : scalar(u.get()));
+    b_.Insert(one);
+    if (results) {
+        Value* r = cx ? b_.CreateExtractValue(one, 0) : one;
+        b_.CreateStore(r, b_.CreateGEP(results->getAllocatedType(), results, {b_.getInt32(0), lane}));
+        if (success)
+            b_.CreateStore(b_.CreateZExt(b_.CreateExtractValue(one, 1), b_.getInt8Ty()),
+                           b_.CreateGEP(success->getAllocatedType(), success, {b_.getInt32(0), lane}));
+    }
+    Value* next = b_.CreateAnd(rem, b_.CreateSub(rem, ConstantInt::get(rem->getType(), 1)));
+    rem->addIncoming(next, b_.GetInsertBlock());
+    b_.CreateCondBr(b_.CreateICmpNE(next, ConstantInt::get(rem->getType(), 0)), loop, done);
+    b_.SetInsertPoint(done);
+    if (!results) return true;
+    Value* v = b_.CreateAlignedLoad(vec_type(t), results, Align(std::min<uint64_t>(64, dl.getTypeAllocSize(t) * W)));
+    if (!cx) {
+        vector_map_[&inst] = v;
+        return true;
+    }
+    Value* ok = b_.CreateAlignedLoad(FixedVectorType::get(b_.getInt8Ty(), W), success, Align(64));
+    cmpxchg_parts_[&inst] = {v, b_.CreateTrunc(ok, mask_type_)};
+    return true;
 }
 
 // threadIdx for a known block shape. Lane l of the group starting at thread
@@ -2998,6 +3226,17 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
             return true;
         }
     }
+    if (auto* a = dyn_cast<AllocaInst>(&inst); a && escaping_.contains(a)) {
+        IRBuilder<> ab(alloca_block_->getTerminator());
+        auto* copies = ArrayType::get(a->getAllocatedType(), W);
+        AllocaInst* base = ab.CreateAlloca(copies, nullptr, a->getName() + ".lanes");
+        base->setAlignment(std::max(a->getAlign(), Align(16)));
+        SmallVector<Constant*, 64> lanes;
+        for (unsigned l = 0; l < W; ++l) lanes.push_back(b_.getInt32(l));
+        // Next to the storage: the lanes' pointers are the same all through
+        // the call, and its uses may be in any block.
+        return set(ab.CreateGEP(copies, base, {ab.getInt32(0), ConstantVector::get(lanes)}, a->getName()));
+    }
     if (isa<AllocaInst>(inst)) return true;  // demoted slots were recreated in the prologue
 
     if (auto* call = dyn_cast<CallInst>(&inst); call && is_cond_load(call)) return set(emit_cond_load(call, mask));
@@ -3046,6 +3285,10 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
     if (is_mma(&inst)) return emit_mma(cast<CallInst>(&inst), mask);
     if (is_mmav(&inst)) return set(emit_mmav(cast<CallInst>(&inst)));
     if (auto* call = dyn_cast<CallInst>(&inst); call && is_device_call(call)) return emit_call(call, mask);
+    if (auto* call = dyn_cast<CallInst>(&inst); call && is_external_call(call)) {
+        unsigned arity;
+        if (libmvec_name(*call, &arity).empty()) return emit_atomic(inst, mask);
+    }
 
     // Intrinsics with special meaning.
     if (auto* call = dyn_cast<CallInst>(&inst)) {
@@ -3071,23 +3314,32 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
         }
     }
 
+    if (isa<AtomicRMWInst>(inst) || isa<AtomicCmpXchgInst>(inst) || (isa<LoadInst>(inst) && inst.isAtomic()) ||
+        (isa<StoreInst>(inst) && inst.isAtomic()))
+        return emit_atomic(inst, mask);
+    if (isa<FenceInst>(inst)) {
+        b_.Insert(inst.clone());
+        return true;
+    }
+
     // Memory through real pointers.
     if (auto* ld = dyn_cast<LoadInst>(&inst)) {
-        if (ld->isVolatile()) return fail("volatile loads are not supported yet", ld), false;
+        if (ld->isVolatile()) compiler_barrier();
         Value* ptr = ld->getPointerOperand();
         if (!uni_->is_varying(ptr)) {
-            Value* v = b_.CreateAlignedLoad(ld->getType(), scalar(ptr), ld->getAlign(), ld->getName());
+            LoadInst* v = b_.CreateAlignedLoad(ld->getType(), scalar(ptr), ld->getAlign(), ld->getName());
+            v->setVolatile(ld->isVolatile());
             if (!varying) return set(v);
             return set(b_.CreateVectorSplat(W, v));
         }
         return set(gather(ld->getType(), ptr, ld->getAlign(), mask, ld->getName()));
     }
     if (auto* st = dyn_cast<StoreInst>(&inst)) {
-        if (st->isVolatile()) return fail("volatile stores are not supported yet", st), false;
+        if (st->isVolatile()) compiler_barrier();
         Value* ptr = st->getPointerOperand();
         Value* val = st->getValueOperand();
         if (!uni_->is_varying(ptr) && !uni_->is_varying(val)) {
-            b_.CreateAlignedStore(scalar(val), scalar(ptr), st->getAlign());
+            b_.CreateAlignedStore(scalar(val), scalar(ptr), st->getAlign())->setVolatile(st->isVolatile());
             return true;
         }
         if (!uni_->is_varying(ptr)) {
@@ -3105,10 +3357,20 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
         for (Use& u : c->operands())
             if (!isa<BasicBlock>(u.get()) && !isa<Function>(u.get()) && !isa<MetadataAsValue>(u.get()))
                 u.set(scalar(u.get()));
+        if (auto* bin = dyn_cast<BinaryOperator>(c); bin && bin->isIntDivRem())
+            if (auto* k = dyn_cast<ConstantInt>(bin->getOperand(1)); !k || k->isZero() || k->isMinusOne()) {
+                Value* d = bin->getOperand(1);
+                bin->setOperand(1, b_.CreateSelect(trapping_divisor(bin->getOpcode(), bin->getOperand(0), d),
+                                                   ConstantInt::get(d->getType(), 1), d));
+            }
         b_.Insert(c, inst.getName());
         return set(c);
     }
 
+    if (auto* ev = dyn_cast<ExtractValueInst>(&inst)) {
+        if (auto it = cmpxchg_parts_.find(ev->getAggregateOperand()); it != cmpxchg_parts_.end())
+            return set(ev->getIndices()[0] == 0 ? it->second.first : it->second.second);
+    }
     if (auto* bin = dyn_cast<BinaryOperator>(&inst)) {
         if (Value* v = emit_uniform_division(bin)) return set(v);
         Value* lhs = vector(bin->getOperand(0));
@@ -3122,8 +3384,9 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
                 // Not a constant one: no lane has zero, and keeping it constant
                 // lets LLVM divide with shifts and multiplies instead of a
                 // scalar idiv per lane.
-                if (auto* c = dyn_cast<ConstantInt>(bin->getOperand(1)); c && !c->isZero()) break;
-                rhs = b_.CreateSelect(mask, rhs, ConstantInt::get(rhs->getType(), 1));
+                if (auto* c = dyn_cast<ConstantInt>(bin->getOperand(1)); c && !c->isZero() && !c->isMinusOne()) break;
+                rhs = b_.CreateSelect(b_.CreateAnd(mask, b_.CreateNot(trapping_divisor(bin->getOpcode(), lhs, rhs))), rhs,
+                                      ConstantInt::get(rhs->getType(), 1));
                 break;
             default:
                 break;
@@ -3186,6 +3449,12 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
             if (isa<FPMathOperator>(v)) v->copyFastMathFlags(call);
             return set(v);
         }
+    }
+    // An intrinsic with no vector form (lround, ldexp...): once per lane.
+    if (auto* call = dyn_cast<IntrinsicInst>(&inst)) {
+        auto lane_type = [](Type* t) { return t->isIntegerTy() || t->isFloatingPointTy() || t->isPointerTy(); };
+        if (lane_type(call->getType()) && all_of(call->args(), [&](Use& u) { return lane_type(u->getType()); }))
+            return emit_atomic(inst, mask);
     }
     fail("unsupported varying instruction", &inst);
     return false;
