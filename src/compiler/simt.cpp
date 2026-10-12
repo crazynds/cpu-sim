@@ -95,7 +95,21 @@ private:
     // ---- atomics: one locked instruction per active lane, or one for the
     // warp when every lane updates the same address.
     bool emit_atomic(Instruction& inst, Value* mask);
-    Value* emit_uniform_rmw(AtomicRMWInst* rmw, Value* mask);
+    // `ptr`: the address of every lane in `mask` (default: the instruction's
+    // own, uniform). Null if the operation has no reduction.
+    Value* emit_uniform_rmw(AtomicRMWInst* rmw, Value* mask, Value* ptr = nullptr);
+    // Operations emit_uniform_rmw reduces across lanes.
+    static bool groupable(const AtomicRMWInst* rmw) {
+        using Op = AtomicRMWInst::BinOp;
+        if (rmw->getType()->isIntegerTy()) switch (rmw->getOperation()) {
+                case Op::Add: case Op::Sub: case Op::Or: case Op::Xor: case Op::And:
+                case Op::Max: case Op::Min: case Op::UMax: case Op::UMin:
+                    return true;
+                default:
+                    return false;
+            }
+        return rmw->getOperation() == Op::FAdd;
+    }
     DenseMap<const Value*, std::pair<Value*, Value*>> cmpxchg_parts_;  // cmpxchg -> (old values, success)
     // An empty asm with a memory clobber: volatile accesses stay in order
     // and are never merged, hoisted or removed.
@@ -215,6 +229,28 @@ private:
             }
     }
     Value* half(Value* v, unsigned h);
+    // A masked gather. AVX-512 gathers 32 and 64-bit elements only; LLVM
+    // turns a gather of bytes into one load per lane. A byte (or an aligned
+    // 16-bit value) is gathered instead as the aligned 32-bit word holding it,
+    // then shifted out: that word never crosses a page, so it is readable
+    // whenever the byte is.
+    Value* masked_gather(Type* vty, Value* ptrs, Align align, Value* mask) {
+        auto* vt = cast<FixedVectorType>(vty);
+        Type* et = vt->getElementType();
+        const unsigned bits = et->getPrimitiveSizeInBits();
+        if (!(bits == 8 || (bits == 16 && align.value() >= 2)))
+            return b_.CreateMaskedGather(vty, ptrs, align, mask, PoisonValue::get(vty));
+        const unsigned n = vt->getNumElements();
+        auto* i64v = FixedVectorType::get(b_.getInt64Ty(), n);
+        auto* i32v = FixedVectorType::get(b_.getInt32Ty(), n);
+        Value* p = b_.CreatePtrToInt(ptrs, i64v);
+        Value* word = b_.CreateIntToPtr(b_.CreateAnd(p, ConstantInt::get(i64v, ~uint64_t(3))),
+                                        FixedVectorType::get(PointerType::get(ctx_, 0), n));
+        Value* shift = b_.CreateTrunc(b_.CreateShl(b_.CreateAnd(p, ConstantInt::get(i64v, 3)), ConstantInt::get(i64v, 3)), i32v);
+        Value* w = b_.CreateMaskedGather(i32v, word, Align(4), mask, PoisonValue::get(i32v));
+        Value* v = b_.CreateTrunc(b_.CreateLShr(w, shift), FixedVectorType::get(b_.getIntNTy(bits), n));
+        return et->isIntegerTy() ? v : b_.CreateBitCast(v, vty);
+    }
     Value* concat_chunks(const std::vector<Value*>& parts);
     void fail(const std::string& what, const Value* v = nullptr) {
         if (error_.empty()) error_ = what + (v ? ": " + describe(v) : "");
@@ -1624,8 +1660,7 @@ Value* WarpBuilder::gather(Type* elem, Value* ptr, Align align, Value* mask, con
             // fdtd3d module took 24 s to compile instead of 7. Only the
             // module without a known block shape gets here.
             if (chunks > 2) {
-                parts[h] = b_.CreateMaskedGather(v16, b_.CreateGEP(b_.getInt8Ty(), addr.base, offs[h]), align, masks[h],
-                                                 PoisonValue::get(v16));
+                parts[h] = masked_gather(v16, b_.CreateGEP(b_.getInt8Ty(), addr.base, offs[h]), align, masks[h]);
                 continue;
             }
             Value* m_bits = b_.CreateBitCast(masks[h], i16);
@@ -1646,7 +1681,7 @@ Value* WarpBuilder::gather(Type* elem, Value* ptr, Align align, Value* mask, con
             b_.CreateBr(bb_done);
             b_.SetInsertPoint(bb_gather);
             Value* ptrs = b_.CreateGEP(b_.getInt8Ty(), addr.base, offs[h]);
-            Value* v_gather = b_.CreateMaskedGather(v16, ptrs, align, masks[h], PoisonValue::get(v16));
+            Value* v_gather = masked_gather(v16, ptrs, align, masks[h]);
             b_.CreateBr(bb_done);
             b_.SetInsertPoint(bb_done);
             PHINode* phi = b_.CreatePHI(v16, 3);
@@ -1908,7 +1943,7 @@ bool WarpBuilder::emit_call(CallInst* call, Value* mask) {
 // each lane's old value = the value before the warp's update combined with
 // the lanes before it (an exclusive scan). CUDA leaves the order of a warp's
 // atomics unspecified, so any order of the lanes is one the GPU could pick.
-Value* WarpBuilder::emit_uniform_rmw(AtomicRMWInst* rmw, Value* mask) {
+Value* WarpBuilder::emit_uniform_rmw(AtomicRMWInst* rmw, Value* mask, Value* ptr) {
     using Op = AtomicRMWInst::BinOp;
     Type* t = rmw->getType();
     const Op op = rmw->getOperation();
@@ -1959,7 +1994,7 @@ Value* WarpBuilder::emit_uniform_rmw(AtomicRMWInst* rmw, Value* mask) {
     Value* total = op == Op::FAdd ? b_.CreateFAddReduce(id, v)
                                   : b_.CreateCall(Intrinsic::getDeclaration(&m_, reduce, {v->getType()}), {v});
     if (auto* fp = dyn_cast<Instruction>(total); fp && op == Op::FAdd) fp->setHasAllowReassoc(true);
-    AtomicRMWInst* one = b_.CreateAtomicRMW(op, scalar(rmw->getPointerOperand()), total, rmw->getAlign(),
+    AtomicRMWInst* one = b_.CreateAtomicRMW(op, ptr ? ptr : scalar(rmw->getPointerOperand()), total, rmw->getAlign(),
                                             rmw->getOrdering(), rmw->getSyncScopeID());
     one->setVolatile(rmw->isVolatile());
     if (rmw->use_empty()) return one;
@@ -1996,6 +2031,40 @@ bool WarpBuilder::emit_atomic(Instruction& inst, Value* mask) {
             if (!inst.use_empty()) vector_map_[&inst] = v;
             return true;
         }
+    // Lanes updating the same address (a histogram's hot bins): one atomic
+    // per distinct address among the active lanes, each with the reduction
+    // of its lanes' operands, instead of one locked instruction per lane on
+    // the same cache line.
+    if (auto* rmw = dyn_cast<AtomicRMWInst>(&inst); rmw && groupable(rmw)) {
+        Type* rt = vec_type(rmw->getType());
+        Value* ptrs = vector(rmw->getPointerOperand());
+        BasicBlock* pre = b_.GetInsertBlock();
+        BasicBlock* loop = BasicBlock::Create(ctx_, "atomic.group", w_);
+        BasicBlock* done = BasicBlock::Create(ctx_, "atomic.groups.done", w_);
+        b_.CreateCondBr(any_lane(mask), loop, done);
+        b_.SetInsertPoint(loop);
+        PHINode* rem = b_.CreatePHI(mask_type_, 2, "atomic.rem");
+        rem->addIncoming(mask, pre);
+        PHINode* acc = b_.CreatePHI(rt, 2, "atomic.acc");
+        acc->addIncoming(PoisonValue::get(rt), pre);
+        Value* first = b_.CreateBinaryIntrinsic(Intrinsic::cttz, b_.CreateBitCast(rem, b_.getIntNTy(W)), b_.getTrue());
+        Value* p = b_.CreateExtractElement(ptrs, b_.CreateTrunc(first, b_.getInt32Ty()));
+        Value* same = b_.CreateAnd(rem, b_.CreateICmpEQ(ptrs, b_.CreateVectorSplat(W, p)));
+        Value* r = emit_uniform_rmw(rmw, same, p);
+        Value* acc2 = inst.use_empty() ? static_cast<Value*>(acc) : b_.CreateSelect(same, r, acc);
+        Value* rem2 = b_.CreateAnd(rem, b_.CreateNot(same));
+        rem->addIncoming(rem2, b_.GetInsertBlock());
+        acc->addIncoming(acc2, b_.GetInsertBlock());
+        b_.CreateCondBr(any_lane(rem2), loop, done);
+        b_.SetInsertPoint(done);
+        if (!inst.use_empty()) {
+            PHINode* res = b_.CreatePHI(rt, 2);
+            res->addIncoming(PoisonValue::get(rt), pre);
+            res->addIncoming(acc2, loop);
+            vector_map_[&inst] = res;
+        }
+        return true;
+    }
     auto* cx = dyn_cast<AtomicCmpXchgInst>(&inst);
     Type* t = cx ? cx->getCompareOperand()->getType() : inst.getType();
     const DataLayout& dl = m_.getDataLayout();
