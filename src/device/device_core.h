@@ -164,9 +164,7 @@ private:
         }();
         return per_worker * executor_->workers();
     }
-    // Every candidate is measured this many times and keeps its best; the
-    // launches are cheap now (a few microseconds), noise is not.
-    static constexpr int kTrialRounds = 3;
+    static constexpr int kTrialRounds = 2;
     // A width to try, with its entry point.
     struct Trial {
         uint32_t lanes;

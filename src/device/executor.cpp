@@ -342,6 +342,9 @@ void Executor::worker(int index, int cpu) {
             // sibling of a pair must not wait for this half again.
             t_in_kernel = 0;
             job->aborted.store(true, std::memory_order_relaxed);
+            // No block will be run any more: say so, or this worker, if it
+            // is the last to leave, never closes the job (leave() needs it).
+            job->exhausted.store(true, std::memory_order_release);
             if (job->cooperative) pairs_[pair_of_[index]]->epoch(half_of_[index]).store(UINT64_MAX);
             std::lock_guard lock(mutex_);
             if (!job->fault.signal) job->fault = recovery.fault;
