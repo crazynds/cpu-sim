@@ -668,7 +668,7 @@ void retarget(Module& m, TargetMachine* tm, const std::vector<KernelInfo>& kerne
         if (f.isDeclaration()) continue;
         bool is_kernel = false;
         for (const auto& k : kernels) is_kernel |= k.scalar == &f;
-        // Every device function is inlined into the kernels (DESIGN.md 5.6).
+        // Every device function is inlined into the kernels (DESIGN.md 5.5).
         f.removeFnAttr(Attribute::NoInline);
         f.removeFnAttr(Attribute::OptimizeNone);
         if (!is_kernel) {

@@ -93,7 +93,7 @@ DeviceProperties make_properties(const Config& cfg, const Topology& topo, int co
     p.clockRate = max_clock_khz;
     p.memoryClockRate = 0;
 
-    // Discrete GPU without host mapping while there is no shared pool (DESIGN.md 6.6).
+    // Discrete GPU without host mapping while there is no shared pool (DESIGN.md 6.2).
     bool shared = cfg.vram_shared > 0;
     p.integrated = shared;
     p.canMapHostMemory = shared;

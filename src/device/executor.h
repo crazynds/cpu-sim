@@ -52,7 +52,7 @@ struct LaunchResult {
 // The device's "SMs": one worker thread per reserved logical CPU, pinned to it.
 // A launch hands out whole blocks through an atomic counter; each worker runs
 // every warp of its block. With a cooperative entry, the two SMT siblings of a
-// core run one block together instead, half each (DESIGN.md 4.3).
+// core run one block together instead, half each (DESIGN.md 4.2).
 // Several launches (from different streams) can be active at once: a worker
 // takes blocks from the oldest one that still has some, so a kernel's last
 // blocks overlap with the next kernel's first ones. Cooperative launches run

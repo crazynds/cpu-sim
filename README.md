@@ -11,7 +11,7 @@ Compiles CUDA programs **without modification** to run on the CPU: each 32-threa
 | `libcpusim_cudart` | malloc/free/memcpy/memset/memGetInfo, properties, fatbin registration, `<<<>>>`, profiling |
 | Compiler (`cucc` + `cpusim-devc`) | static and dynamic `__shared__`, `__syncthreads`, divergence, loops; pass on both backends: `matmul`, `transpose`, `heat2d`, `scan`, `bitonic_sort`, `mandelbrot` |
 | Also | asynchronous streams (one queue per stream, streams in parallel, default stream rules, events, `cudaStreamWaitEvent`, host callbacks); warp operations (`__shfl*_sync`, `__ballot_sync`, `__any/__all_sync`, `__activemask`, `__match_*`, `__reduce_*`); managed memory and mapped host memory (shared pool at the same address in the driver and in the program); device math library (AVX-512 where available, glibc libmvec for exp/log/pow/sin/erf...); per-thread local arrays |
-| Not yet | atomics, device `malloc`, `__managed__` variables, CUDA graphs |
+| Also, since the stress suite | atomics, device and `__managed__` variables, recursion and function pointers, device `printf`/`malloc`/`assert`, cooperative groups, libcu++ atomics, CUDA graphs; 629 of 631 stress cases pass ([tests/stress/](tests/stress/README.md)) |
 
 ## Build
 

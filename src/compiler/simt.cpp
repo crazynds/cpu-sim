@@ -319,7 +319,7 @@ private:
         return mma_scratch_;
     }
 
-    // Barriers (DESIGN.md 4.4): each __syncthreads is a block of its own; the
+    // Barriers (DESIGN.md 4.5): each __syncthreads is a block of its own; the
     // warp saves every slot and mask to its frame there and returns.
     bool split_barriers();
     bool reload_is_safe(LoadInst* ld, AllocaInst* slot, Instruction* use);
