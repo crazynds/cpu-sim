@@ -170,7 +170,8 @@ if(TARGET cpusim-devc)
     # The samples carry GPU-sized workloads (>= 100 ms on an RTX 5060 where the
     # kernel allows it); the tests build them with -DSAMPLE_TEST (smaller sizes,
     # same code paths) and OpenMP for the CPU reference: seconds each.
-    foreach(sample IN ITEMS matmul_naive matmul transpose heat2d scan bitonic_sort mandelbrot tensor_gemm cpu_gemm)
+    foreach(sample IN ITEMS matmul_naive matmul transpose heat2d scan bitonic_sort mandelbrot tensor_gemm cpu_gemm
+                            histogram reduction spmv nbody)
         add_test(NAME sample_${sample}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_sample_test.sh ${CMAKE_BINARY_DIR}/cucc
                     $<TARGET_FILE:cpusimd> ${CMAKE_CURRENT_SOURCE_DIR}/samples/${sample}.cu -fmad=false -fopenmp -DSAMPLE_TEST)

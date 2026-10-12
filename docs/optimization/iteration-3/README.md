@@ -10,6 +10,7 @@ The third round: it started with stability tests that require the same bits in a
 | 26 | [Compiler and runtime changes](26-compiler-and-runtime-changes.md) | Division by a constant in divergent code, the generic-variant budget and the JIT cache key |
 | 27 | [A kernel written for the CPU, near peak](27-kernel-at-peak.md) | GEMM in CUDA for the `cucc` model: 94% (fp32) and 93% (bf16) of one core's peak, with the bfloat16 `mma_sync` inline and the accumulators in registers |
 | 28 | [Function calls that are not inlined](28-function-calls.md) | Recursion, function pointers and virtual calls: a W-lane version of the function, called with the warp's mask |
+| 29 | [The stress suite](29-stress-suite.md) | 631 cases checked against the GPU: from 174 passing to 629, what broke and why, and the slow cases left for later |
 
 ## Tensor core results at the end of the iteration
 
@@ -32,7 +33,7 @@ Left by iteration 2:
 
 - **Block distribution policy:** chunks of 64 blocks helped the stencils and cost ~5% of cycles in matmul; it could become one more dimension of the automatic selection (see [17](../iteration-2/17-block-distribution.md)).
 - **Measurement noise:** the same configuration varied by up to ±30% between runs in black-scholes, which limits the precision of the width choice (see [03](../iteration-2/03-automatic-width-selection.md)).
-- **Missing compiler features:** atomics, device `malloc` and `__managed__` variables.
+- **Missing compiler features:** atomics, device `malloc` and `__managed__` variables (all done in [29](29-stress-suite.md)).
 
 New in this iteration:
 
@@ -42,5 +43,11 @@ New in this iteration:
 - **2-byte fragment loads:** they become two masked 32-byte loads and a `vinserti64x4`; the two 16-lane halves are not merged into one 64-byte load (see [27](27-kernel-at-peak.md)).
 - **Efficiency with all cores depends on temperature:** the same bf16 GEMM went from 1956 to 3173 GFLOPS depending on the laptop's thermal state; the loss that remains relative to the peak was not attributed (see [27](27-kernel-at-peak.md)).
 - **Compile time of large kernels:** the generic-variant budget resolves the module compiled before execution, but the JIT of a WMMA kernel for 512-thread blocks still takes 7.43 s, and the 16-bit types test compiles in 13.6 s, almost all of it in register allocation (see [26](26-compiler-and-runtime-changes.md)).
+
+New in the stress suite ([29](29-stress-suite.md)):
+
+- **Slow cases:** 48 of the 113 cases whose OpenMP version takes 1 ms or more run slower on the simulator; the largest groups are many short launches (~66 us each through the driver), global atomics with conflicts, sorting networks and scans, and byte-granular access.
+- **Waiting loops:** a kernel that waits for other threads runs one warp per call; a lane waiting for another lane of its own warp still hangs.
+- **`j0` and `y0`:** glibc's double versions exceed CUDA's ulp bound near their zeros.
 
 Previous: [iteration 2](../iteration-2/README.md). Back to the [index](../README.md).

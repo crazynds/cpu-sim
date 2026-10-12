@@ -89,7 +89,7 @@ Why the simulator wins where it does:
 
 - Arguments and results must be scalars (integers, floating point, pointers): no structs by value, and no per-thread arrays passed by pointer (they live in a lane-major layout that has no per-lane address).
 - No `__syncthreads` or direct `__shared__` access inside a function that is not inlined.
-- A function's address is local to the module that took it. Each block shape compiled by the JIT is its own module, so a pointer stored by one kernel and called by a kernel launched with another block shape does not match any target. This is the same problem as `__device__` variables across modules, open in the stress test.
+- (Fixed in [29](29-stress-suite.md): a function's address is now a number made from its name, the same in every module, so a pointer stored by one kernel is called right by a kernel of another block shape.)
 - Every argument is varying, even one that is the same for the whole warp (the tree pointer in the BST search): inside the function, accesses through it are classified at run time instead of at compile time.
 
-Previous: [27](27-kernel-at-peak.md). Back to the [iteration 3 index](README.md).
+Previous: [27](27-kernel-at-peak.md). Next: [29](29-stress-suite.md). Back to the [iteration 3 index](README.md).
