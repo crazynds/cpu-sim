@@ -87,4 +87,4 @@ One feature area per program, so that something the simulator cannot compile hid
 
 The full list is the suite's `summary.tsv`.
 
-Previous: [28](28-function-calls.md). Back to the [iteration 3 index](README.md).
+Previous: [28](28-function-calls.md). Next: [30](30-launches-and-hot-spots.md), which worked on these slow cases. Back to the [iteration 3 index](README.md).

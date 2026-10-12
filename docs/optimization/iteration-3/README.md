@@ -11,6 +11,7 @@ The third round: it started with stability tests that require the same bits in a
 | 27 | [A kernel written for the CPU, near peak](27-kernel-at-peak.md) | GEMM in CUDA for the `cucc` model: 94% (fp32) and 93% (bf16) of one core's peak, with the bfloat16 `mma_sync` inline and the accumulators in registers |
 | 28 | [Function calls that are not inlined](28-function-calls.md) | Recursion, function pointers and virtual calls: a W-lane version of the function, called with the warp's mask |
 | 29 | [The stress suite](29-stress-suite.md) | 631 cases checked against the GPU: from 174 passing to 629, what broke and why, and the slow cases left for later |
+| 30 | [Launches and the slow cases](30-launches-and-hot-spots.md) | An empty kernel from 42 us to 1.7 us; atomics merged per warp; against OpenMP, 335 of 541 cases faster (233 before) |
 
 ## Tensor core results at the end of the iteration
 
@@ -46,7 +47,7 @@ New in this iteration:
 
 New in the stress suite ([29](29-stress-suite.md)):
 
-- **Slow cases:** 48 of the 113 cases whose OpenMP version takes 1 ms or more run slower on the simulator; the largest groups are many short launches (~66 us each through the driver), global atomics with conflicts, sorting networks and scans, and byte-granular access.
+- **Slow cases** (after [30](30-launches-and-hot-spots.md)): 31 of the 114 cases whose OpenMP version takes 1 ms or more still run slower on the simulator: atomics contended across cores, GPU-style GEMM and SpMV kernels, per-thread divergence, byte-per-thread code; and a launch through the driver costs 5 to 7 us against 1.7 in-process.
 - **Waiting loops:** a kernel that waits for other threads runs one warp per call; a lane waiting for another lane of its own warp still hangs.
 - **`j0` and `y0`:** glibc's double versions exceed CUDA's ulp bound near their zeros.
 

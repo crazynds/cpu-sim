@@ -84,6 +84,7 @@ A CPU running AVX-512 on all cores is limited by power and temperature: the cloc
 2. **Watch `cpu-smi`** during the runs: if the clock drops between two runs, their numbers are not comparable.
 3. **Pause between runs** and **compare in pairs**: run the two contenders back to back, alternate which goes first, and compare the ratio within each pair rather than numbers taken minutes apart. `bench/gemm_duel.sh` does exactly this.
 4. **Measure the ceiling in the same state** (tutorial 2): an efficiency is only meaningful against the peak measured right before.
+5. **OpenMP next to CUDA:** a program that also runs OpenMP code (the benchmarks' `omp` references) should set `OMP_WAIT_POLICY=passive`. By default libgomp's threads keep spinning for milliseconds after each parallel region, on every CPU, the device's included, and a kernel launched in that window shares its workers' CPUs with them.
 
 ## First run of a CUDA program
 
