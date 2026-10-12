@@ -20,6 +20,7 @@ struct KernelInfo {
     llvm::Function* entry = nullptr;
     llvm::Function* profiled = nullptr;
     bool has_barriers = false;
+    bool spins = false;  // waits for other warps in a loop (yield points): 32-lane variants only
     uint32_t spec_block[3] = {0, 0, 0};  // block shape the code is specialized for (0: any)
     uint32_t wide_variants = 0;  // CPUSIM_META_WIDE_SHIFT / CPUSIM_META_SUSP_SHIFT bits
     std::vector<ParamSlot> params;
@@ -37,6 +38,15 @@ constexpr const char* kSharedBaseFn = "__cpusim_shared_base";
 // Warp primitives the device header builds __shfl_* and __ballot_* on.
 constexpr const char* kShflFn = "__cpusim_shfl";
 constexpr const char* kBallotFn = "__cpusim_ballot";
+// `__cpusim_yield()`: in a loop that waits for memory another warp writes
+// (cpusim-devc inserts it): the warp suspends there as at a barrier and lets
+// the other warps of its block run.
+constexpr const char* kYieldFn = "__cpusim_yield";
+inline bool is_yield(const llvm::Instruction& i) {
+    auto* call = llvm::dyn_cast<llvm::CallInst>(&i);
+    return call && call->getCalledFunction() && call->getCalledFunction()->getName() == kYieldFn;
+}
+
 // Tensor cores: `__cpusim_mma_<types>(d, a, b, c)`, pointers to the fragments
 // (per-thread arrays) of one warp's 16x16x16 multiply-accumulate (mma.h). The
 // warp code calls `__cpusim_tensor_<types>` of libcpusim_tensor per warp.

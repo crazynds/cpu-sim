@@ -126,6 +126,7 @@ private:
     bool emit_instruction(Instruction& inst, Value* mask, bool divergent);
     void add_edge(BasicBlock* from, BasicBlock* to, Value* edge_mask);
     std::vector<Node> topo_order(Loop* level);
+    bool waits(const Node& n);
     Node node_of(BasicBlock* bb, Loop* level);
 
     // ---- values
@@ -320,6 +321,7 @@ private:
     AllocaInst* pass_used_ = nullptr;  // this call already went through one barrier
     void emit_dispatch();
     DenseSet<const BasicBlock*> barrier_blocks_;
+    DenseSet<const BasicBlock*> yield_blocks_;  // barrier blocks that are yield points
     std::vector<std::pair<AllocaInst*, uint64_t>> state_;  // slot -> frame offset
     BasicBlock* dispatch_ = nullptr;
     Value* frame_ = nullptr;
@@ -605,7 +607,8 @@ bool WarpBuilder::check_supported() {
                     if (call->getFunctionType()->isVarArg()) fail("variadic calls through a pointer", call);
                     continue;  // through a pointer: emit_call
                 } else if (callee->getName() == kSharedBaseFn || is_cond_load(call)) continue;
-                else if (callee->getName() == kShflFn || callee->getName() == kBallotFn || is_mma(call) || is_mmav(call))
+                else if (callee->getName() == kShflFn || callee->getName() == kBallotFn || is_mma(call) || is_mmav(call) ||
+                         callee->getName() == kYieldFn)
                     continue;
                 else if (unsigned n; !libmvec_name(*call, &n).empty()) continue;
                 else if (!callee->isIntrinsic() && !callee->isDeclaration() && !callee->isVarArg()) continue;  // emit_call
@@ -644,12 +647,13 @@ bool WarpBuilder::split_barriers() {
     std::vector<Instruction*> barriers;
     for (BasicBlock& bb : f_)
         for (Instruction& inst : bb)
-            if (is_barrier(inst)) barriers.push_back(&inst);
+            if (is_barrier(inst) || is_yield(inst)) barriers.push_back(&inst);
     for (Instruction* bar : barriers) {
         BasicBlock* bb = bar->getParent();
         if (&*bb->getFirstNonPHIIt() != bar) bb = bb->splitBasicBlock(bar, "barrier");
         bb->splitBasicBlock(std::next(bar->getIterator()), "after.barrier");
         barrier_blocks_.insert(bb);
+        if (is_yield(*bar)) yield_blocks_.insert(bb);
     }
     return !barriers.empty();
 }
@@ -2633,6 +2637,13 @@ Node WarpBuilder::node_of(BasicBlock* bb, Loop* level) {
 
 // Reverse post order of a loop level, with subloops collapsed and back edges to
 // the level's header ignored: every node comes after all of its predecessors.
+// The node holds a yield point (a loop waiting for another thread's write).
+bool WarpBuilder::waits(const Node& n) {
+    if (yield_blocks_.empty()) return false;
+    if (n.block) return yield_blocks_.contains(n.block);
+    return any_of(n.loop->blocks(), [&](BasicBlock* bb) { return yield_blocks_.contains(bb); });
+}
+
 std::vector<Node> WarpBuilder::topo_order(Loop* level) {
     BasicBlock* start = level ? level->getHeader() : &f_.getEntryBlock();
     std::vector<Node> post;
@@ -2647,13 +2658,19 @@ std::vector<Node> WarpBuilder::topo_order(Loop* level) {
         } else {
             for (BasicBlock* bb : n.loop->blocks()) exits_from.push_back(bb);
         }
+        // Nodes that wait for other threads (yield points) are visited first,
+        // so they come after their siblings in the order: a branch that
+        // writes a flag runs before the branch that waits for it.
+        SmallVector<Node, 8> next;
         for (BasicBlock* bb : exits_from) {
             for (BasicBlock* s : successors(bb)) {
                 if (level && (!level->contains(s) || s == level->getHeader())) continue;
                 if (n.loop && n.loop->contains(s)) continue;
-                dfs(node_of(s, level));
+                next.push_back(node_of(s, level));
             }
         }
+        std::stable_partition(next.begin(), next.end(), [&](const Node& x) { return waits(x); });
+        for (const Node& x : next) dfs(x);
         post.push_back(n);
     };
     dfs(node_of(start, level));
@@ -2846,6 +2863,17 @@ void WarpBuilder::emit_prologue() {
 // Stores every slot for now; compute_resume_liveness() later removes the
 // stores of slots the code after the barrier never reads before writing.
 void WarpBuilder::emit_barrier(BasicBlock* bb) {
+    if (yield_blocks_.contains(bb)) {
+        // A yield point: always suspend (the other warps must run), and
+        // resume right here.
+        BasicBlock* resume = BasicBlock::Create(ctx_, "after.yield", w_);
+        resumes_.push_back(resume);
+        barrier_order_.push_back(bb);
+        save_state(int(resumes_.size()));
+        b_.CreateRet(b_.getInt32(CPUSIM_YIELD));
+        b_.SetInsertPoint(resume);
+        return;
+    }
     BasicBlock* resume = BasicBlock::Create(ctx_, "after." + bb->getName(), w_);
     BasicBlock* through = BasicBlock::Create(ctx_, "barrier.through", w_);
     BasicBlock* suspend = BasicBlock::Create(ctx_, "barrier.suspend", w_);
@@ -3298,6 +3326,7 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
             if (coop_) emit_coop_barrier(mask);
             return true;
         }
+        if (is_yield(*call)) return true;  // the block's end does it (emit_barrier)
         Intrinsic::ID id = call->getIntrinsicID();
         switch (id) {
             case Intrinsic::nvvm_bar_warp_sync:  // the warp runs in lockstep

@@ -22,6 +22,7 @@
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/IR/Dominators.h>
+#include <llvm/Analysis/LoopInfo.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/CommandLine.h>
@@ -358,7 +359,41 @@ void lower_nvvm_atomics(Module& m) {
 // `__cpusim_sym_<name>`, which the runtime sets when it loads the module.
 // `__cpusim_init_<name>` keeps the initial value, copied to the VRAM when the
 // generic module is loaded. Returns the manifest lines: "symbol <name> <size>
-// <alignment>".
+// <alignment> [managed [initial bytes in hex]]".
+// The bytes of a constant without relocations (numbers, arrays and structs of
+// them, zero), as laid out in memory; false if it has an address in it.
+bool constant_bytes(const DataLayout& dl, const Constant* c, uint8_t* out) {
+    if (isa<ConstantAggregateZero>(c) || isa<UndefValue>(c)) return true;  // the buffer starts zeroed
+    if (auto* i = dyn_cast<ConstantInt>(c)) {
+        const APInt& v = i->getValue();
+        for (unsigned b = 0; b < dl.getTypeStoreSize(c->getType()); ++b) out[b] = uint8_t(v.extractBitsAsZExtValue(8, b * 8));
+        return true;
+    }
+    if (auto* f = dyn_cast<ConstantFP>(c)) {
+        APInt v = f->getValueAPF().bitcastToAPInt();
+        for (unsigned b = 0; b < dl.getTypeStoreSize(c->getType()); ++b) out[b] = uint8_t(v.extractBitsAsZExtValue(8, b * 8));
+        return true;
+    }
+    if (auto* d = dyn_cast<ConstantDataSequential>(c)) {
+        StringRef raw = d->getRawDataValues();
+        std::memcpy(out, raw.data(), raw.size());
+        return true;
+    }
+    if (auto* st = dyn_cast<ConstantStruct>(c)) {
+        const StructLayout* sl = dl.getStructLayout(st->getType());
+        for (unsigned i = 0; i < st->getNumOperands(); ++i)
+            if (!constant_bytes(dl, st->getOperand(i), out + sl->getElementOffset(i))) return false;
+        return true;
+    }
+    if (auto* a = dyn_cast<ConstantArray>(c)) {
+        const uint64_t step = dl.getTypeAllocSize(a->getType()->getElementType());
+        for (unsigned i = 0; i < a->getNumOperands(); ++i)
+            if (!constant_bytes(dl, a->getOperand(i), out + i * step)) return false;
+        return true;
+    }
+    return false;
+}
+
 std::string lower_device_globals(Module& m) {
     LLVMContext& ctx = m.getContext();
     const DataLayout& dl = m.getDataLayout();
@@ -376,6 +411,7 @@ std::string lower_device_globals(Module& m) {
     MDNode* empty = MDNode::get(ctx, {});
     for (GlobalVariable* g : syms) {
         const std::string name = g->getName().str();
+        const bool managed = g->getSection() == "cpusim_managed";  // __managed__ (device header)
         Type* t = g->getValueType();
         const uint64_t size = dl.getTypeAllocSize(t);
         const uint64_t align = std::max<uint64_t>(g->getAlign().valueOrOne().value(), dl.getABITypeAlign(t).value());
@@ -406,7 +442,20 @@ std::string lower_device_globals(Module& m) {
         // Still referenced from another global's initializer: the initial copy.
         if (!g->use_empty()) g->replaceAllUsesWith(ConstantExpr::getPointerBitCastOrAddrSpaceCast(init, g->getType()));
         g->eraseFromParent();
-        lines += "symbol " + name + " " + std::to_string(size) + " " + std::to_string(align) + "\n";
+        lines += "symbol " + name + " " + std::to_string(size) + " " + std::to_string(align);
+        if (managed) {
+            // The host copy starts from the same value (Clang leaves the host
+            // side of a device variable without its initializer).
+            lines += " managed";
+            std::vector<uint8_t> bytes(size);
+            if (init->hasInitializer() && !init->getInitializer()->isNullValue() &&
+                constant_bytes(dl, init->getInitializer(), bytes.data())) {
+                static const char* hex = "0123456789abcdef";
+                lines += " ";
+                for (uint8_t b : bytes) lines += hex[b >> 4], lines += hex[b & 15];
+            }
+        }
+        lines += "\n";
     }
     return lines;
 }
@@ -537,6 +586,56 @@ void lower_printf(Function& f) {
             if ((*it)->use_empty()) (*it)->eraseFromParent();
         if (buf && buf->use_empty()) buf->eraseFromParent();
     }
+}
+
+// Loops that wait for memory another thread writes: their exit depends on a
+// volatile or atomic read made inside them (a flag, a lock). On a GPU the
+// writer, in another warp or another branch of the same warp, runs meanwhile;
+// here the warp's lanes run together and the warps of a block in turn. Each
+// such loop gets a yield point at the end of its iterations (the warp
+// suspends there and the others run), and the kernel keeps to its 32-lane
+// variants (several warps in one vector could wait for each other).
+bool mark_spin_loops(Function& f) {
+    DominatorTree dt(f);
+    LoopInfo li(dt);
+    Module& m = *f.getParent();
+    FunctionCallee yield = m.getOrInsertFunction(cpusim::kYieldFn, Type::getVoidTy(m.getContext()));
+    if (auto* fn = dyn_cast<Function>(yield.getCallee())) {
+        fn->addFnAttr(Attribute::Convergent);
+        fn->addFnAttr(Attribute::NoUnwind);
+    }
+    bool any = false;
+    for (Loop* l : li.getLoopsInPreorder()) {
+        bool barrier = false;
+        for (BasicBlock* bb : l->blocks())
+            for (Instruction& i : *bb)
+                if (auto* ii = dyn_cast<IntrinsicInst>(&i))
+                    barrier |= ii->getIntrinsicID() == Intrinsic::nvvm_barrier0;
+        if (barrier) continue;  // its barriers already let the other warps run
+        // Does an exit condition depend, inside the loop, on such a read?
+        SmallVector<BasicBlock*, 4> exiting;
+        l->getExitingBlocks(exiting);
+        SmallVector<Value*, 16> work;
+        for (BasicBlock* bb : exiting)
+            if (auto* br = dyn_cast<BranchInst>(bb->getTerminator()); br && br->isConditional())
+                work.push_back(br->getCondition());
+        SmallPtrSet<Value*, 32> seen;
+        bool spins = false;
+        while (!work.empty() && !spins) {
+            auto* i = dyn_cast<Instruction>(work.pop_back_val());
+            if (!i || !l->contains(i) || !seen.insert(i).second) continue;
+            if (auto* ld = dyn_cast<LoadInst>(i); ld && (ld->isVolatile() || ld->isAtomic())) spins = true;
+            else if (isa<AtomicRMWInst>(i) || isa<AtomicCmpXchgInst>(i)) spins = true;
+            else
+                for (Value* op : i->operands()) work.push_back(op);
+        }
+        if (!spins) continue;
+        BasicBlock* latch = l->getLoopLatch();
+        if (!latch) continue;
+        CallInst::Create(yield, "", latch->getTerminator()->getIterator());
+        any = true;
+    }
+    return any;
 }
 
 bool has_alloca(const Function& f) {
@@ -731,6 +830,7 @@ int main(int argc, char** argv) {
                                   "instcombine<no-verify-fixpoint>,simplifycfg,dse,adce,lower-switch,lcssa");
         }
     for (Function* f : per_thread) removeUnreachableBlocks(*f);
+    for (auto& k : kernels) k.spins = mark_spin_loops(*k.scalar);
     if (!opt.emit_scalar_ll.empty()) write_ll(*m, opt.emit_scalar_ll);
 
     std::string manifest = "cpusim-module " + std::to_string(CPUSIM_KERNEL_ABI) + "\n" + symbol_lines;
@@ -784,7 +884,7 @@ int main(int argc, char** argv) {
         for (BasicBlock& bb : *k.scalar)
             for (Instruction& inst : bb)
                 if (auto* call = dyn_cast<IntrinsicInst>(&inst))
-                    k.has_barriers |= call->getIntrinsicID() == Intrinsic::nvvm_barrier0 ||
+                    k.has_barriers |= k.spins || call->getIntrinsicID() == Intrinsic::nvvm_barrier0 ||
                                       call->getIntrinsicID() == Intrinsic::nvvm_bar_sync ||
                                       call->getIntrinsicID() == Intrinsic::nvvm_barrier ||
                                       call->getIntrinsicID() == Intrinsic::nvvm_barrier_n;
@@ -804,24 +904,28 @@ int main(int argc, char** argv) {
         // independent work, and the runtime's measurement picked the 32-lane
         // variant over the block-wide one (samples/tensor_gemm: 2x faster).
         const bool tensor = min_sm > 0;
+        k.has_barriers |= k.spins;
+        // Spinning kernels: one warp per call, as on a GPU (wide variants put
+        // the waiting warp and the one it waits for in the same vector).
+        const bool narrow = tensor || k.spins;
         bool ok = build(false, 32) && (spec || build(true, 32));
         // Wider variants: with barriers, a whole block per call makes them free
         // (64..512 lanes); without, 2 or 4 warps per call give the core more
         // independent work. The runtime measures which one wins.
         for (unsigned i = 0; ok && i < (k.has_barriers ? 4u : 2u); ++i) {
-            if (!wanted(64u << i, true) || tensor) continue;
+            if (!wanted(64u << i, true) || narrow) continue;
             ok = build(false, 64u << i);
             if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_WIDE_SHIFT + i);
         }
         // Groups of 2 and 4 warps that still suspend at barriers: fewer switches.
-        for (unsigned i = 0; ok && k.has_barriers && !tensor && i < 2; ++i) {
+        for (unsigned i = 0; ok && k.has_barriers && !narrow && i < 2; ++i) {
             if (!wanted(64u << i, false)) continue;
             ok = build(false, 64u << i, true);
             if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_SUSP_SHIFT + i);
         }
         // Half a block per call, the two SMT siblings of a core together: for
         // blocks of L+1 to 2L threads.
-        for (unsigned i = 0; ok && k.has_barriers && !tensor && i < 4; ++i) {
+        for (unsigned i = 0; ok && k.has_barriers && !narrow && i < 4; ++i) {
             const unsigned lanes = 64u << i;
             if (spec && !(threads > lanes && threads <= 2 * lanes)) continue;
             ok = build(false, lanes, false, true);
@@ -844,6 +948,7 @@ int main(int argc, char** argv) {
                                                          ConstantInt::get(i32, k.frame_bytes),
                                                          ConstantInt::get(i32, k.shared_bytes),
                                                          ConstantInt::get(i32, (k.has_barriers ? CPUSIM_META_HAS_BARRIERS : 0) |
+                                                                                   (k.spins ? CPUSIM_META_YIELDS : 0) |
                                                                                    k.wide_variants),
                                                          ConstantInt::get(i32, k.frame_bytes_wide[0]),
                                                          ConstantInt::get(i32, k.frame_bytes_wide[1])}),

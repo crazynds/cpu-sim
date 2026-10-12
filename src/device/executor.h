@@ -156,6 +156,7 @@ private:
         mutable std::atomic<bool> aborted{false};
         KernelFault fault;  // under mutex_
         uint32_t tag = 0;   // the context that launched it
+        uint32_t meta_flags = 0;  // CPUSIM_META_*
     };
 
     // Two SMT siblings running blocks together. Barrier epochs (see

@@ -50,6 +50,8 @@
 enum cpusim_exit_reason {
     CPUSIM_EXIT = 0,     // the group finished
     CPUSIM_BARRIER = 1,  // reached __syncthreads; call again to resume (32-lane entry only)
+    CPUSIM_YIELD = 2,    // spinning on memory another warp of the block writes: run the
+                         // others, then call again (same barrier count as before)
 };
 
 // One call's context: this 128-byte header, followed by the per-lane data
@@ -117,6 +119,7 @@ enum cpusim_counter {
 #define CPUSIM_META_SUSP_SHIFT 16  // bit (16 + i): suspending variant __cpusim_entry<64 << i>s_ exists
 #define CPUSIM_META_COOP_SHIFT 24  // bit (24 + i): cooperative variant __cpusim_entry<64 << i>c_ exists
 #define CPUSIM_META_BLOCK_FN 2u    // __cpusim_block_<name> exists (see below)
+#define CPUSIM_META_YIELDS 4u      // the 32-lane entry may return CPUSIM_YIELD (no barrier pass-through)
 
 // Kernels with barriers also get
 //     uint32_t __cpusim_block_<mangled name>(cpusim_warp_ctx* ctxs, uint32_t nwarps, uint8_t* done);

@@ -404,15 +404,18 @@ void Executor::run_blocks(const Job& job, int worker, CtxArray& ctx, uint8_t* sh
                 if (done[w] || phase[w] != low) continue;
                 cpusim_warp_ctx* c = ctx.at(w);
                 static const bool disabled = std::getenv("CPUSIM_NO_BARRIER_PASS") != nullptr;  // for comparisons
-                const bool pass = behind == 1 && !disabled;
+                // (Not with yield points: a warp could pass a barrier, then
+                // yield, and its count would be ambiguous.)
+                const bool pass = behind == 1 && !disabled && !(job.meta_flags & CPUSIM_META_YIELDS);
                 c->barrier_pass = pass;
                 --behind;
-                if (in_kernel(job.entry, c) == CPUSIM_EXIT) {
+                const uint32_t r = in_kernel(job.entry, c);
+                if (r == CPUSIM_EXIT) {
                     done[w] = 1;
                     --remaining;
-                } else {
+                } else if (r != CPUSIM_YIELD) {
                     phase[w] += pass ? 2 : 1;  // went through one barrier, stopped at the next
-                }
+                }  // a yield: the same count; the warps waiting with it run first
             }
         }
     }
@@ -587,6 +590,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     job.block = block;
     job.cooperative = cooperative && !pairs_.empty();
     job.tag = tag;
+    job.meta_flags = meta.flags;
     // The warps of a block that has no barrier and no shared memory never
     // talk to each other: with few blocks, hand out its groups one by one
     // (as a GPU schedules warps), so the work spreads over every worker
