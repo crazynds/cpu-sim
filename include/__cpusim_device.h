@@ -5,6 +5,7 @@
 #ifndef CPUSIM_DEVICE_H
 #define CPUSIM_DEVICE_H
 
+#include <math.h> /* the host math functions, next to the device ones below (as nvcc) */
 #include <stdlib.h>
 
 #include "cuda_runtime_api.h"
