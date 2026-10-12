@@ -563,6 +563,29 @@ cudaError_t cudaDeviceSynchronize(void) {
     return async_error();
 }
 
+// Limits are recorded and reported back; none constrains the device. Device
+// code runs on the workers' own stacks (megabytes, not CUDA's kilobyte), and
+// there is no device printf FIFO or heap to size.
+namespace {
+std::mutex limits_mutex;
+size_t limits[7] = {1024, 1 << 20, 8 << 20, 2, 2048, 32, 0};
+}  // namespace
+
+cudaError_t cudaDeviceSetLimit(cudaLimit limit, size_t value) {
+    if (unsigned(limit) >= 7) return record(Error::UnsupportedLimit);
+    std::lock_guard lock(limits_mutex);
+    limits[limit] = value;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetLimit(size_t* value, cudaLimit limit) {
+    if (!value) return record(Error::InvalidValue);
+    if (unsigned(limit) >= 7) return record(Error::UnsupportedLimit);
+    std::lock_guard lock(limits_mutex);
+    *value = limits[limit];
+    return cudaSuccess;
+}
+
 cudaError_t cudaDeviceReset(void) { return cudaDeviceSynchronize(); }
 
 cudaError_t cudaMalloc(void** ptr, size_t size) {

@@ -41,6 +41,7 @@ typedef enum cudaError {
     cudaErrorInvalidDevice = 101,
     cudaErrorInvalidKernelImage = 200,
     cudaErrorNoKernelImageForDevice = 209,
+    cudaErrorUnsupportedLimit = 215,
     cudaErrorSharedObjectInitFailed = 303,
     cudaErrorOperatingSystem = 304,
     cudaErrorInvalidResourceHandle = 400,
@@ -61,6 +62,16 @@ typedef enum cudaMemcpyKind {
     cudaMemcpyDeviceToDevice = 3,
     cudaMemcpyDefault = 4
 } cudaMemcpyKind;
+
+typedef enum cudaLimit {
+    cudaLimitStackSize = 0,
+    cudaLimitPrintfFifoSize = 1,
+    cudaLimitMallocHeapSize = 2,
+    cudaLimitDevRuntimeSyncDepth = 3,
+    cudaLimitDevRuntimePendingLaunchCount = 4,
+    cudaLimitMaxL2FetchGranularity = 5,
+    cudaLimitPersistingL2CacheSize = 6
+} cudaLimit;
 
 typedef struct CUstream_st* cudaStream_t;
 typedef struct CUevent_st* cudaEvent_t;
@@ -127,6 +138,8 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp* prop, int device);
 cudaError_t cudaDriverGetVersion(int* version);
 cudaError_t cudaRuntimeGetVersion(int* version);
 cudaError_t cudaDeviceSynchronize(void);
+cudaError_t cudaDeviceSetLimit(cudaLimit limit, size_t value);
+cudaError_t cudaDeviceGetLimit(size_t* value, cudaLimit limit);
 cudaError_t cudaDeviceReset(void);
 
 cudaError_t cudaMalloc(void** devPtr, size_t size);

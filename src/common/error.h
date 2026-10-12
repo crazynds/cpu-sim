@@ -19,6 +19,7 @@ enum class Error : int {
     InvalidDevice = 101,
     InvalidKernelImage = 200,
     NoKernelImageForDevice = 209,
+    UnsupportedLimit = 215,
     OperatingSystem = 304,
     InvalidResourceHandle = 400,
     IllegalAddress = 700,

@@ -12,6 +12,7 @@ const char* error_name(Error e) {
         case Error::InvalidDeviceFunction: return "cudaErrorInvalidDeviceFunction";
         case Error::InvalidKernelImage: return "cudaErrorInvalidKernelImage";
         case Error::NoKernelImageForDevice: return "cudaErrorNoKernelImageForDevice";
+        case Error::UnsupportedLimit: return "cudaErrorUnsupportedLimit";
         case Error::MissingConfiguration: return "cudaErrorMissingConfiguration";
         case Error::InvalidResourceHandle: return "cudaErrorInvalidResourceHandle";
         case Error::InvalidDevicePointer: return "cudaErrorInvalidDevicePointer";
@@ -39,6 +40,7 @@ const char* error_string(Error e) {
         case Error::InvalidDeviceFunction: return "invalid device function";
         case Error::InvalidKernelImage: return "device kernel image is invalid";
         case Error::NoKernelImageForDevice: return "no kernel image is available for execution on the device";
+        case Error::UnsupportedLimit: return "limit is not supported on this architecture";
         case Error::MissingConfiguration: return "__global__ function call is not configured";
         case Error::InvalidResourceHandle: return "invalid resource handle";
         case Error::InvalidDevicePointer: return "invalid device pointer";
