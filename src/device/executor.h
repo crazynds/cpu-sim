@@ -66,6 +66,22 @@ struct KernelFault {
     uintptr_t ip = 0;
 };
 
+// A lock held for a few hundred nanoseconds by threads pinned one per CPU:
+// spinning beats sleeping on a futex, which cost every launch tens of
+// microseconds when all the workers joined and left a job at once.
+class SpinMutex {
+public:
+    void lock() {
+        while (locked_.exchange(true, std::memory_order_acquire))
+            while (locked_.load(std::memory_order_relaxed)) __builtin_ia32_pause();
+    }
+    bool try_lock() { return !locked_.load(std::memory_order_relaxed) && !locked_.exchange(true, std::memory_order_acquire); }
+    void unlock() { locked_.store(false, std::memory_order_release); }
+
+private:
+    std::atomic<bool> locked_{false};
+};
+
 class Executor {
 public:
     explicit Executor(const std::vector<int>& cpus);
@@ -134,6 +150,10 @@ private:
         // against 0.51 with 4), a matmul still shares its operands (~5% more
         // cycles than 4).
         static constexpr uint64_t kChunk = 64;
+        // This job's chunk: kChunk, or less when the grid is too small to
+        // give every worker a whole one (1024 blocks were 16 chunks for 28
+        // workers: a dozen of them stole block by block from the rest).
+        uint64_t chunk = kChunk;
         struct alignas(64) Range {
             mutable std::atomic<uint64_t> next{0};  // position in this worker's own sequence
             uint64_t end = 0;                       // its length
@@ -143,15 +163,34 @@ private:
         uint64_t first = 0;
         // Block (unit) at position t of worker w's sequence.
         uint64_t block_at(size_t w, uint64_t t) const {
-            return first + ((t / kChunk) * nranges + w) * kChunk + t % kChunk;
+            return first + ((t / chunk) * nranges + w) * chunk + t % chunk;
         }
-        bool has_work() const;  // some block not taken yet
-        // Under mutex_: workers inside the job, and (cooperative) which have joined.
+        bool has_work() const;  // some block not taken yet (reads every range: not on hot paths)
+        // A worker found no block left: no one else needs to join.
+        mutable std::atomic<bool> exhausted{false};
+        // Cooperative jobs, under mutex_: workers inside, and which have joined.
         int inflight = 0;
+        // Other jobs, without the lock: workers inside, plus kClosed once the
+        // last one left with no block to hand out (then nobody can join).
+        static constexpr int64_t kClosed = int64_t(1) << 62;
+        std::atomic<int64_t> state{0};
+        bool try_join() {
+            int64_t v = state.load(std::memory_order_relaxed);
+            while (!(v & kClosed))
+                if (state.compare_exchange_weak(v, v + 1, std::memory_order_acquire)) return true;
+            return false;
+        }
+        // True for the worker that closes the job.
+        bool leave() {
+            if (state.fetch_sub(1, std::memory_order_acq_rel) != 1 || !exhausted.load(std::memory_order_acquire))
+                return false;
+            int64_t zero = 0;
+            return state.compare_exchange_strong(zero, kClosed, std::memory_order_acq_rel);
+        }
         int joins = 0;
-        uint64_t busy_ns = 0;
+        std::atomic<uint64_t> busy_ns{0};
         std::vector<char> joined;
-        bool done = false;
+        std::atomic<bool> done{false};
         // A worker faulted: the others take no more blocks.
         mutable std::atomic<bool> aborted{false};
         KernelFault fault;  // under mutex_
@@ -197,11 +236,34 @@ private:
     std::vector<std::thread> threads_;
     std::vector<std::unique_ptr<Pair>> pairs_;
     std::vector<int> pair_of_, half_of_;  // per worker; pair -1: no sibling among the workers
-    std::mutex mutex_;
-    std::condition_variable start_cv_, done_cv_;
+    SpinMutex mutex_;
+    std::condition_variable_any start_cv_, done_cv_;
     bool stop_ = false;
+    // Idle workers and a launching thread spin a while before sleeping: a
+    // kernel launched right after another finds the workers awake, with no
+    // system call on either side (waking 28 sleeping threads per launch cost
+    // tens of microseconds). Jobs posted so far, to notice a new one.
+    std::atomic<uint64_t> posted_{0};
+    // Workers a posted job can use (its blocks, at most every worker): an
+    // idle worker takes one before it takes the lock, so a one-block kernel
+    // does not have every worker queue on the mutex.
+    std::atomic<int> demand_{0};
+    std::atomic<int> spinners_{0};  // idle workers spinning for a demand slot
+    bool take_demand() {
+        int d = demand_.load(std::memory_order_relaxed);
+        while (d > 0)
+            if (demand_.compare_exchange_weak(d, d - 1, std::memory_order_acquire)) return true;
+        return false;
+    }
+    std::atomic<bool> stopping_{false};
     std::vector<Job*> active_;   // oldest first
-    std::vector<Job*> current_;  // under mutex_: the job each worker is in
+    std::unique_ptr<std::atomic<Job*>[]> current_;  // the job each worker is in (for cancel)
+    // The latest job posted (not cooperative): a worker with a demand slot
+    // joins it without the lock. `readers_` counts workers between reading it
+    // and joining, so the job outlives their look at it.
+    std::atomic<Job*> hot_{nullptr};
+    std::atomic<int> readers_{0};
+    void finish(Job* job);  // under mutex_: the job is over, run() may return
     bool coop_active_ = false;   // a cooperative job runs alone
 };
 

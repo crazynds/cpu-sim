@@ -8,6 +8,7 @@
 //   - cudaStreamWaitEvent makes a stream wait for an event's last record.
 // Errors of asynchronous work are kept and returned by the next
 // synchronization (or cudaGetLastError), as in CUDA.
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -16,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/spin.h"
 #include "cuda_runtime_api.h"
 
 namespace cpusim::cudart {
@@ -24,21 +26,21 @@ namespace cpusim::cudart {
 struct Completion {
     std::mutex mutex;
     std::condition_variable cv;
-    bool done = false;
-    cudaError_t error = cudaSuccess;  // of this operation
+    std::atomic<bool> done{false};
+    cudaError_t error = cudaSuccess;  // of this operation (written before done)
     void wait() {
+        // Spinning first: a short kernel ends before a sleeping thread
+        // would even be woken (common/spin.h).
+        if (spin_until([&] { return done.load(std::memory_order_acquire); })) return;
         std::unique_lock lock(mutex);
-        cv.wait(lock, [&] { return done; });
+        cv.wait(lock, [&] { return done.load(); });
     }
-    bool ready() {
-        std::lock_guard lock(mutex);
-        return done;
-    }
+    bool ready() { return done.load(std::memory_order_acquire); }
     void finish(cudaError_t e = cudaSuccess) {
         {
             std::lock_guard lock(mutex);
             error = e;
-            done = true;
+            done.store(true, std::memory_order_release);
         }
         cv.notify_all();
     }

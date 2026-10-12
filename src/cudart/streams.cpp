@@ -1,6 +1,9 @@
 #include "cudart/streams.h"
 
+#include "common/spin.h"
+
 #include <algorithm>
+#include <atomic>
 #include <map>
 
 namespace cpusim::cudart {
@@ -27,6 +30,7 @@ public:
         {
             std::lock_guard lock(mutex_);
             ops_.push_back(std::move(op));
+            pending_.fetch_add(1, std::memory_order_release);
             if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
         }
         cv_.notify_one();
@@ -52,6 +56,7 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Op> ops_;
+    std::atomic<int> pending_{0};  // ops_.size(), readable without the lock
     bool stopping_ = false;
     std::thread thread_;
     friend class Scheduler;
@@ -62,10 +67,16 @@ void Queue::run() {
         Op op;
         {
             std::unique_lock lock(mutex_);
+            if (ops_.empty() && !stopping_) {  // the next operation usually follows soon
+                lock.unlock();
+                spin_until([&] { return pending_.load(std::memory_order_acquire) != 0; });
+                lock.lock();
+            }
             cv_.wait(lock, [&] { return stopping_ || !ops_.empty(); });
             if (ops_.empty()) return;  // stopping, and everything ran
             op = std::move(ops_.front());
             ops_.pop_front();
+            pending_.fetch_sub(1, std::memory_order_relaxed);
         }
         for (auto& d : op.deps) d->wait();
         cudaError_t e = op.work ? op.work() : cudaSuccess;

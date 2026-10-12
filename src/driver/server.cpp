@@ -1,5 +1,6 @@
 #include "driver/server.h"
 
+
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <vector>
 
+#include "common/spin.h"
 #include "common/units.h"
 
 namespace cpusim {
@@ -218,7 +220,7 @@ void Server::serve(Client* client) {
         msg.msg_iovlen = 1;
         msg.msg_control = control;
         msg.msg_controllen = sizeof(control);
-        ssize_t n = recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
+        ssize_t n = recvmsg_spinning(fd, &msg, MSG_CMSG_CLOEXEC);
         if (n < 0 && errno == EINTR) continue;
         int passed_fd = -1;
         for (cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm))

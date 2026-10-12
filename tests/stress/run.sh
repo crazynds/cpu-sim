@@ -18,6 +18,10 @@ GPU_OUT=$ROOT/build/stress  # the GPU runs, shared by every build compared
 WHICH=${1:-cpu}
 [ $# -gt 0 ] && shift
 TIMEOUT=${STRESS_TIMEOUT:-120}
+# The OpenMP references wait passively: by default libgomp's threads keep
+# spinning for milliseconds after each parallel region, on every CPU, and the
+# kernel timed right after would share its workers' CPUs with them.
+export OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-passive}
 mkdir -p "$OUT" "$GPU_OUT"
 
 if [ $# -gt 0 ]; then

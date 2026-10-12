@@ -12,8 +12,10 @@
 
 #include "common/config.h"
 #include "common/paths.h"
+#include "common/spin.h"
 #include "device/device.h"
 #include "device/driver_client.h"
+
 
 namespace cpusim {
 
@@ -78,7 +80,7 @@ Error DriverConnection::call(const proto::Request& req, void* reply, size_t repl
     rmsg.msg_control = rcontrol;
     rmsg.msg_controllen = sizeof(rcontrol);
     ssize_t n;
-    do n = recvmsg(fd_, &rmsg, MSG_CMSG_CLOEXEC);
+    do n = recvmsg_spinning(fd_, &rmsg, MSG_CMSG_CLOEXEC);
     while (n < 0 && errno == EINTR);
     for (cmsghdr* cm = CMSG_FIRSTHDR(&rmsg); n > 0 && cm; cm = CMSG_NXTHDR(&rmsg, cm)) {
         if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) continue;

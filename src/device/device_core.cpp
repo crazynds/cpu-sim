@@ -719,15 +719,17 @@ void DeviceCore::record_timing(uint32_t id, uint64_t function, uint64_t key, uin
     t.ns.push_back(ns);
     const size_t n = t.first_round ? t.first_round : t.candidates.size() / kTrialRounds;
     if (!t.first_round && t.ns.size() == n) {
-        // First round done. The second one only separates candidates close
-        // to the best (within 25%); the others cannot win and are not run
-        // again (each run is a whole launch with that width).
+        // First round done. The next ones only separate candidates within
+        // 2x of the best: one measurement can be off by that much (clock,
+        // caches, another program), and a candidate dropped on one bad
+        // sample never comes back.
         t.first_round = n;
         const uint64_t best = *std::min_element(t.ns.begin(), t.ns.end());
         t.candidates.resize(n);
-        for (size_t i = 0; i < n; ++i)
-            if (t.ns[i] <= best + best / 4) t.candidates.push_back(t.candidates[i]);
-        if (t.candidates.size() == n + 1) t.candidates.pop_back();  // only one left: no need
+        for (int r = 1; r < kTrialRounds; ++r)
+            for (size_t i = 0; i < n; ++i)
+                if (t.ns[i] <= 2 * best) t.candidates.push_back(t.candidates[i]);
+        if (t.candidates.size() == n + kTrialRounds - 1) t.candidates.resize(n);  // only one left: no need
     }
     if (t.ns.size() == t.candidates.size()) {
         // Each candidate's best over its runs.

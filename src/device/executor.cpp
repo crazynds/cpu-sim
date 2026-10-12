@@ -18,6 +18,7 @@
 #include <new>
 #include <string>
 
+#include "common/spin.h"
 #include "common/topology.h"
 
 namespace cpusim {
@@ -228,7 +229,8 @@ Executor::Executor(const std::vector<int>& cpus) {
         pairs_.push_back(std::make_unique<Pair>());
     }
     install_fault_handlers();
-    current_.assign(cpus.size(), nullptr);
+    current_.reset(new std::atomic<Job*>[cpus.size()]);
+    for (size_t i = 0; i < cpus.size(); ++i) current_[i] = nullptr;
     for (size_t i = 0; i < cpus.size(); ++i) threads_.emplace_back([this, i, cpu = cpus[i]] { worker(int(i), cpu); });
 }
 
@@ -236,6 +238,7 @@ Executor::~Executor() {
     {
         std::lock_guard lock(mutex_);
         stop_ = true;
+        stopping_ = true;
     }
     start_cv_.notify_all();
     for (auto& t : threads_) t.join();
@@ -265,11 +268,58 @@ void Executor::worker(int index, int cpu) {
     while (true) {
         Job* job = nullptr;
         {
-            std::unique_lock lock(mutex_);
-            start_cv_.wait(lock, [&] { return stop_ || (job = pick(index)) != nullptr; });
-            if (stop_) break;
-            ++job->inflight;
+            // A job with blocks left, if the lock is free (when every worker
+            // leaves a job at once, the others go on to wait for slots).
+            std::unique_lock lock(mutex_, std::try_to_lock);
+            if (lock.owns_lock()) {
+                if (stop_) break;
+                job = pick(index);
+                lock.unlock();
+            }
+            if (!job) {
+                // Nothing to do: spin a while, until a posted job wants
+                // another worker; then sleep.
+                bool slot = false;
+                const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(cpusim::spin_ns());
+                spinners_.fetch_add(1, std::memory_order_relaxed);
+                // Parked on the demand's cache line where the CPU allows it:
+                // a pause loop would slow down the SMT sibling still running
+                // the last blocks of a job.
+                const bool park = cpusim::has_mwaitx();
+                for (unsigned i = 1; !stopping_.load(std::memory_order_relaxed); ++i) {
+                    if (demand_.load(std::memory_order_relaxed) > 0 && take_demand()) {
+                        slot = true;
+                        break;
+                    }
+                    if (park) cpusim::park_on(&demand_, 4000);  // about a microsecond
+                    else _mm_pause();
+                    if ((park || i % 256 == 0) && std::chrono::steady_clock::now() > until) break;
+                }
+                spinners_.fetch_sub(1, std::memory_order_relaxed);
+                if (slot) {
+                    // The latest job, without the lock (usually the one that
+                    // gave the slot).
+                    readers_.fetch_add(1, std::memory_order_seq_cst);
+                    Job* hot = hot_.load(std::memory_order_seq_cst);
+                    if (hot && !hot->exhausted.load(std::memory_order_relaxed) && hot->try_join()) job = hot;
+                    readers_.fetch_sub(1, std::memory_order_release);
+                }
+                if (!job) {
+                    lock.lock();
+                    if (stop_) break;
+                    if (slot) {
+                        job = pick(index);
+                        if (!job) continue;  // its job needed no more workers
+                    } else {
+                        start_cv_.wait(lock, [&] { return stop_ || (job = pick(index)) != nullptr; });
+                        if (!job) break;  // stopping
+                    }
+                    lock.unlock();
+                }
+            }
             if (job->cooperative) {
+                std::lock_guard jl(mutex_);
+                ++job->inflight;
                 job->joined[size_t(index)] = 1;
                 ++job->joins;
             }
@@ -280,10 +330,7 @@ void Executor::worker(int index, int cpu) {
         Recovery recovery;
         t_aborted = &job->aborted;
         t_output_fd = job->cfg.output_fd;
-        {
-            std::lock_guard lock(mutex_);
-            current_[size_t(index)] = job;
-        }
+        current_[size_t(index)].store(job, std::memory_order_release);
         if (sigsetjmp(recovery.jump, 1) == 0) {
             t_recovery = &recovery;
             if (!job->cooperative) run_blocks(*job, index, ctx, shared, counters, frames.data());
@@ -301,14 +348,19 @@ void Executor::worker(int index, int cpu) {
         }
         const uint64_t ns = uint64_t(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
-        {
+        current_[size_t(index)].store(nullptr, std::memory_order_release);
+        job->busy_ns.fetch_add(ns, std::memory_order_relaxed);
+        if (job->counters) {  // profiling runs only
             std::lock_guard lock(mutex_);
-            current_[size_t(index)] = nullptr;
-            job->busy_ns += ns;
-            if (job->counters)
-                for (int i = 0; i < CPUSIM_COUNTERS; ++i) job->counters[i] += counters[i];
+            for (int i = 0; i < CPUSIM_COUNTERS; ++i) job->counters[i] += counters[i];
+        }
+        if (job->cooperative) {
+            std::lock_guard lock(mutex_);
             --job->inflight;
             maybe_finish(job);
+        } else if (job->leave()) {
+            std::lock_guard lock(mutex_);
+            finish(job);
         }
     }
     std::free(shared_mem);
@@ -325,7 +377,11 @@ bool Executor::Job::has_work() const {
 // The next block for `worker`: from its own range, then from the others'
 // (starting with its neighbours, which are on the same CCD more often).
 bool Executor::claim(const Job& job, int worker, uint64_t* b) {
-    if (job.aborted.load(std::memory_order_relaxed)) return false;
+    if (job.exhausted.load(std::memory_order_relaxed)) return false;
+    if (job.aborted.load(std::memory_order_relaxed)) {
+        job.exhausted.store(true, std::memory_order_release);
+        return false;
+    }
     for (size_t k = 0; k < job.nranges; ++k) {
         const size_t w = (size_t(worker) + k) % job.nranges;
         const Job::Range& r = job.ranges[w];
@@ -336,6 +392,7 @@ bool Executor::claim(const Job& job, int worker, uint64_t* b) {
             return true;
         }
     }
+    job.exhausted.store(true, std::memory_order_release);
     return false;
 }
 
@@ -512,7 +569,9 @@ Executor::Job* Executor::pick(int worker) {
             if (pair_of_[size_t(worker)] >= 0 && !j->joined[size_t(worker)]) return j;
             continue;
         }
-        if (j->has_work()) return j;
+        if (!j->exhausted.load(std::memory_order_relaxed) && !j->aborted.load(std::memory_order_relaxed) &&
+            j->try_join())
+            return j;
     }
     return nullptr;
 }
@@ -524,17 +583,24 @@ void Executor::cancel(uint32_t tag) {
         j->aborted.store(true, std::memory_order_relaxed);
         if (!j->fault.signal) j->fault.signal = kCancelSignal;
         for (size_t i = 0; i < threads_.size(); ++i)
-            if (current_[i] == j) pthread_kill(threads_[i].native_handle(), kCancelSignal);
+            if (current_[i].load(std::memory_order_acquire) == j) pthread_kill(threads_[i].native_handle(), kCancelSignal);
     }
 }
 
+void Executor::finish(Job* j) {
+    active_.erase(std::find(active_.begin(), active_.end(), j));
+    j->done.store(true, std::memory_order_release);  // last: the waiting run() may return at once
+    done_cv_.notify_all();
+}
+
+// Cooperative jobs: over when every paired worker joined and left.
 void Executor::maybe_finish(Job* j) {
     if (j->done || j->inflight > 0) return;
-    if (j->cooperative ? j->joins < int(2 * pairs_.size()) : j->has_work()) return;
-    j->done = true;
+    if (j->joins < int(2 * pairs_.size())) return;
     if (j->cooperative && j->aborted.load(std::memory_order_relaxed))
         for (auto& p : pairs_) p->resync();
     active_.erase(std::find(active_.begin(), active_.end(), j));
+    j->done.store(true, std::memory_order_release);  // last: the waiting run() may return at once
     done_cv_.notify_all();
 }
 
@@ -606,15 +672,17 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     if (busy_ns) *busy_ns = 0;
     if (first >= job.blocks) return;
     if (!job.cooperative) {
-        // Worker w's sequence: chunks w, w + n, w + 2n... of kChunk blocks.
+        // Worker w's sequence: chunks w, w + n, w + 2n... of `chunk` blocks.
         job.nranges = threads_.size();
         job.ranges.reset(new Job::Range[job.nranges]);
         job.first = first;
-        const uint64_t count = job.blocks - first, per_round = Job::kChunk * job.nranges;
+        const uint64_t count = job.blocks - first;
+        job.chunk = std::clamp<uint64_t>(count / job.nranges, 1, Job::kChunk);
+        const uint64_t per_round = job.chunk * job.nranges;
         for (size_t w = 0; w < job.nranges; ++w) {
-            const uint64_t full = count / per_round * Job::kChunk;  // whole rounds
-            const uint64_t rest = count % per_round, start = w * Job::kChunk;
-            job.ranges[w].end = full + (rest > start ? std::min(Job::kChunk, rest - start) : 0);
+            const uint64_t full = count / per_round * job.chunk;  // whole rounds
+            const uint64_t rest = count % per_round, start = w * job.chunk;
+            job.ranges[w].end = full + (rest > start ? std::min(job.chunk, rest - start) : 0);
         }
     }
 
@@ -627,8 +695,34 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
         done_cv_.wait(lock, [&] { return !coop_active_; });
     }
     active_.push_back(&job);
-    start_cv_.notify_all();
-    done_cv_.wait(lock, [&] { return job.done; });
+    if (!job.cooperative) hot_.store(&job, std::memory_order_release);
+    posted_.fetch_add(1, std::memory_order_release);
+    {
+        const int workers = int(threads_.size());
+        const uint64_t units = job.cooperative ? uint64_t(workers) : job.blocks - first;
+        const int want = int(std::min<uint64_t>(units, uint64_t(workers)));
+        if (demand_.fetch_add(want, std::memory_order_release) + want > workers)
+            demand_.store(workers, std::memory_order_relaxed);  // stale demand of finished jobs
+        // Wake sleepers only if the idle workers spinning are too few: a
+        // one-block kernel must not wake every idle worker. (One that stops
+        // spinning meanwhile finds the job when it goes to sleep: it looks
+        // for one under the lock first, and the job is already listed.)
+        if (job.cooperative || want > spinners_.load(std::memory_order_relaxed)) start_cv_.notify_all();
+    }
+    // Short kernels end within the spin: no sleep, no wake-up.
+    lock.unlock();
+    // (This thread is not pinned: the short budget, common/spin.h.)
+    cpusim::spin_until([&] { return job.done.load(std::memory_order_acquire); });
+    lock.lock();
+    done_cv_.wait(lock, [&] { return job.done.load(); });
+    // No worker may still be looking at the job when it goes away (it lives
+    // on this stack). Both sides store, then load the other's variable: the
+    // orderings must be sequentially consistent, or x86's store buffer lets
+    // each miss the other's store (we see no reader, the worker sees the job).
+    Job* expected = &job;
+    hot_.compare_exchange_strong(expected, nullptr, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    while (readers_.load(std::memory_order_seq_cst)) _mm_pause();
     if (busy_ns) *busy_ns = job.busy_ns;
     if (fault) *fault = job.fault;
     if (job.cooperative) {
