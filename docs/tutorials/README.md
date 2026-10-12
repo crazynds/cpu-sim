@@ -10,7 +10,7 @@ Each tutorial lists the commands, what the output means, and how to check that a
 | 2 | [Arithmetic peak and clock](02-peak.md) | the ceiling: GFLOPS the device can do at the clock it holds |
 | 3 | [The fp32 GEMM duel](03-gemm-duel.md) | GPU vs OpenMP vs `cucc`: kernel time, total time, GFLOPS |
 | 4 | [GEMM ablation](04-gemm-ablation.md) | the effect of each change in the `cucc` version, one at a time |
-| 5 | [Tensor cores and the other benchmarks](05-tensor-cores-and-samples.md) | WMMA and capability gating, every tensor operation (`tensor_ops`), `cpu_gemm`, `tensor_gemm`, `bench/run.sh`, the samples |
+| 5 | [Tensor cores and the other benchmarks](05-tensor-cores-and-samples.md) | WMMA and capability gating, every tensor operation (`tensor_ops`), `cpu_gemm`, `tensor_gemm`, function calls (`calls`), `bench/run.sh`, the samples |
 
 Do them in order: tutorial 1 builds everything the others use, and tutorial 2 gives the reference that tutorials 3 to 5 are compared against.
 
@@ -24,4 +24,5 @@ The programs these tutorials use:
 | `bench/gemm_duel.sh` | builds and runs the duel in pairs with pauses, then prints the means and ratios |
 | `bench/gemm_explore.cu` | the ablation steps of the `cucc` GEMM |
 | `bench/tensor_ops.cu` | every tensor core operation (type and shape): WMMA on the GPU or the simulator, or the same product with OpenMP |
+| `bench/calls.cu` | recursion, function pointers and virtual calls: kernels on the GPU or the simulator, or the same functions with OpenMP |
 | `bench/run.sh` | the earlier kernel comparison (GPU, `cucc`, plain C++), see [BENCHMARKS.md](../../BENCHMARKS.md) |

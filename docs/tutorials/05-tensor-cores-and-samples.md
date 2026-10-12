@@ -61,6 +61,20 @@ What to look for:
 - Compare `tensor_gemm` and `cpu_gemm` on both devices. On the CPU, the GPU-style kernel pays for shared-memory staging and barriers, which the CPU-style one avoids; on the GPU, see which structure the hardware prefers per type (the fp32 path of `cpu_gemm` uses no tensor cores, so it is not a GPU fp32 reference).
 - The fp32 path of `cpu_gemm` is the "before" kernel of tutorial 4 (12×32 per warp); the duel uses the newer one.
 
+## Function calls: `bench/calls.cu`
+
+Calls the compiler cannot inline: recursion (`fib` with the same and with a per-element depth, a recursive search in a 4M-node binary search tree, a divide and conquer), four calls per element through a table of function pointers, and virtual calls on 16M objects (grouped by type, then mixed). The same `__host__ __device__` functions run as kernels (`cuda`) or in an OpenMP loop (`omp`):
+
+```sh
+build/cucc -O3 -std=c++20 -fopenmp -Xcompiler -march=native bench/calls.cu -o build/bench/calls_cpu
+nvcc -O3 -std=c++20 -arch=native -Xcompiler -fopenmp,-march=native bench/calls.cu -o build/bench/calls_gpu
+build/bench/calls_gpu cuda    # the GPU
+build/bench/calls_cpu cuda    # the simulator (through the driver)
+build/bench/calls_cpu omp     # plain C++ with OpenMP
+```
+
+Each line gives the time (best of 3 after a warm-up), millions of elements per second, and a checksum that must be the same in the three runs. Run `cuda` and `omp` back to back, and repeat the pair: the recursive workloads are short and follow the clock closely.
+
 ## The kernel comparison of `bench/run.sh`
 
 [BENCHMARKS.md](../../BENCHMARKS.md) compares unmodified GPU kernels (matmul, mandelbrot, heat2d, transpose, scan, bitonic sort) on the GPU, on `cucc`, and as plain C++ with OpenMP. Every CPU result is checked bit for bit against the GPU's (a hash of the output):
