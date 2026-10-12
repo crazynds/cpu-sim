@@ -19,7 +19,7 @@ The optimizations were done in rounds. Each round has a folder with its own inde
 |---|---|---|
 | [Iteration 1](iteration-1/README.md) | Making it viable to run CUDA on the CPU: JIT, widths, memory accesses, control flow and barriers. Includes the original record, [OPTIMIZATIONS.md](iteration-1/OPTIMIZATIONS.md) | 01, 02, 04 to 09, 11 |
 | [Iteration 2](iteration-2/README.md) | Making the CUDA code on the CPU beat the HeCBench OpenMP version and making the width choice reliable | 03, 10, 12 to 22 |
-| [Iteration 3](iteration-3/README.md) | The same bits in all execution modes, 16-bit types and tensor cores, the adjustments that this work exposed and a kernel written for the CPU near peak | 23 to 27 |
+| [Iteration 3](iteration-3/README.md) | The same bits in all execution modes, 16-bit types and tensor cores, the adjustments that this work exposed and a kernel written for the CPU near peak | 23 to 28 |
 
 ## The documents
 
@@ -55,6 +55,7 @@ The numbering is unique across all iterations, so that references do not change.
 | 25 | 3 | [Tensor cores](iteration-3/25-tensor-cores.md) | `wmma::mma_sync` becomes one call per warp to `vdpbf16ps`, `vpdpbusd` or F16C with FMA |
 | 26 | 3 | [Compiler and runtime changes](iteration-3/26-compiler-and-runtime-changes.md) | Division by a constant in divergent code, the generic-variant budget and the JIT cache key |
 | 27 | 3 | [A kernel written for the CPU, near peak](iteration-3/27-kernel-at-peak.md) | GEMM in CUDA for the `cucc` model: 94% (fp32) and 93% (bf16) of one core's peak, with the bfloat16 `mma_sync` inline and the accumulators in registers |
+| 28 | 3 | [Function calls that are not inlined](iteration-3/28-function-calls.md) | Recursion, function pointers and virtual calls: a W-lane version of the function, called with the warp's mask |
 
 ## Suggested reading order
 

@@ -9,6 +9,7 @@ The third round: it started with stability tests that require the same bits in a
 | 25 | [Tensor cores](25-tensor-cores.md) | `wmma::mma_sync` becomes one call per warp to `vdpbf16ps`, `vpdpbusd` or F16C with FMA |
 | 26 | [Compiler and runtime changes](26-compiler-and-runtime-changes.md) | Division by a constant in divergent code, the generic-variant budget and the JIT cache key |
 | 27 | [A kernel written for the CPU, near peak](27-kernel-at-peak.md) | GEMM in CUDA for the `cucc` model: 94% (fp32) and 93% (bf16) of one core's peak, with the bfloat16 `mma_sync` inline and the accumulators in registers |
+| 28 | [Function calls that are not inlined](28-function-calls.md) | Recursion, function pointers and virtual calls: a W-lane version of the function, called with the warp's mask |
 
 ## Tensor core results at the end of the iteration
 
