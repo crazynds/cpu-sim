@@ -31,10 +31,12 @@ public:
     uint64_t used() const { return used_; }
     size_t allocation_count() const { return allocated_.size(); }
     uint64_t largest_free() const;
-    // Allocations of 2 GiB or more: while there is none, an offset inside any
-    // allocation fits in 32 signed bits (kernels then gather with 32-bit indices).
+    // Allocations of 2 GiB or more ("huge"), placed at the top of the range.
+    // An offset inside any other allocation fits in 32 signed bits, so the
+    // kernels gather with 32-bit indices through every pointer outside
+    // [first, end] of the huge ones (huge_span; nothing when there are none).
     static constexpr uint64_t kHuge = uint64_t(1) << 31;
-    size_t huge_allocations() const { return huge_; }
+    std::optional<std::pair<uint64_t, uint64_t>> huge_span() const;
 
 private:
     void insert_free(uint64_t off, uint64_t len);
@@ -42,7 +44,7 @@ private:
 
     uint64_t size_, granularity_, large_threshold_, large_alignment_;
     uint64_t used_ = 0;
-    size_t huge_ = 0;
+    std::map<uint64_t, uint64_t> huge_;  // offset -> length, the huge ones
     std::map<uint64_t, uint64_t> free_by_offset_;              // offset -> length
     std::set<std::pair<uint64_t, uint64_t>> free_by_size_;     // (length, offset)
     std::map<uint64_t, uint64_t> allocated_;                   // offset -> length

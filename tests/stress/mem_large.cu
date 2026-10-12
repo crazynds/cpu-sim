@@ -1,7 +1,9 @@
 // Large data: one 1 GiB allocation written by a kernel; 10000 small
 // allocations written through a device array of pointers and freed; a grid of
 // (2^31-1)>>6 blocks of 64 threads over more than 2^31 bytes, indexed with
-// size_t in a grid-stride loop.
+// size_t in a grid-stride loop, then gathered from at random; gathers and
+// scatters at random positions of a 3 GiB allocation (beyond 2 GiB, and back
+// from its end pointer) in the same kernel as gathers from a small one.
 #include "stress.cuh"
 
 __host__ __device__ inline unsigned pattern(size_t i) {
@@ -19,6 +21,27 @@ __global__ void fill_words(unsigned* p, size_t n) {
 __global__ void fill_bytes(unsigned char* p, size_t n) {
     size_t stride = size_t(gridDim.x) * blockDim.x;
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) p[i] = byte_pattern(i);
+}
+
+__global__ void gather_two(const unsigned* big, const size_t* bidx, const unsigned* small, const unsigned* sidx,
+                           unsigned* out, int m) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < m) out[i] = big[bidx[i]] ^ small[sidx[i]];
+}
+
+__global__ void gather_back(const unsigned* end, const size_t* back, unsigned* out, int m) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < m) out[i] = end[-1 - (long long)back[i]];
+}
+
+__global__ void scatter_big(unsigned* big, const size_t* bidx, int m) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < m) big[bidx[i]] = ~pattern(bidx[i]);
+}
+
+__global__ void gather_bytes(const unsigned char* p, const size_t* idx, unsigned char* out, int m) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < m) out[i] = p[idx[i]];
 }
 
 __global__ void write_many(int** ptrs, int count, int words) {
@@ -116,8 +139,88 @@ int main() {
                 std::printf("  [%zu] got %02x want %02x\n", from + i, tail[i], byte_pattern(from + i));
                 ok = false;
             }
-        STRESS_CHECK(cudaFree(p));
         report("huge_grid_size_t_index", ok, k, -1);
+
+        // Bytes gathered from random positions, most beyond 2 GiB.
+        const int m = 1 << 20;
+        std::vector<size_t> hidx(m);
+        auto rr = random_u32(m, 7);
+        for (int i = 0; i < m; ++i) hidx[i] = (size_t(rr[i]) * 7 + (size_t(i) << 13)) % n;
+        size_t* didx;
+        unsigned char* dout;
+        STRESS_CHECK(cudaMalloc(&didx, m * sizeof(size_t)));
+        STRESS_CHECK(cudaMalloc(&dout, m));
+        STRESS_CHECK(cudaMemcpy(didx, hidx.data(), m * sizeof(size_t), cudaMemcpyHostToDevice));
+        double kg = time_device([&] { gather_bytes<<<m / 256, 256>>>(p, didx, dout, m); });
+        std::vector<unsigned char> hout(m);
+        STRESS_CHECK(cudaMemcpy(hout.data(), dout, m, cudaMemcpyDeviceToHost));
+        bool okg = true;
+        for (int i = 0; i < m && okg; ++i)
+            if (hout[i] != byte_pattern(hidx[i])) {
+                std::printf("  byte [%zu] got %02x want %02x\n", hidx[i], hout[i], byte_pattern(hidx[i]));
+                okg = false;
+            }
+        STRESS_CHECK(cudaFree(didx));
+        STRESS_CHECK(cudaFree(dout));
+        STRESS_CHECK(cudaFree(p));
+        report("gather_bytes_past_2gib", okg, kg, -1);
+    }
+
+    {  // 3 GiB of words: gathers, scatters and indexing back from the end
+        const size_t n = (size_t(3) << 30) / sizeof(unsigned), ns = 1 << 18;
+        const int m = 1 << 20;
+        unsigned *big, *small, *out;
+        size_t *bidx, *back;
+        unsigned* sidx;
+        STRESS_CHECK(cudaMalloc(&big, n * sizeof(unsigned)));
+        STRESS_CHECK(cudaMalloc(&small, ns * sizeof(unsigned)));
+        STRESS_CHECK(cudaMalloc(&out, m * sizeof(unsigned)));
+        STRESS_CHECK(cudaMalloc(&bidx, m * sizeof(size_t)));
+        STRESS_CHECK(cudaMalloc(&back, m * sizeof(size_t)));
+        STRESS_CHECK(cudaMalloc(&sidx, m * sizeof(unsigned)));
+        fill_words<<<26 * 64, 256>>>(big, n);
+        std::vector<unsigned> hs(ns);
+        for (size_t i = 0; i < ns; ++i) hs[i] = pattern(i + 12345);
+        STRESS_CHECK(cudaMemcpy(small, hs.data(), ns * sizeof(unsigned), cudaMemcpyHostToDevice));
+        std::vector<size_t> hb(m), hk(m);
+        std::vector<unsigned> hsi(m);
+        auto r1 = random_u32(m, 11), r2 = random_u32(m, 12), r3 = random_u32(m, 13);
+        for (int i = 0; i < m; ++i) {
+            hb[i] = (size_t(r1[i]) * 3 + (size_t(i) << 9)) % n;  // up to 3 GiB
+            hk[i] = (size_t(r2[i]) * 5 + (size_t(i) << 10)) % n;  // back from the end
+            hsi[i] = r3[i] % ns;
+        }
+        STRESS_CHECK(cudaMemcpy(bidx, hb.data(), m * sizeof(size_t), cudaMemcpyHostToDevice));
+        STRESS_CHECK(cudaMemcpy(back, hk.data(), m * sizeof(size_t), cudaMemcpyHostToDevice));
+        STRESS_CHECK(cudaMemcpy(sidx, hsi.data(), m * sizeof(unsigned), cudaMemcpyHostToDevice));
+        std::vector<unsigned> h(m);
+        bool ok = true;
+        double k = time_device([&] { gather_two<<<m / 256, 256>>>(big, bidx, small, sidx, out, m); });
+        STRESS_CHECK(cudaMemcpy(h.data(), out, m * sizeof(unsigned), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < m && ok; ++i)
+            if (h[i] != (pattern(hb[i]) ^ hs[hsi[i]])) {
+                std::printf("  gather [%zu] got %08x want %08x\n", hb[i], h[i], pattern(hb[i]) ^ hs[hsi[i]]);
+                ok = false;
+            }
+        k += time_device([&] { gather_back<<<m / 256, 256>>>(big + n, back, out, m); });
+        STRESS_CHECK(cudaMemcpy(h.data(), out, m * sizeof(unsigned), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < m && ok; ++i)
+            if (h[i] != pattern(n - 1 - hk[i])) {
+                std::printf("  back [%zu] got %08x want %08x\n", n - 1 - hk[i], h[i], pattern(n - 1 - hk[i]));
+                ok = false;
+            }
+        k += time_device([&] { scatter_big<<<m / 256, 256>>>(big, bidx, m); }, 1);
+        for (int i = 0; i < m && ok; i += 61) {
+            unsigned v = 0;
+            STRESS_CHECK(cudaMemcpy(&v, big + hb[i], sizeof(v), cudaMemcpyDeviceToHost));
+            if (v != ~pattern(hb[i])) {
+                std::printf("  scatter [%zu] got %08x want %08x\n", hb[i], v, ~pattern(hb[i]));
+                ok = false;
+            }
+        }
+        for (void* q : {(void*)big, (void*)small, (void*)out, (void*)bidx, (void*)back, (void*)sidx})
+            STRESS_CHECK(cudaFree(q));
+        report("gather_scatter_3gib", ok, k, -1);
     }
 
     return finish();

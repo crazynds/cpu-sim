@@ -268,7 +268,7 @@ private:
     Value* narrow_index(const SplitAddress& addr, Value* offs);
     Value* gather16_narrow(Type* v16, const SplitAddress& addr, Value* offs, Value* mask);
     void scatter16_narrow(Value* v, const SplitAddress& addr, Value* offs, Value* mask);
-    Value* small_offsets_flag();
+    Value* root_is_small(Value* root);
     Value* concat_chunks(const std::vector<Value*>& parts);
     void fail(const std::string& what, const Value* v = nullptr) {
         if (error_.empty()) error_ = what + (v ? ": " + describe(v) : "");
@@ -1548,18 +1548,25 @@ Value* WarpBuilder::cached(Value* v) {
 // the instructions, the registers holding offsets and the arithmetic on them.
 // Indices count bytes from addr.root, so they fit whenever root's object is
 // under 2 GiB: always for shared memory and per-thread arrays, and for
-// global memory when the runtime says no allocation is that large
-// (cpusim_warp_ctx::small_offsets).
+// global memory when root is outside the span of the allocations of 2 GiB or
+// more that the runtime passes (cpusim_warp_ctx::huge_lo/hi).
 bool WarpBuilder::narrow_fits(Type* elem, Align align) {
     const uint64_t size = m_.getDataLayout().getTypeStoreSize(elem);
     return size == 4 || size == 8 || size == 1 || (size == 2 && align.value() >= 2);
 }
 
-Value* WarpBuilder::small_offsets_flag() {
-    Value* p = b_.CreateConstGEP1_64(b_.getInt8Ty(), ctx_arg_, CPUSIM_CTX_SMALL_OFFSETS);
-    LoadInst* v = b_.CreateAlignedLoad(b_.getInt32Ty(), p, Align(4));
-    v->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(ctx_, {}));
-    return b_.CreateICmpNE(v, b_.getInt32(0));
+// root is outside the span of the huge objects (cpusim_warp_ctx::huge_lo/hi),
+// so its object, and every offset from it, is under 2 GiB. Uniform, and
+// usually loop invariant (root is a parameter): it leaves the loops.
+Value* WarpBuilder::root_is_small(Value* root) {
+    auto field = [&](uint64_t off) {
+        Value* p = b_.CreateConstGEP1_64(b_.getInt8Ty(), ctx_arg_, off);
+        LoadInst* v = b_.CreateAlignedLoad(b_.getInt64Ty(), p, Align(8));
+        v->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(ctx_, {}));
+        return v;
+    };
+    Value* r = b_.CreatePtrToInt(root, b_.getInt64Ty());
+    return b_.CreateOr(b_.CreateICmpULT(r, field(CPUSIM_CTX_HUGE_LO)), b_.CreateICmpUGT(r, field(CPUSIM_CTX_HUGE_HI)));
 }
 
 // root + index = base + offs, as 32-bit byte indices (exact while the true
@@ -1640,11 +1647,11 @@ Value* WarpBuilder::gather16(Type* v16, const SplitAddress& a, Value* offs, Alig
     auto wide = [&] { return masked_gather(v16, b_.CreateGEP(b_.getInt8Ty(), a.base, offs), align, mask); };
     if (!a.root || !narrow_fits(cast<VectorType>(v16)->getElementType(), align)) return wide();
     if (a.small) return gather16_narrow(v16, a, offs, mask);
-    // Global memory: the runtime's flag picks the form (uniform, invariant).
+    // Global memory: 32-bit unless root points into a huge object.
     BasicBlock* narrow = BasicBlock::Create(ctx_, "g.narrow", w_);
     BasicBlock* wide_bb = BasicBlock::Create(ctx_, "g.wide", w_);
     BasicBlock* join = BasicBlock::Create(ctx_, "g.join", w_);
-    b_.CreateCondBr(small_offsets_flag(), narrow, wide_bb);
+    b_.CreateCondBr(root_is_small(a.root), narrow, wide_bb);
     b_.SetInsertPoint(narrow);
     Value* vn = gather16_narrow(v16, a, offs, mask);
     BasicBlock* narrow_end = b_.GetInsertBlock();
@@ -1668,7 +1675,7 @@ void WarpBuilder::scatter16(Value* v, const SplitAddress& a, Value* offs, Align 
     BasicBlock* narrow = BasicBlock::Create(ctx_, "s.narrow", w_);
     BasicBlock* wide_bb = BasicBlock::Create(ctx_, "s.wide", w_);
     BasicBlock* join = BasicBlock::Create(ctx_, "s.join", w_);
-    b_.CreateCondBr(small_offsets_flag(), narrow, wide_bb);
+    b_.CreateCondBr(root_is_small(a.root), narrow, wide_bb);
     b_.SetInsertPoint(narrow);
     scatter16_narrow(v, a, offs, mask);
     b_.CreateBr(join);

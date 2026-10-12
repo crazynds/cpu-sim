@@ -166,7 +166,7 @@ Specializing on the block shape is what made the wide variants viable: `blockDim
 1. **Uniformity analysis** (ours). Values are uniform across the group (`blockIdx`, parameters, a loop counter all lanes share), varying (`threadIdx`, loads through varying pointers, values that join divergent paths), or affine in the lane. Uniform values stay scalar.
 2. **Linearization** with masks (section 4.6).
 3. **Widening** of every varying value to W lanes.
-4. **Memory.** An address is split into a uniform base and a varying offset, so that most of its arithmetic is scalar and the access patterns can be tested on the offsets alone ([05](docs/optimization/iteration-1/05-address-decomposition.md)). Then, per 16-lane chunk: proven contiguous at compile time, a contiguous masked load or store; proven equal, a broadcast; otherwise a run-time test of the offsets picks contiguous, broadcast or gather ([06](docs/optimization/iteration-1/06-dynamic-coalescing.md)). Bytes and 16-bit values are gathered as the 32-bit words holding them. Gathers and scatters that remain take 32-bit indices counted from the access's root pointer: an access stays inside its object, so the index fits whenever the object is under 2 GiB, which is always true of shared memory and per-thread arrays and, for global memory, true while no allocation reaches 2 GiB (the runtime tells the kernel through its context; device `malloc` refuses objects that large). Gathers and especially scatters are slow on Zen 4 (about 0.7 cycle per element), so the point of all of this is to avoid them ([31](docs/optimization/iteration-3/31-gathers-and-scatters.md)).
+4. **Memory.** An address is split into a uniform base and a varying offset, so that most of its arithmetic is scalar and the access patterns can be tested on the offsets alone ([05](docs/optimization/iteration-1/05-address-decomposition.md)). Then, per 16-lane chunk: proven contiguous at compile time, a contiguous masked load or store; proven equal, a broadcast; otherwise a run-time test of the offsets picks contiguous, broadcast or gather ([06](docs/optimization/iteration-1/06-dynamic-coalescing.md)). Bytes and 16-bit values are gathered as the 32-bit words holding them. Gathers and scatters that remain take 32-bit indices counted from the access's root pointer: an access stays inside its object, so the index fits whenever the object is under 2 GiB, which is always true of shared memory and per-thread arrays and, for global memory, true unless the root points into an allocation of 2 GiB or more (the allocators keep those at the top, the runtime passes their address span in the context and the kernel compares the root with it; device `malloc` refuses objects that large). Gathers and especially scatters are slow on Zen 4 (about 0.7 cycle per element), so the point of all of this is to avoid them ([31](docs/optimization/iteration-3/31-gathers-and-scatters.md)).
 5. **Barriers and yields**: the state machine of section 4.5, the yield points of 4.7.
 6. **Specialized arithmetic**: division by a uniform divisor becomes a multiplication by a magic number ([14](docs/optimization/iteration-2/14-magic-number-division.md)); `blockIdx` carries CUDA's range limits, so 32-bit index arithmetic can be proved not to wrap ([13](docs/optimization/iteration-2/13-no-overflow-proof.md)); strided accesses inside loops get software prefetches ([19](docs/optimization/iteration-2/19-automatic-prefetch.md)).
 
@@ -227,13 +227,13 @@ A device interface in the style of the CUDA driver API has two implementations, 
 
 ### 6.4 Kernel ABI
 
-The contract between generated code and runtime is `src/device/kernel_abi.h`, versioned (`CPUSIM_KERNEL_ABI`, now 11); the runtime refuses a module of another version. A module exports, per kernel:
+The contract between generated code and runtime is `src/device/kernel_abi.h`, versioned (`CPUSIM_KERNEL_ABI`, now 12); the runtime refuses a module of another version. A module exports, per kernel:
 
 - the entry of each variant (`__cpusim_entry_<k>`, `__cpusim_entry<W>_<k>`, `<W>s`, `<W>c`): it runs one group from its saved state to the next barrier, yield or the end, and returns the reason;
 - an instrumented twin for profiling (`__cpusim_prof_<k>`);
 - metadata (`__cpusim_meta_<k>`): parameter layout, static shared memory, frame size, which variants exist, flags (barriers, waiting loops).
 
-Per module, the pointer slots and initial values of device variables. Each call receives a context with the block's coordinates, dimensions, shared memory base, frame, per-lane thread indices and whether every reachable object is under 2 GiB.
+Per module, the pointer slots and initial values of device variables. Each call receives a context with the block's coordinates, dimensions, shared memory base, frame, per-lane thread indices and the address span of the allocations of 2 GiB or more.
 
 ### 6.5 Runtime API
 

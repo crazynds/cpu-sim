@@ -1,5 +1,7 @@
 #include "device/allocator.h"
 
+#include <algorithm>
+
 namespace cpusim {
 
 namespace {
@@ -32,6 +34,26 @@ std::optional<uint64_t> RangeAllocator::allocate(uint64_t bytes) {
     bytes = align_up(bytes, granularity_);
     uint64_t align = bytes >= large_threshold_ ? large_alignment_ : granularity_;
 
+    // Allocations of 2 GiB or more go at the top of the highest free block
+    // that holds them: the kernels index every other object with 32-bit
+    // offsets, and test only whether a pointer falls in the span of these.
+    if (bytes >= kHuge) {
+        for (auto it = free_by_offset_.rbegin(); it != free_by_offset_.rend(); ++it) {
+            auto [off, len] = *it;
+            if (len < bytes) continue;
+            uint64_t start = (off + len - bytes) / align * align;
+            if (start < off) continue;
+            erase_free(free_by_offset_.find(off));
+            if (start > off) insert_free(off, start - off);
+            if (off + len > start + bytes) insert_free(start + bytes, off + len - start - bytes);
+            allocated_.emplace(start, bytes);
+            huge_.emplace(start, bytes);
+            used_ += bytes;
+            return start;
+        }
+        return std::nullopt;
+    }
+
     // Smallest free block that fits once its start is aligned.
     for (auto it = free_by_size_.lower_bound({bytes, 0}); it != free_by_size_.end(); ++it) {
         auto [len, off] = *it;
@@ -45,7 +67,6 @@ std::optional<uint64_t> RangeAllocator::allocate(uint64_t bytes) {
 
         allocated_.emplace(start, bytes);
         used_ += bytes;
-        if (bytes >= kHuge) ++huge_;
         return start;
     }
     return std::nullopt;
@@ -57,7 +78,7 @@ uint64_t RangeAllocator::release(uint64_t offset, uint64_t* free_begin, uint64_t
     uint64_t len = a->second;
     allocated_.erase(a);
     used_ -= len;
-    if (len >= kHuge) --huge_;
+    huge_.erase(offset);
 
     uint64_t begin = offset, end = offset + len;
     auto next = free_by_offset_.lower_bound(end);
@@ -87,6 +108,13 @@ std::optional<std::pair<uint64_t, uint64_t>> RangeAllocator::find(uint64_t offse
     if (offset - start > n || len > n - (offset - start)) return std::nullopt;
     if (len == 0 && offset == start + n) return std::nullopt;
     return std::make_pair(start, n);
+}
+
+std::optional<std::pair<uint64_t, uint64_t>> RangeAllocator::huge_span() const {
+    if (huge_.empty()) return std::nullopt;
+    uint64_t end = 0;
+    for (auto [off, len] : huge_) end = std::max(end, off + len);
+    return std::make_pair(huge_.begin()->first, end);
 }
 
 uint64_t RangeAllocator::largest_free() const {

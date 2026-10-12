@@ -520,8 +520,9 @@ void lower_barrier_votes(Module& m, Function& kernel) {
 
 // Device malloc refuses objects of 2 GiB or more (malloc(SIZE_MAX) returns
 // null), as a GPU does with a heap below that size: kernels index every
-// object with 32-bit offsets when the runtime allows it (kernel_abi.h,
-// cpusim_warp_ctx::small_offsets), and it only knows about VRAM allocations.
+// object outside the span of the huge allocations with 32-bit offsets
+// (kernel_abi.h, cpusim_warp_ctx::huge_lo), and the runtime only knows the
+// VRAM and shared pool ones.
 void cap_device_malloc(Function& f) {
     for (Instruction& i : instructions(f)) {
         auto* call = dyn_cast<CallInst>(&i);

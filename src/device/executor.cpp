@@ -633,7 +633,8 @@ CtxArray Executor::make_groups(const LaunchConfig& cfg, uint32_t lanes) {
         }
         std::memcpy(c->block_dim, cfg.block, sizeof(c->block_dim));
         std::memcpy(c->grid_dim, cfg.grid, sizeof(c->grid_dim));
-        c->small_offsets = cfg.small_offsets;
+        c->huge_lo = cfg.huge_lo;
+        c->huge_hi = cfg.huge_hi;
     }
     return groups;
 }

@@ -23,7 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CPUSIM_KERNEL_ABI 11
+#define CPUSIM_KERNEL_ABI 12
 #define CPUSIM_WARP_SIZE 32   // CUDA's warp: lane ids, warp intrinsics
 #define CPUSIM_MAX_LANES 512  // widest group of threads one entry call runs
 
@@ -80,12 +80,14 @@ typedef struct __attribute__((aligned(64))) cpusim_warp_ctx {
     // that value | 0xffffffff, so the other one never waits for it again.
     uint64_t* coop_epoch;
     const uint64_t* coop_other;
-    // Nonzero when no object the kernel can reach (VRAM and shared pool
-    // allocations, device malloc) is 2 GiB or larger: an access p[i] stays
-    // inside p's object, so its byte offset from p fits in 32 signed bits and
-    // gathers and scatters can use 32-bit indices. (Shared memory and
-    // per-thread arrays are always that small; they do not need it.)
-    uint32_t small_offsets;
+    // The span [huge_lo, huge_hi] of every object of 2 GiB or more the kernel
+    // can reach (VRAM and shared pool allocations; device malloc refuses
+    // them); huge_lo > huge_hi when there is none. An access p[i] stays inside
+    // p's object, so when p is outside the span its byte offset from p fits in
+    // 32 signed bits and gathers and scatters use 32-bit indices. huge_hi is
+    // inclusive: a pointer one past a huge object may still index back into
+    // it. (Shared memory and per-thread arrays are always small.)
+    uint64_t huge_lo, huge_hi;
 } cpusim_warp_ctx;
 
 #define CPUSIM_CTX_HEADER 128
@@ -161,7 +163,8 @@ static inline uint32_t cpusim_stagger(uint32_t bytes) {
 #define CPUSIM_CTX_FRAME 72
 #define CPUSIM_CTX_COOP_EPOCH 80
 #define CPUSIM_CTX_COOP_OTHER 88
-#define CPUSIM_CTX_SMALL_OFFSETS 96
+#define CPUSIM_CTX_HUGE_LO 96
+#define CPUSIM_CTX_HUGE_HI 104
 
 #ifdef __cplusplus
 static_assert(sizeof(cpusim_warp_ctx) == CPUSIM_CTX_HEADER);
@@ -176,7 +179,8 @@ static_assert(offsetof(cpusim_warp_ctx, counters) == CPUSIM_CTX_COUNTERS);
 static_assert(offsetof(cpusim_warp_ctx, frame) == CPUSIM_CTX_FRAME);
 static_assert(offsetof(cpusim_warp_ctx, coop_epoch) == CPUSIM_CTX_COOP_EPOCH);
 static_assert(offsetof(cpusim_warp_ctx, coop_other) == CPUSIM_CTX_COOP_OTHER);
-static_assert(offsetof(cpusim_warp_ctx, small_offsets) == CPUSIM_CTX_SMALL_OFFSETS);
+static_assert(offsetof(cpusim_warp_ctx, huge_lo) == CPUSIM_CTX_HUGE_LO);
+static_assert(offsetof(cpusim_warp_ctx, huge_hi) == CPUSIM_CTX_HUGE_HI);
 #endif
 
 typedef uint32_t (*cpusim_entry_fn)(const cpusim_warp_ctx*);

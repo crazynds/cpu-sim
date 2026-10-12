@@ -451,7 +451,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     uint64_t tuning_key = 0;
     std::vector<Trial> trials;  // width tuning inside this launch
     int output_fd = 1;
-    bool small_offsets = false;
+    uint64_t huge_lo = 0, huge_hi = UINT64_MAX;
     cpusim_kernel_meta meta{};
     // The executor first: the widths offered depend on its pairs of SMT siblings.
     std::call_once(executor_once_, [this] { executor_ = std::make_unique<Executor>(reserved_cpus()); });
@@ -464,13 +464,26 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
         meta = fn->second.meta;
         ++it->second.running;
         output_fd = it->second.output_fd;
-        // CPUSIM_SMALL_OFFSETS=0: 64-bit gather indices into global memory (for comparisons).
+        // The span of the allocations of 2 GiB or more, in VRAM and in the
+        // shared pool (their hull when both have some). CPUSIM_SMALL_OFFSETS=0:
+        // everything, so 64-bit gather indices into global memory (comparisons).
         static const bool allow_small = [] {
             const char* v = std::getenv("CPUSIM_SMALL_OFFSETS");
             return !v || std::atoi(v) != 0;
         }();
-        small_offsets = allow_small && allocator_->huge_allocations() == 0 &&
-                        (!shared_allocator_ || shared_allocator_->huge_allocations() == 0);
+        if (allow_small) {
+            huge_lo = UINT64_MAX;
+            huge_hi = 0;
+            auto add = [&](const RangeAllocator* a, const uint8_t* base) {
+                if (!a) return;
+                if (auto span = a->huge_span()) {
+                    huge_lo = std::min(huge_lo, reinterpret_cast<uint64_t>(base) + span->first);
+                    huge_hi = std::max(huge_hi, reinterpret_cast<uint64_t>(base) + span->second);
+                }
+            };
+            add(allocator_.get(), vram().base());
+            add(shared_allocator_.get(), shared_base_);
+        }
         if (cfg.profile) {
             if (!fn->second.profiled) return Error::NotSupported;
             entry = fn->second.profiled;
@@ -500,7 +513,8 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     // Dynamic shared memory goes right after the kernel's static __shared__ variables.
     LaunchConfig run_cfg = cfg;
     run_cfg.output_fd = output_fd;
-    run_cfg.small_offsets = small_offsets;
+    run_cfg.huge_lo = huge_lo;
+    run_cfg.huge_hi = huge_hi;
     run_cfg.shared_bytes = meta.shared_bytes + cfg.shared_bytes;
     if (run_cfg.shared_bytes > Executor::kMaxSharedBytes) return Error::InvalidValue;
 
