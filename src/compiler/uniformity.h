@@ -19,7 +19,11 @@ namespace cpusim {
 // lanes may exit in different iterations.
 class Uniformity {
 public:
-    Uniformity(llvm::Function& f, llvm::DominatorTree& dt, llvm::PostDominatorTree& pdt, llvm::LoopInfo& li);
+    // `varying_args`: the function is called per lane (a device function that
+    // was not inlined), so its arguments differ between lanes; a kernel's
+    // parameters are the same for every thread.
+    Uniformity(llvm::Function& f, llvm::DominatorTree& dt, llvm::PostDominatorTree& pdt, llvm::LoopInfo& li,
+               bool varying_args = false);
 
     bool is_varying(const llvm::Value* v) const { return varying_.contains(v); }
     void set_varying(const llvm::Value* v) { varying_.insert(v); }

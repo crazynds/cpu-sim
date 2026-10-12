@@ -304,6 +304,12 @@ void retarget(Module& m, TargetMachine* tm, const std::vector<KernelInfo>& kerne
     if (NamedMDNode* md = m.getNamedMetadata("nvvm.annotations")) m.eraseNamedMetadata(md);
     if (NamedMDNode* md = m.getNamedMetadata("nvvmir.version")) m.eraseNamedMetadata(md);
 
+    // The module becomes a shared object: a global another module could
+    // preempt (vtables and other linkonce data, __device__ variables) cannot
+    // be addressed PC-relative. Protected keeps them visible to dlsym
+    // (cudaMemcpyToSymbol) without making them preemptible.
+    for (GlobalVariable& g : m.globals())
+        if (!g.isDeclaration() && !g.hasLocalLinkage()) g.setVisibility(GlobalValue::ProtectedVisibility);
     for (Function& f : m) {
         f.removeFnAttr("target-cpu");
         f.removeFnAttr("target-features");
@@ -455,15 +461,20 @@ int main(int argc, char** argv) {
     // trip count: unrolled, their indices are constants and SROA turns them
     // into registers. Only kernels that still have arrays, so the others keep
     // their loops as written.
-    for (auto& k : kernels)
-        if (has_alloca(*k.scalar)) {
-            expand_local_memcpys(*k.scalar);
-            run_function_pipeline(*k.scalar, tm.get(),
+    // (Device functions that were not inlined too: they become warp code as well.)
+    std::vector<Function*> per_thread;
+    for (auto& k : kernels) per_thread.push_back(k.scalar);
+    for (Function& f : *m)
+        if (!f.isDeclaration() && f.hasFnAttribute(Attribute::AlwaysInline)) per_thread.push_back(&f);
+    for (Function* f : per_thread)
+        if (has_alloca(*f)) {
+            expand_local_memcpys(*f);
+            run_function_pipeline(*f, tm.get(),
                                   "loop-simplify,lcssa,loop(loop-rotate,indvars,loop-unroll-full),sroa<modify-cfg>,"
                                   "early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,gvn,"
                                   "instcombine<no-verify-fixpoint>,simplifycfg,dse,adce,lower-switch,lcssa");
         }
-    for (auto& k : kernels) removeUnreachableBlocks(*k.scalar);
+    for (Function* f : per_thread) removeUnreachableBlocks(*f);
     if (!opt.emit_scalar_ll.empty()) write_ll(*m, opt.emit_scalar_ll);
 
     std::string manifest = "cpusim-module " + std::to_string(CPUSIM_KERNEL_ABI) + "\n";
@@ -590,6 +601,25 @@ int main(int argc, char** argv) {
 
     // Only the entries remain visible; the scalar kernels are dropped.
     for (auto& k : kernels) k.scalar->eraseFromParent();
+    // So are the per-thread device functions left after inlining (recursive
+    // ones, or those whose address is taken): their vector versions replaced
+    // every call. An address still in use (a table of function pointers, the
+    // comparisons that pick the target of a call through a pointer) becomes
+    // that of a byte of its own: equal for equal functions, which is all a
+    // device function pointer is used for here.
+    {
+        std::vector<Function*> left;
+        for (Function& f : *m)
+            if (!f.isDeclaration() && f.hasFnAttribute(Attribute::AlwaysInline)) left.push_back(&f);
+        for (Function* f : left) f->dropAllReferences();
+        for (Function* f : left) {
+            if (!f->use_empty())
+                f->replaceAllUsesWith(new GlobalVariable(*m, Type::getInt8Ty(ctx), true, GlobalValue::InternalLinkage,
+                                                         ConstantInt::get(Type::getInt8Ty(ctx), 0),
+                                                         "__cpusim_fnaddr_" + f->getName()));
+            f->eraseFromParent();
+        }
+    }
     new GlobalVariable(*m, Type::getInt32Ty(ctx), true, GlobalValue::ExternalLinkage,
                        ConstantInt::get(Type::getInt32Ty(ctx), CPUSIM_KERNEL_ABI), "__cpusim_abi_version");
 

@@ -129,7 +129,7 @@ add_test(NAME runtime_daemon
 # Self-checking tests of single features (tests/cuda), each run with every
 # lane width, without JIT and on the daemon backend.
 if(TARGET cpusim-devc)
-    foreach(feature IN ITEMS warp_ops math division local_arrays streams async managed types wmma wmma_shapes wmma_subbyte streaming)
+    foreach(feature IN ITEMS warp_ops math division local_arrays streams async managed types wmma wmma_shapes wmma_subbyte streaming calls)
         add_test(NAME cuda_${feature}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_feature_test.sh ${CMAKE_BINARY_DIR}/cucc
                     $<TARGET_FILE:cpusimd> ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/${feature}.cu)

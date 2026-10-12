@@ -185,7 +185,7 @@ Private arrays of each thread (`float acc[4]`) live on the warp's stack in **SoA
 
 ### 5.6 Functions, floating point and math
 
-- **Device functions: inline everything** at first. Later, vectorized versions with the mask as a parameter. Recursion and function pointers: much later.
+- **Device functions: inline everything** that can be inlined. A function that cannot (recursive, called through a pointer or a vtable) gets a W-lane version taking the lane mask and the arguments as vectors; a call through a pointer runs once per distinct target among the active lanes (docs/optimization/iteration-3/28-function-calls.md).
 - **Floating point**: default equal to nvcc (**FMA on**; Zen 4 has FMA), with a flag equivalent to `-fmad=false`. Goal: within the ULP documented by NVIDIA, not bit-for-bit identical. The samples use `-fmad=false` for exact comparison.
 - **Own vector math library** (without SLEEF), written in IR/intrinsics to be inlined into the kernel (not a separate `.s`, which would require a calling convention and saving zmm). Validate against the RTX 5060.
 - `half`/`bf16` and any type without native support: emulate (convert to float). Left for later.

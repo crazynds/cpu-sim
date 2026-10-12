@@ -43,8 +43,10 @@ bool is_back_edge(const BasicBlock* from, const BasicBlock* to, const DominatorT
 
 }  // namespace
 
-Uniformity::Uniformity(Function& f, DominatorTree& dt, PostDominatorTree& pdt, LoopInfo& li)
+Uniformity::Uniformity(Function& f, DominatorTree& dt, PostDominatorTree& pdt, LoopInfo& li, bool varying_args)
     : f_(f), dt_(dt), pdt_(pdt), li_(li) {
+    if (varying_args)
+        for (Argument& a : f.args()) varying_.insert(&a);
     ReversePostOrderTraversal<Function*> rpot(&f);
     rpo_.assign(rpot.begin(), rpot.end());
 

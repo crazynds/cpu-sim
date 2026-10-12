@@ -37,6 +37,7 @@
 #include <llvm/IR/IntrinsicsX86.h>
 #include <llvm/IR/ReplaceConstant.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 
 #include "compiler/uniformity.h"
@@ -69,10 +70,12 @@ public:
     // guarantees a whole block fits in one call, so barriers are no-ops.
     // `cooperative`: half of a block per call, the other half runs on the SMT
     // sibling; barriers are an inline 2-party barrier on epochs (no suspending).
+    // `target`: build the body of this declaration (from vector_fn) instead
+    // of a kernel entry: `scalar` is a device function called per lane.
     WarpBuilder(Module& m, KernelInfo& k, Function& scalar, bool profile, unsigned lanes, bool block_wide,
-                bool cooperative = false)
+                bool cooperative = false, Function* target = nullptr)
         : W(lanes), block_wide_(block_wide || cooperative), coop_(cooperative), m_(m), k_(k), f_(scalar),
-          profile_(profile), ctx_(m.getContext()), b_(ctx_) {}
+          profile_(profile), ctx_(m.getContext()), b_(ctx_), fn_(target) {}
 
     bool run(std::string* error);
 
@@ -81,6 +84,14 @@ private:
     bool check_supported();
     bool insert_prefetches();
     void demote();
+
+    // ---- device functions that are not inlined (recursive, or called
+    // through a pointer): each has a W-lane version taking the context, the
+    // lane mask and every argument per lane, built from the same per-thread
+    // code by a WarpBuilder of its own (build_pending_functions).
+    Function* vector_fn(Function* f);
+    bool emit_call(CallInst* call, Value* mask);
+    Value* call_vector_fn(Function* f, CallInst* call, Value* mask);
 
     // ---- emission
     void emit_prologue();
@@ -182,6 +193,8 @@ private:
     std::unique_ptr<LoopInfo> li_;
     std::unique_ptr<Uniformity> uni_;
 
+    Function* fn_ = nullptr;           // function mode: the declaration being defined
+    AllocaInst* ret_slot_ = nullptr;   // function mode: the lanes' return values
     Function* w_ = nullptr;
     Type* mask_type_ = nullptr;
     Value* ctx_arg_ = nullptr;
@@ -282,6 +295,25 @@ private:
     std::vector<const BasicBlock*> barrier_order_;
     DenseMap<const BasicBlock*, DenseSet<const AllocaInst*>> live_after_barrier_;
 };
+
+// A call to a device function that was not inlined (recursive), or through
+// a pointer.
+bool is_device_call(const CallInst* call) {
+    const Function* f = call->getCalledFunction();
+    if (!f) return !call->isInlineAsm();
+    return !f->isIntrinsic() && !f->isDeclaration() && !f->isVarArg();
+}
+
+// Versions of device functions declared by vector_fn and not built yet.
+struct PendingFunction {
+    Function* decl;
+    Function* scalar;
+    unsigned lanes;
+};
+std::vector<PendingFunction>& pending_functions() {
+    static std::vector<PendingFunction> list;
+    return list;
+}
 
 bool is_barrier(const Instruction& inst) {
     auto* call = dyn_cast<IntrinsicInst>(&inst);
@@ -479,14 +511,33 @@ bool WarpBuilder::check_supported() {
         if (!isa<BranchInst>(term) && !isa<ReturnInst>(term) && !isa<UnreachableInst>(term))
             fail("unsupported terminator", term);
         for (Instruction& inst : bb) {
+            if (fn_ && (is_barrier(inst) || special_reg(&inst) == SpecialReg::SharedBase))
+                fail("__syncthreads and __shared__ in a function that is not inlined (recursive or called "
+                     "through a pointer) are not supported", &inst);
+            if (fn_)
+                for (Value* op : inst.operands()) {
+                    SmallPtrSet<const Value*, 8> seen;
+                    std::function<bool(const Value*)> shared = [&](const Value* v) {
+                        if (!seen.insert(v).second) return false;
+                        if (auto* g = dyn_cast<GlobalVariable>(v)) return g->getAddressSpace() == 3;
+                        if (auto* ce = dyn_cast<ConstantExpr>(v)) return any_of(ce->operands(), shared);
+                        return false;
+                    };
+                    if (shared(op))
+                        fail("__shared__ in a function that is not inlined (recursive or called through a "
+                             "pointer) is not supported", &inst);
+                }
             if (auto* call = dyn_cast<CallInst>(&inst)) {
                 Function* callee = call->getCalledFunction();
-                if (!callee) fail("indirect calls are not supported yet", call);
-                else if (callee->getName() == kSharedBaseFn || is_cond_load(call)) continue;
+                if (!callee) {
+                    if (call->getFunctionType()->isVarArg()) fail("variadic calls through a pointer", call);
+                    continue;  // through a pointer: emit_call
+                } else if (callee->getName() == kSharedBaseFn || is_cond_load(call)) continue;
                 else if (callee->getName() == kShflFn || callee->getName() == kBallotFn || is_mma(call) || is_mmav(call))
                     continue;
                 else if (unsigned n; !libmvec_name(*call, &n).empty()) continue;
-                else if (!callee->isIntrinsic()) fail("call to a function that could not be inlined", call);
+                else if (!callee->isIntrinsic() && !callee->isDeclaration() && !callee->isVarArg()) continue;  // emit_call
+                else if (!callee->isIntrinsic()) fail("call to an external device function", call);
                 else if (callee->getIntrinsicID() == Intrinsic::nvvm_barrier0_popc ||
                          callee->getIntrinsicID() == Intrinsic::nvvm_barrier0_and ||
                          callee->getIntrinsicID() == Intrinsic::nvvm_barrier0_or)
@@ -1648,6 +1699,117 @@ Value* WarpBuilder::emit_cond_load(CallInst* call, Value* mask) {
     return b_.CreateSelect(m, v, vector(other));
 }
 
+// ---------------------------------------------------------------- calls
+
+// `__cpusim_fn<W>_<name>(ctx, mask, args...)`: every argument and the result
+// as W-lane vectors. Internal, fastcc: the vectors travel in registers.
+Function* WarpBuilder::vector_fn(Function* f) {
+    std::string name = "__cpusim_fn" + std::to_string(W) + "_" + f->getName().str();
+    if (Function* v = m_.getFunction(name)) return v;
+    auto lane_type = [](Type* t) { return t->isIntegerTy() || t->isFloatingPointTy() || t->isPointerTy(); };
+    Type* ret = f->getReturnType();
+    if (!ret->isVoidTy() && !lane_type(ret))
+        return fail("a function that is not inlined returns an aggregate", f), nullptr;
+    SmallVector<Type*, 8> params{PointerType::get(ctx_, 0), mask_type_};
+    for (Argument& a : f->args()) {
+        if (!lane_type(a.getType()) || a.hasByValAttr() || a.hasStructRetAttr())
+            return fail("a function that is not inlined takes an aggregate argument", f), nullptr;
+        params.push_back(vec_type(a.getType()));
+    }
+    Function* v = Function::Create(FunctionType::get(ret->isVoidTy() ? ret : vec_type(ret), params, false),
+                                   GlobalValue::InternalLinkage, name, m_);
+    v->setCallingConv(CallingConv::Fast);
+    v->addFnAttr(Attribute::NoUnwind);
+    for (const char* a : {"target-cpu", "target-features"})
+        if (f->hasFnAttribute(a)) v->addFnAttr(f->getFnAttribute(a));
+    pending_functions().push_back({v, f, W});
+    return v;
+}
+
+Value* WarpBuilder::call_vector_fn(Function* f, CallInst* call, Value* mask) {
+    Function* v = vector_fn(f);
+    if (!v) return nullptr;
+    SmallVector<Value*, 8> args{ctx_arg_, mask};
+    for (unsigned i = 0; i < call->arg_size(); ++i) args.push_back(vector(call->getArgOperand(i)));
+    CallInst* r = b_.CreateCall(v, args);
+    r->setCallingConv(CallingConv::Fast);
+    return r;
+}
+
+// A call that was not inlined runs once for all the active lanes (the block
+// it is in only runs when some lane is: that is what ends a recursion). A call
+// through a pointer runs once per distinct target among the active lanes,
+// each with the lanes that point at it; the targets are the device functions
+// of that type whose address is taken.
+bool WarpBuilder::emit_call(CallInst* call, Value* mask) {
+    Type* rt = call->getType()->isVoidTy() ? nullptr : vec_type(call->getType());
+    auto result = [&](Value* v) {
+        if (!rt) return true;
+        if (!v) return false;
+        (uni_->is_varying(call) ? vector_map_ : scalar_map_)[call] = v;
+        return true;
+    };
+    if (Function* f = call->getCalledFunction()) {
+        Value* r = call_vector_fn(f, call, mask);
+        return error_.empty() && result(r);
+    }
+
+    std::vector<Function*> targets;
+    for (Function& f : m_)
+        if (!f.isDeclaration() && f.hasFnAttribute(Attribute::AlwaysInline) &&
+            f.getFunctionType() == call->getFunctionType() && f.hasAddressTaken())
+            targets.push_back(&f);
+    // One target with its lanes: compare against each candidate in turn.
+    auto dispatch = [&](Value* t, Value* m) -> Value* {
+        BasicBlock* join = BasicBlock::Create(ctx_, "icall.join", w_);
+        std::vector<std::pair<Value*, BasicBlock*>> incoming;
+        for (Function* f : targets) {
+            BasicBlock* yes = BasicBlock::Create(ctx_, "icall." + f->getName(), w_);
+            BasicBlock* no = BasicBlock::Create(ctx_, "icall.next", w_);
+            b_.CreateCondBr(b_.CreateICmpEQ(t, f), yes, no);
+            b_.SetInsertPoint(yes);
+            Value* r = call_vector_fn(f, call, m);
+            if (rt) incoming.push_back({r ? r : PoisonValue::get(rt), b_.GetInsertBlock()});
+            b_.CreateBr(join);
+            b_.SetInsertPoint(no);
+        }
+        if (rt) incoming.push_back({PoisonValue::get(rt), b_.GetInsertBlock()});
+        b_.CreateBr(join);
+        b_.SetInsertPoint(join);
+        if (!rt) return nullptr;
+        PHINode* phi = b_.CreatePHI(rt, unsigned(incoming.size()));
+        for (auto [v, bb] : incoming) phi->addIncoming(v, bb);
+        return phi;
+    };
+    Value* target = call->getCalledOperand();
+    if (!uni_->is_varying(target)) return result(dispatch(scalar(target), mask)) && error_.empty();
+
+    // Per distinct target: the first remaining lane's, and every lane that
+    // has the same.
+    Value* tv = vector(target);
+    BasicBlock* pre = b_.GetInsertBlock();
+    BasicBlock* loop = BasicBlock::Create(ctx_, "icall.loop", w_);
+    BasicBlock* done = BasicBlock::Create(ctx_, "icall.done", w_);
+    b_.CreateBr(loop);
+    b_.SetInsertPoint(loop);
+    PHINode* rem = b_.CreatePHI(mask_type_, 2, "icall.rem");
+    rem->addIncoming(mask, pre);
+    PHINode* acc = rt ? b_.CreatePHI(rt, 2, "icall.acc") : nullptr;
+    if (acc) acc->addIncoming(PoisonValue::get(rt), pre);
+    Value* bits = b_.CreateBitCast(rem, b_.getIntNTy(W));
+    Value* first = b_.CreateBinaryIntrinsic(Intrinsic::cttz, bits, b_.getTrue());
+    Value* t = b_.CreateExtractElement(tv, b_.CreateTrunc(first, b_.getInt32Ty()));
+    Value* same = b_.CreateAnd(rem, b_.CreateICmpEQ(tv, b_.CreateVectorSplat(W, t)));
+    Value* r = dispatch(t, same);
+    Value* acc2 = acc ? b_.CreateSelect(same, r, acc) : nullptr;
+    Value* rem2 = b_.CreateAnd(rem, b_.CreateNot(same));
+    rem->addIncoming(rem2, b_.GetInsertBlock());
+    if (acc) acc->addIncoming(acc2, b_.GetInsertBlock());
+    b_.CreateCondBr(any_lane(rem2), loop, done);
+    b_.SetInsertPoint(done);
+    return result(acc2) && error_.empty();
+}
+
 // threadIdx for a known block shape. Lane l of the group starting at thread
 // `base` (= warp_index * 32) is thread base + l. When the group covers the
 // whole block, base is 0 and every index is a constant vector; when the width
@@ -2277,13 +2439,14 @@ void WarpBuilder::emit_prologue() {
     auto* ptr = PointerType::get(ctx_, 0);
     mask_type_ = FixedVectorType::get(b_.getInt1Ty(), W);
 
-    w_ = Function::Create(FunctionType::get(i32, {ptr}, false), GlobalValue::ExternalLinkage,
-                          (profile_ ? std::string("__cpusim_prof_")
-                           : W == CPUSIM_WARP_SIZE ? std::string("__cpusim_entry_")
-                                                   : "__cpusim_entry" + std::to_string(W) +
-                                                         (coop_ ? "c_" : block_wide_ ? "_" : "s_")) +
-                              k_.name,
-                          m_);
+    w_ = fn_ ? fn_
+             : Function::Create(FunctionType::get(i32, {ptr}, false), GlobalValue::ExternalLinkage,
+                                (profile_ ? std::string("__cpusim_prof_")
+                                 : W == CPUSIM_WARP_SIZE ? std::string("__cpusim_entry_")
+                                                         : "__cpusim_entry" + std::to_string(W) +
+                                                               (coop_ ? "c_" : block_wide_ ? "_" : "s_")) +
+                                    k_.name,
+                                m_);
     w_->addFnAttr(Attribute::NoUnwind);
     w_->addFnAttr("prefer-vector-width", "512");
     w_->addFnAttr("min-legal-vector-width", "512");
@@ -2302,10 +2465,13 @@ void WarpBuilder::emit_prologue() {
     auto load_u32 = [&](unsigned offset, const char* name) { return b_.CreateAlignedLoad(i32, field(offset), Align(4), name); };
 
     // Kernel parameters: uniform, read from the launch's parameter buffer.
+    // A device function's arguments: one per lane, after the context and the mask.
     const DataLayout& dl = m_.getDataLayout();
-    Value* params = b_.CreateAlignedLoad(ptr, field(CPUSIM_CTX_PARAMS), Align(8), "params");
+    Value* params = fn_ ? nullptr : b_.CreateAlignedLoad(ptr, field(CPUSIM_CTX_PARAMS), Align(8), "params");
     uint64_t offset = 0;
-    for (Argument& arg : f_.args()) {
+    if (fn_)
+        for (Argument& arg : f_.args()) vector_map_[&arg] = w_->getArg(2 + arg.getArgNo());
+    for (Argument& arg : fn_ ? make_range(f_.arg_end(), f_.arg_end()) : f_.args()) {
         Type* t = arg.getType();
         uint64_t size, align;
         Type* byval = arg.getParamByValType();
@@ -2322,7 +2488,7 @@ void WarpBuilder::emit_prologue() {
         if (!profile_ && W == CPUSIM_WARP_SIZE) k_.params.push_back({offset, size});
         offset += size;
     }
-    k_.param_bytes = offset;
+    if (!fn_) k_.param_bytes = offset;
     if (profile_) counters_ = b_.CreateAlignedLoad(ptr, field(CPUSIM_CTX_COUNTERS), Align(8), "counters");
 
     // Special registers.
@@ -2362,7 +2528,8 @@ void WarpBuilder::emit_prologue() {
     special_[(int)SpecialReg::LaneId] = ConstantVector::get(lanes);
     special_[(int)SpecialReg::WarpSize] = b_.getInt32(CPUSIM_WARP_SIZE);
     special_[(int)SpecialReg::SharedBase] = b_.CreateAlignedLoad(ptr, field(CPUSIM_CTX_SHARED), Align(8), "shared");
-    Value* lane_mask = spec_lane_mask_
+    Value* lane_mask = fn_ ? w_->getArg(1)
+                       : spec_lane_mask_
                            ? spec_lane_mask_
                            : b_.CreateBitCast(b_.CreateAlignedLoad(b_.getIntNTy(W), field(CPUSIM_CTX_LANE_MASK(W)),
                                                                    Align(64), "lane_mask"),
@@ -2380,7 +2547,7 @@ void WarpBuilder::emit_prologue() {
         Value* base = getUnderlyingObject(ld->getPointerOperand());
         if (base != ctx_arg_ && base != params) continue;
         ld->setMetadata(LLVMContext::MD_invariant_load, empty);
-        if (ld->getType()->isPointerTy() && ld == params)
+        if (ld->getType()->isPointerTy() && params && ld == params)
             ld->setMetadata(LLVMContext::MD_dereferenceable,
                             MDNode::get(ctx_, ConstantAsMetadata::get(b_.getInt64(std::max<uint64_t>(k_.param_bytes, 1)))));
     }
@@ -2419,6 +2586,10 @@ void WarpBuilder::emit_prologue() {
             continue;
         }
         slots_[slot] = ab.CreateAlloca(varying ? vec_type(t) : t, nullptr, slot->getName());
+    }
+    if (fn_ && !f_.getReturnType()->isVoidTy()) {
+        ret_slot_ = ab.CreateAlloca(vec_type(f_.getReturnType()), nullptr, "ret");
+        ab.CreateStore(PoisonValue::get(ret_slot_->getAllocatedType()), ret_slot_);
     }
     ab.CreateBr(entry);
 
@@ -2672,6 +2843,11 @@ void WarpBuilder::emit_block(BasicBlock* bb) {
         mask = b_.CreateLoad(mask_type_, block_mask_[bb], "m." + bb->getName());
     }
 
+    if (auto* ret = dyn_cast<ReturnInst>(bb->getTerminator()); ret && ret_slot_) {
+        Value* v = vector(ret->getReturnValue());
+        if (divergent) v = b_.CreateSelect(mask, v, b_.CreateLoad(ret_slot_->getAllocatedType(), ret_slot_));
+        b_.CreateStore(v, ret_slot_);
+    }
     if (auto* br = dyn_cast<BranchInst>(bb->getTerminator())) {
         if (br->isUnconditional()) {
             add_edge(bb, br->getSuccessor(0), mask);
@@ -2869,6 +3045,7 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
 
     if (is_mma(&inst)) return emit_mma(cast<CallInst>(&inst), mask);
     if (is_mmav(&inst)) return set(emit_mmav(cast<CallInst>(&inst)));
+    if (auto* call = dyn_cast<CallInst>(&inst); call && is_device_call(call)) return emit_call(call, mask);
 
     // Intrinsics with special meaning.
     if (auto* call = dyn_cast<CallInst>(&inst)) {
@@ -3097,15 +3274,15 @@ bool WarpBuilder::run(std::string* error) {
     li_ = std::make_unique<LoopInfo>(*dt_);
     if (!check_supported()) return *error = error_, false;
 
-    uni_ = std::make_unique<Uniformity>(f_, *dt_, *pdt_, *li_);
-    if (!profile_ && insert_prefetches()) uni_ = std::make_unique<Uniformity>(f_, *dt_, *pdt_, *li_);
+    uni_ = std::make_unique<Uniformity>(f_, *dt_, *pdt_, *li_, fn_ != nullptr);
+    if (!profile_ && insert_prefetches()) uni_ = std::make_unique<Uniformity>(f_, *dt_, *pdt_, *li_, fn_ != nullptr);
     // The instrumented variant keeps the original branches so its per-thread
     // counts stay exact (if-conversion runs both sides' arithmetic).
     if (!profile_ && if_convert()) {
         dt_ = std::make_unique<DominatorTree>(f_);
         pdt_ = std::make_unique<PostDominatorTree>(f_);
         li_ = std::make_unique<LoopInfo>(*dt_);
-        uni_ = std::make_unique<Uniformity>(f_, *dt_, *pdt_, *li_);
+        uni_ = std::make_unique<Uniformity>(f_, *dt_, *pdt_, *li_, fn_ != nullptr);
     }
     demote();
 
@@ -3113,12 +3290,15 @@ bool WarpBuilder::run(std::string* error) {
     if (error_.empty()) emit_level(nullptr);
     if (!error_.empty()) {
         *error = error_;
-        if (w_) w_->eraseFromParent();
+        if (w_ && !fn_) w_->eraseFromParent();
         return false;
     }
     sfence_if_streaming();
-    b_.CreateRet(b_.getInt32(CPUSIM_EXIT));
+    if (!fn_) b_.CreateRet(b_.getInt32(CPUSIM_EXIT));
+    else if (ret_slot_) b_.CreateRet(b_.CreateLoad(ret_slot_->getAllocatedType(), ret_slot_));
+    else b_.CreateRetVoid();
     if (dispatch_) emit_dispatch();
+    if (fn_) return true;
     if (profile_) k_.profiled = w_;
     else if (W == CPUSIM_WARP_SIZE) k_.entry = w_;
     return true;
@@ -3133,7 +3313,24 @@ bool build_warp_entry(Module& m, KernelInfo& kernel, Function& scalar, bool prof
     // run any number of warps per call.)
     WarpBuilder builder(m, kernel, scalar, profile, lanes, lanes > CPUSIM_WARP_SIZE && !suspending && !cooperative,
                         cooperative);
-    return builder.run(error);
+    if (!builder.run(error)) return false;
+    // The functions it calls without inlining, and the ones those call.
+    auto& pending = pending_functions();
+    while (!pending.empty()) {
+        PendingFunction p = pending.back();
+        pending.pop_back();
+        ValueToValueMapTy vmap;
+        Function* copy = CloneFunction(p.scalar, vmap);
+        WarpBuilder fb(m, kernel, *copy, false, p.lanes, true, false, p.decl);
+        bool ok = fb.run(error);
+        copy->eraseFromParent();
+        if (!ok) {
+            *error = "in " + p.scalar->getName().str() + ": " + *error;
+            pending.clear();
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace cpusim
