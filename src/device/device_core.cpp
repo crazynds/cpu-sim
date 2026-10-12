@@ -451,6 +451,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     uint64_t tuning_key = 0;
     std::vector<Trial> trials;  // width tuning inside this launch
     int output_fd = 1;
+    bool small_offsets = false;
     cpusim_kernel_meta meta{};
     // The executor first: the widths offered depend on its pairs of SMT siblings.
     std::call_once(executor_once_, [this] { executor_ = std::make_unique<Executor>(reserved_cpus()); });
@@ -463,6 +464,13 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
         meta = fn->second.meta;
         ++it->second.running;
         output_fd = it->second.output_fd;
+        // CPUSIM_SMALL_OFFSETS=0: 64-bit gather indices into global memory (for comparisons).
+        static const bool allow_small = [] {
+            const char* v = std::getenv("CPUSIM_SMALL_OFFSETS");
+            return !v || std::atoi(v) != 0;
+        }();
+        small_offsets = allow_small && allocator_->huge_allocations() == 0 &&
+                        (!shared_allocator_ || shared_allocator_->huge_allocations() == 0);
         if (cfg.profile) {
             if (!fn->second.profiled) return Error::NotSupported;
             entry = fn->second.profiled;
@@ -492,6 +500,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     // Dynamic shared memory goes right after the kernel's static __shared__ variables.
     LaunchConfig run_cfg = cfg;
     run_cfg.output_fd = output_fd;
+    run_cfg.small_offsets = small_offsets;
     run_cfg.shared_bytes = meta.shared_bytes + cfg.shared_bytes;
     if (run_cfg.shared_bytes > Executor::kMaxSharedBytes) return Error::InvalidValue;
 

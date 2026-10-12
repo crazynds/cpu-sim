@@ -41,6 +41,7 @@ struct LaunchConfig {
     bool profile = false;  // run the instrumented entry and collect counters
     int debug = 0;         // 1: single-step with guard pages (debug_exec.h); 2: also trace every step
     int output_fd = 1;     // where the kernel's printf writes (the program's stdout)
+    bool small_offsets = false;  // no reachable object of 2 GiB or more (cpusim_warp_ctx::small_offsets)
 };
 
 struct LaunchResult {

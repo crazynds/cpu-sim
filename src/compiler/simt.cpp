@@ -155,6 +155,14 @@ private:
         Value* base;     // uniform pointer (scalar)
         Value* offsets;  // varying byte offsets, <32 x i64>
         uint64_t scale = 1;  // a per-thread array: a thread's byte offsets count W times (lane-major layout)
+        // The pointer the address is computed from (a parameter, the shared
+        // memory base, a loaded pointer...) and base's distance from it in
+        // bytes: the address is root + uoff + offsets. An access stays inside
+        // root's object, so uoff + offsets is smaller than that object.
+        // root is null for an opaque varying pointer.
+        Value* root = nullptr;
+        Value* uoff = nullptr;  // scalar i64
+        bool small = false;     // root's object is shared memory or a per-thread array: under 2 GiB
     };
     // Per-thread arrays (`float v[8]` that did not become registers), stored
     // lane-major: element byte offset o of lane l at base + o * W + l * elem,
@@ -251,6 +259,16 @@ private:
         Value* v = b_.CreateTrunc(b_.CreateLShr(w, shift), FixedVectorType::get(b_.getIntNTy(bits), n));
         return et->isIntegerTy() ? v : b_.CreateBitCast(v, vty);
     }
+    // One 16-lane chunk of a gather or scatter at addr.base + offs (byte
+    // offsets, <16 x i64>): with 32-bit indices from addr.root when they are
+    // known to fit, else with the 64-bit offsets (see gather16 below).
+    Value* gather16(Type* v16, const SplitAddress& addr, Value* offs, Align align, Value* mask);
+    void scatter16(Value* v, const SplitAddress& addr, Value* offs, Align align, Value* mask);
+    bool narrow_fits(Type* elem, Align align);
+    Value* narrow_index(const SplitAddress& addr, Value* offs);
+    Value* gather16_narrow(Type* v16, const SplitAddress& addr, Value* offs, Value* mask);
+    void scatter16_narrow(Value* v, const SplitAddress& addr, Value* offs, Value* mask);
+    Value* small_offsets_flag();
     Value* concat_chunks(const std::vector<Value*>& parts);
     void fail(const std::string& what, const Value* v = nullptr) {
         if (error_.empty()) error_ = what + (v ? ": " + describe(v) : "");
@@ -903,7 +921,10 @@ bool WarpBuilder::remat_ok(Value* v, unsigned depth) {
     auto* inst = dyn_cast<Instruction>(v);
     if (!inst || depth > 8) return false;
     if (!uni_->is_varying(inst)) return depth > 0;
-    if (!(isa<BinaryOperator>(inst) || isa<CastInst>(inst))) return false;
+    // A GEP too: an address computed before a branch and used inside it is
+    // recomputed there from its base and indices, so the access still sees
+    // base + offsets (a slot would hold W opaque 64-bit pointers).
+    if (!(isa<BinaryOperator>(inst) || isa<CastInst>(inst) || isa<GetElementPtrInst>(inst))) return false;
     switch (inst->getOpcode()) {
         case Instruction::UDiv: case Instruction::SDiv: case Instruction::URem: case Instruction::SRem:
         case Instruction::FDiv: case Instruction::FRem:
@@ -1175,6 +1196,18 @@ std::pair<Value*, Value*> WarpBuilder::split_index(Value* idx, bool is_signed) {
 // through GEPs. The offsets usually depend only on the thread index, so
 // everything computed from them alone (the access pattern tests below) is
 // loop invariant and gets hoisted.
+namespace {
+
+// Shared memory or a per-thread array: an object far below 2 GiB.
+bool small_object(const Value* p) {
+    const Value* o = getUnderlyingObject(p, 0);
+    if (isa<AllocaInst>(o)) return true;
+    auto* c = dyn_cast<CallInst>(o);
+    return c && c->getCalledFunction() && c->getCalledFunction()->getName() == kSharedBaseFn;
+}
+
+}  // namespace
+
 WarpBuilder::SplitAddress WarpBuilder::split_address(Value* ptr) {
     auto* i64 = b_.getInt64Ty();
     auto* v64 = FixedVectorType::get(i64, W);
@@ -1182,9 +1215,13 @@ WarpBuilder::SplitAddress WarpBuilder::split_address(Value* ptr) {
         // Lane l's copy of the array starts at base + l * elem.
         SmallVector<Constant*, 64> lanes;
         for (unsigned l = 0; l < W; ++l) lanes.push_back(ConstantInt::get(i64, l * private_elem_[a]));
-        return {private_base(a), ConstantVector::get(lanes), W};
+        Value* base = private_base(a);
+        return {base, ConstantVector::get(lanes), W, base, ConstantInt::get(i64, 0), true};
     }
-    if (!uni_->is_varying(ptr)) return {scalar(ptr), Constant::getNullValue(v64)};
+    if (!uni_->is_varying(ptr)) {
+        Value* base = scalar(ptr);
+        return {base, Constant::getNullValue(v64), 1, base, ConstantInt::get(i64, 0), small_object(ptr)};
+    }
     if (auto* gep = dyn_cast<GetElementPtrInst>(ptr)) {
         const DataLayout& dl = m_.getDataLayout();
         SplitAddress inner = split_address(gep->getPointerOperand());
@@ -1203,9 +1240,15 @@ WarpBuilder::SplitAddress WarpBuilder::split_address(Value* ptr) {
             varying = b_.CreateAdd(varying, b_.CreateMul(v, ConstantVector::getSplat(ElementCount::getFixed(W),
                                                                                     ConstantInt::get(i64, size))));
         }
-        return {b_.CreateGEP(b_.getInt8Ty(), inner.base, uniform), varying, inner.scale};
+        SplitAddress out{b_.CreateGEP(b_.getInt8Ty(), inner.base, uniform), varying, inner.scale};
+        if (inner.root) {
+            out.root = inner.root;
+            out.uoff = b_.CreateAdd(inner.uoff, uniform);
+            out.small = inner.small;
+        }
+        return out;
     }
-    // Opaque varying pointer: offsets from address zero.
+    // Opaque varying pointer: offsets from address zero, no root.
     Value* addrs = b_.CreatePtrToInt(vector(ptr), v64);
     return {ConstantPointerNull::get(cast<PointerType>(ptr->getType()->getScalarType())), addrs};
 }
@@ -1498,6 +1541,143 @@ Value* WarpBuilder::cached(Value* v) {
     return ld;
 }
 
+// Gathers and scatters with 32-bit indices. AVX-512 has them in two forms:
+// 64-bit indices (vpgatherqd: 8 lanes per instruction, the offsets in two
+// zmm per 16 lanes) and 32-bit ones (vpgatherdd: 16 lanes, one zmm). The
+// memory side costs the same per element on Zen 4; the 32-bit form halves
+// the instructions, the registers holding offsets and the arithmetic on them.
+// Indices count bytes from addr.root, so they fit whenever root's object is
+// under 2 GiB: always for shared memory and per-thread arrays, and for
+// global memory when the runtime says no allocation is that large
+// (cpusim_warp_ctx::small_offsets).
+bool WarpBuilder::narrow_fits(Type* elem, Align align) {
+    const uint64_t size = m_.getDataLayout().getTypeStoreSize(elem);
+    return size == 4 || size == 8 || size == 1 || (size == 2 && align.value() >= 2);
+}
+
+Value* WarpBuilder::small_offsets_flag() {
+    Value* p = b_.CreateConstGEP1_64(b_.getInt8Ty(), ctx_arg_, CPUSIM_CTX_SMALL_OFFSETS);
+    LoadInst* v = b_.CreateAlignedLoad(b_.getInt32Ty(), p, Align(4));
+    v->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(ctx_, {}));
+    return b_.CreateICmpNE(v, b_.getInt32(0));
+}
+
+// root + index = base + offs, as 32-bit byte indices (exact while the true
+// distance from root fits; the wrapping arithmetic gives it mod 2^32).
+Value* WarpBuilder::narrow_index(const SplitAddress& a, Value* offs) {
+    auto* v32 = FixedVectorType::get(b_.getInt32Ty(), 16);
+    Value* u = b_.CreateTrunc(a.uoff, b_.getInt32Ty());
+    return b_.CreateAdd(b_.CreateTrunc(offs, v32), b_.CreateVectorSplat(16, u));
+}
+
+namespace {
+
+Value* low_half(IRBuilder<>& b, Value* v, unsigned part) {
+    SmallVector<int, 8> idx;
+    for (int i = 0; i < 8; ++i) idx.push_back(int(part) * 8 + i);
+    return b.CreateShuffleVector(v, idx);
+}
+
+}  // namespace
+
+Value* WarpBuilder::gather16_narrow(Type* v16, const SplitAddress& a, Value* offs, Value* mask) {
+    Type* et = cast<VectorType>(v16)->getElementType();
+    const uint64_t size = m_.getDataLayout().getTypeStoreSize(et);
+    auto* i32 = b_.getInt32Ty();
+    auto* v32 = FixedVectorType::get(i32, 16);
+    Value* idx = narrow_index(a, offs);
+    auto from_bits = [&](Value* bits) -> Value* {
+        if (et->isPointerTy()) return b_.CreateIntToPtr(bits, v16);
+        return bits->getType() == v16 ? bits : b_.CreateBitCast(bits, v16);
+    };
+    if (size == 4) {
+        Function* f = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_mask_gather_dpi_512);
+        return from_bits(b_.CreateCall(f, {Constant::getNullValue(v32), a.root, idx, mask, b_.getInt32(1)}));
+    }
+    if (size == 8) {
+        // vpgatherdq: 8 lanes per instruction, indices from a ymm.
+        auto* v64 = FixedVectorType::get(b_.getInt64Ty(), 8);
+        Function* f = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_mask_gather_dpq_512);
+        Value* lo = b_.CreateCall(f, {Constant::getNullValue(v64), a.root, low_half(b_, idx, 0), low_half(b_, mask, 0),
+                                      b_.getInt32(1)});
+        Value* hi = b_.CreateCall(f, {Constant::getNullValue(v64), a.root, low_half(b_, idx, 1), low_half(b_, mask, 1),
+                                      b_.getInt32(1)});
+        return from_bits(concat_chunks({lo, hi}));
+    }
+    // A byte, or an aligned 16-bit value: the aligned 32-bit word holding it
+    // (as masked_gather does), counted from root rounded down to 4 bytes.
+    Value* rlow = b_.CreateAnd(b_.CreatePtrToInt(a.root, b_.getInt64Ty()), b_.getInt64(3));
+    Value* word_root = b_.CreateGEP(b_.getInt8Ty(), a.root, b_.CreateNeg(rlow));
+    Value* at = b_.CreateAdd(idx, b_.CreateVectorSplat(16, b_.CreateTrunc(rlow, i32)));
+    Value* word = b_.CreateAnd(at, ConstantInt::get(v32, ~3u));
+    Value* shift = b_.CreateShl(b_.CreateAnd(at, ConstantInt::get(v32, 3)), ConstantInt::get(v32, 3));
+    Function* f = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_mask_gather_dpi_512);
+    Value* w = b_.CreateCall(f, {Constant::getNullValue(v32), word_root, word, mask, b_.getInt32(1)});
+    Value* v = b_.CreateTrunc(b_.CreateLShr(w, shift), FixedVectorType::get(b_.getIntNTy(unsigned(size * 8)), 16));
+    return et->isIntegerTy() ? v : b_.CreateBitCast(v, v16);
+}
+
+void WarpBuilder::scatter16_narrow(Value* v, const SplitAddress& a, Value* offs, Value* mask) {
+    auto* vt = cast<FixedVectorType>(v->getType());
+    Type* et = vt->getElementType();
+    const uint64_t size = m_.getDataLayout().getTypeStoreSize(et);
+    auto* bits_ty = FixedVectorType::get(b_.getIntNTy(unsigned(size * 8)), 16);
+    Value* bits = et->isPointerTy() ? b_.CreatePtrToInt(v, bits_ty) : b_.CreateBitCast(v, bits_ty);
+    Value* idx = narrow_index(a, offs);
+    if (size == 4) {
+        Function* f = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_scatter_dpi_512);
+        b_.CreateCall(f, {a.root, b_.CreateBitCast(mask, b_.getInt16Ty()), idx, bits, b_.getInt32(1)});
+        return;
+    }
+    // size 8: two vpscatterdq, low lanes first (the last active lane wins).
+    Function* f = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_scatter_dpq_512);
+    for (unsigned part = 0; part < 2; ++part)
+        b_.CreateCall(f, {a.root, b_.CreateBitCast(low_half(b_, mask, part), b_.getInt8Ty()), low_half(b_, idx, part),
+                          low_half(b_, bits, part), b_.getInt32(1)});
+}
+
+Value* WarpBuilder::gather16(Type* v16, const SplitAddress& a, Value* offs, Align align, Value* mask) {
+    auto wide = [&] { return masked_gather(v16, b_.CreateGEP(b_.getInt8Ty(), a.base, offs), align, mask); };
+    if (!a.root || !narrow_fits(cast<VectorType>(v16)->getElementType(), align)) return wide();
+    if (a.small) return gather16_narrow(v16, a, offs, mask);
+    // Global memory: the runtime's flag picks the form (uniform, invariant).
+    BasicBlock* narrow = BasicBlock::Create(ctx_, "g.narrow", w_);
+    BasicBlock* wide_bb = BasicBlock::Create(ctx_, "g.wide", w_);
+    BasicBlock* join = BasicBlock::Create(ctx_, "g.join", w_);
+    b_.CreateCondBr(small_offsets_flag(), narrow, wide_bb);
+    b_.SetInsertPoint(narrow);
+    Value* vn = gather16_narrow(v16, a, offs, mask);
+    BasicBlock* narrow_end = b_.GetInsertBlock();
+    b_.CreateBr(join);
+    b_.SetInsertPoint(wide_bb);
+    Value* vw = wide();
+    BasicBlock* wide_end = b_.GetInsertBlock();
+    b_.CreateBr(join);
+    b_.SetInsertPoint(join);
+    PHINode* phi = b_.CreatePHI(v16, 2);
+    phi->addIncoming(vn, narrow_end);
+    phi->addIncoming(vw, wide_end);
+    return phi;
+}
+
+void WarpBuilder::scatter16(Value* v, const SplitAddress& a, Value* offs, Align align, Value* mask) {
+    auto wide = [&] { b_.CreateMaskedScatter(v, b_.CreateGEP(b_.getInt8Ty(), a.base, offs), align, mask); };
+    const uint64_t size = m_.getDataLayout().getTypeStoreSize(cast<VectorType>(v->getType())->getElementType());
+    if (!a.root || (size != 4 && size != 8)) return wide();  // no scatter of bytes (LLVM stores them one by one)
+    if (a.small) return scatter16_narrow(v, a, offs, mask);
+    BasicBlock* narrow = BasicBlock::Create(ctx_, "s.narrow", w_);
+    BasicBlock* wide_bb = BasicBlock::Create(ctx_, "s.wide", w_);
+    BasicBlock* join = BasicBlock::Create(ctx_, "s.join", w_);
+    b_.CreateCondBr(small_offsets_flag(), narrow, wide_bb);
+    b_.SetInsertPoint(narrow);
+    scatter16_narrow(v, a, offs, mask);
+    b_.CreateBr(join);
+    b_.SetInsertPoint(wide_bb);
+    wide();
+    b_.CreateBr(join);
+    b_.SetInsertPoint(join);
+}
+
 // Loads through varying addresses. The access pattern is found at run time
 // from the offsets alone (usually invariant, so the tests leave loops or are
 // cached per warp), first for the whole access, then per 16 lanes:
@@ -1651,7 +1831,7 @@ Value* WarpBuilder::gather(Type* elem, Value* ptr, Align align, Value* mask, con
         {
             SplitAddress again = split_address(ptr);
             for (unsigned h = 0; h < chunks; ++h) offs[h] = half(again.offsets, h);
-            addr.base = again.base;
+            addr = again;
         }
         std::vector<Value*> parts(chunks);
         for (unsigned h = 0; h < chunks; ++h) {
@@ -1660,7 +1840,7 @@ Value* WarpBuilder::gather(Type* elem, Value* ptr, Align align, Value* mask, con
             // fdtd3d module took 24 s to compile instead of 7. Only the
             // module without a known block shape gets here.
             if (chunks > 2) {
-                parts[h] = masked_gather(v16, b_.CreateGEP(b_.getInt8Ty(), addr.base, offs[h]), align, masks[h]);
+                parts[h] = gather16(v16, addr, offs[h], align, masks[h]);
                 continue;
             }
             Value* m_bits = b_.CreateBitCast(masks[h], i16);
@@ -1680,14 +1860,14 @@ Value* WarpBuilder::gather(Type* elem, Value* ptr, Align align, Value* mask, con
             Value* v_same = b_.CreateVectorSplat(16, b_.CreateAlignedLoad(elem, bases[h], align));
             b_.CreateBr(bb_done);
             b_.SetInsertPoint(bb_gather);
-            Value* ptrs = b_.CreateGEP(b_.getInt8Ty(), addr.base, offs[h]);
-            Value* v_gather = masked_gather(v16, ptrs, align, masks[h]);
+            Value* v_gather = gather16(v16, addr, offs[h], align, masks[h]);
+            BasicBlock* gather_end = b_.GetInsertBlock();  // gather16 may branch
             b_.CreateBr(bb_done);
             b_.SetInsertPoint(bb_done);
             PHINode* phi = b_.CreatePHI(v16, 3);
             phi->addIncoming(v_cont, bb_cont);
             phi->addIncoming(v_same, bb_same);
-            phi->addIncoming(v_gather, bb_gather);
+            phi->addIncoming(v_gather, gather_end);
             parts[h] = phi;
         }
         results.push_back({concat(parts), b_.GetInsertBlock()});
@@ -1778,13 +1958,13 @@ void WarpBuilder::scatter(Value* vals, Value* ptr, Align align, Value* mask, boo
     {
         SplitAddress again = split_address(ptr);
         for (unsigned h = 0; h < chunks; ++h) offs[h] = half(again.offsets, h);
-        addr.base = again.base;
+        addr = again;
     }
     for (unsigned h = 0; h < chunks; ++h) {
         Value* m = half(mask, h);
         Value* v = half(vals, h);
         if (chunks > 2) {  // as for loads: one scatter per chunk (lanes in order, the last one wins)
-            b_.CreateMaskedScatter(v, b_.CreateGEP(b_.getInt8Ty(), addr.base, offs[h]), align, m);
+            scatter16(v, addr, offs[h], align, m);
             continue;
         }
         Value* m_bits = b_.CreateBitCast(m, i16);
@@ -1797,7 +1977,7 @@ void WarpBuilder::scatter(Value* vals, Value* ptr, Align align, Value* mask, boo
         b_.CreateMaskedStore(v, bases[h], align, m);
         b_.CreateBr(bb_done);
         b_.SetInsertPoint(bb_scatter);
-        b_.CreateMaskedScatter(v, b_.CreateGEP(b_.getInt8Ty(), addr.base, offs[h]), align, m);
+        scatter16(v, addr, offs[h], align, m);
         b_.CreateBr(bb_done);
         b_.SetInsertPoint(bb_done);
     }

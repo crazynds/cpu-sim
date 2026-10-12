@@ -133,4 +133,4 @@ Geometric mean 1.76 before, 2.06 after (median 1.72, 1.76). The cases that chang
 - **Divergence:** a per-thread quicksort (`array_by_pointer_quicksort`, 5x) and loops with per-thread trip counts.
 - **Through the driver** a launch still costs 5 to 7 us, against 1.7 us in-process: a socket round trip per launch. Sending launches without waiting for each reply would remove most of it.
 
-Previous: [29](29-stress-suite.md). Back to the [iteration 3 index](README.md).
+Previous: [29](29-stress-suite.md). Next: [31](31-gathers-and-scatters.md). Back to the [iteration 3 index](README.md).

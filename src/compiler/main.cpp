@@ -518,6 +518,23 @@ void lower_barrier_votes(Module& m, Function& kernel) {
     }
 }
 
+// Device malloc refuses objects of 2 GiB or more (malloc(SIZE_MAX) returns
+// null), as a GPU does with a heap below that size: kernels index every
+// object with 32-bit offsets when the runtime allows it (kernel_abi.h,
+// cpusim_warp_ctx::small_offsets), and it only knows about VRAM allocations.
+void cap_device_malloc(Function& f) {
+    for (Instruction& i : instructions(f)) {
+        auto* call = dyn_cast<CallInst>(&i);
+        Function* callee = call ? call->getCalledFunction() : nullptr;
+        if (!callee || callee->getName() != "malloc" || call->arg_size() != 1) continue;
+        IRBuilder<> b(call);
+        Value* n = call->getArgOperand(0);
+        auto* t = cast<IntegerType>(n->getType());
+        Value* big = b.CreateICmpUGE(n, ConstantInt::get(t, uint64_t(1) << 31));
+        call->setArgOperand(0, b.CreateSelect(big, ConstantInt::get(t, t->getMask()), n));
+    }
+}
+
 // Device printf: Clang packs the arguments in a local struct and calls
 // vprintf(format, &struct). Each call becomes
 //   h = __cpusim_printf_begin(format); __cpusim_printf_<kind>(h, value)...;
@@ -819,6 +836,7 @@ int main(int argc, char** argv) {
     for (Function& f : *m)
         if (!f.isDeclaration() && f.hasFnAttribute(Attribute::AlwaysInline)) per_thread.push_back(&f);
     for (Function* f : per_thread) lower_printf(*f);
+    for (Function* f : per_thread) cap_device_malloc(*f);
     for (Function* f : per_thread)
         if (expand_mem_intrinsics(*f, tm.get()) && !has_alloca(*f))
             run_function_pipeline(*f, tm.get(),

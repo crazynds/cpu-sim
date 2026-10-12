@@ -45,6 +45,7 @@ std::optional<uint64_t> RangeAllocator::allocate(uint64_t bytes) {
 
         allocated_.emplace(start, bytes);
         used_ += bytes;
+        if (bytes >= kHuge) ++huge_;
         return start;
     }
     return std::nullopt;
@@ -56,6 +57,7 @@ uint64_t RangeAllocator::release(uint64_t offset, uint64_t* free_begin, uint64_t
     uint64_t len = a->second;
     allocated_.erase(a);
     used_ -= len;
+    if (len >= kHuge) --huge_;
 
     uint64_t begin = offset, end = offset + len;
     auto next = free_by_offset_.lower_bound(end);
