@@ -38,6 +38,10 @@ public:
     // Kernel modules: `image` is the native shared object from the fatbin.
     virtual Error load_module(const void* image, size_t size, uint64_t* module) = 0;
     virtual Error get_function(uint64_t module, const std::string& name, uint64_t* function) = 0;
+    // Points the module's variables at their VRAM copies: `table` has one
+    // "<address> <size> <name>" line per variable. With `init`, also copies
+    // each variable's initial value from this module to its address.
+    virtual Error bind_symbols(uint64_t module, const std::string& table, bool init) = 0;
     virtual Error launch(uint64_t function, const LaunchConfig& cfg, const void* params, size_t param_bytes,
                          LaunchResult* result = nullptr) = 0;
 

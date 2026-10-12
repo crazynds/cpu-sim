@@ -81,6 +81,11 @@ public:
 
     uint32_t open_context(int pid, std::string process_name);
     void close_context(uint32_t ctx);  // frees everything the context still holds
+    void set_output(uint32_t ctx, int fd);  // takes the descriptor
+    // Stops the kernels still running for programs that are gone (or, with
+    // dead_only false, every kernel): a stuck kernel of a dead program would
+    // hold the device for everyone. Repeat while they last.
+    void cancel_launches(bool dead_only);
     std::vector<ContextInfo> contexts() const;
 
     Error allocate(uint32_t ctx, uint64_t bytes, uint64_t* dptr);
@@ -104,6 +109,7 @@ public:
     // The handle is only valid for this context.
     Error load_module(uint32_t ctx, int fd, uint64_t* module);
     Error get_function(uint32_t ctx, uint64_t module, const std::string& name, uint64_t* function);
+    Error bind_symbols(uint32_t ctx, uint64_t module, const std::string& table, bool init);
     Error launch(uint32_t ctx, uint64_t function, const LaunchConfig& cfg, const void* params, size_t param_bytes,
                  LaunchResult* result);
     Error memcpy_dtod(uint32_t ctx, uint64_t dst, uint64_t src, uint64_t n);
@@ -125,6 +131,8 @@ private:
         ContextInfo info;
         std::map<uint64_t, uint64_t> allocations;  // device pointer -> size
         std::vector<void*> modules;                // dlopen handles
+        int running = 0;                           // launches in flight
+        int output_fd = 1;                         // device printf (owned unless 1)
         // Per block shape: which width runs fastest, measured on the first launches.
         struct Tuning {
             std::vector<uint32_t> candidates;  // lane widths still to try, then the winner

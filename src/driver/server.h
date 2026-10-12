@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <list>
 #include <mutex>
 #include <string>
@@ -33,7 +34,7 @@ private:
     struct Client {
         int fd = -1;
         std::thread thread;
-        bool done = false;
+        std::atomic<bool> done{false};
     };
 
     void serve(Client* client);

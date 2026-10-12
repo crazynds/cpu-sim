@@ -13,7 +13,7 @@
 namespace cpusim::proto {
 
 constexpr uint32_t kMagic = 0x43505553;  // "CPUS"
-constexpr uint32_t kVersion = 5;
+constexpr uint32_t kVersion = 6;
 constexpr int32_t kCudaVersion = 13000;   // the CUDA version we implement
 
 enum class Op : uint32_t {
@@ -32,6 +32,7 @@ enum class Op : uint32_t {
     Launch,        // a = function, payload = LaunchPayload + parameter bytes
     SharedPool,    // -> fd of the shared pool (SCM_RIGHTS), reply.a = its address, reply.b = size; error if none
     MallocManaged, // a = bytes                   -> reply.a = pointer in the shared pool
+    BindSymbols,   // a = module, b = 1: copy the initial values, payload = Device::bind_symbols table
 };
 
 // Requests may carry a payload right after the Request header, in the same packet.

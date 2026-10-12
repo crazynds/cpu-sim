@@ -179,26 +179,48 @@ cudaError_t Scheduler::peek_error() {
     return error_;
 }
 
+// A kernel that faulted leaves the context unusable, as on a GPU: its error
+// is reported by every later call that reports asynchronous errors, until
+// cudaDeviceReset.
+static bool sticky(cudaError_t e) {
+    return e == cudaErrorIllegalAddress || e == cudaErrorLaunchFailure || e == cudaErrorAssert;
+}
+
 cudaError_t Scheduler::take_error() {
     std::lock_guard lock(error_mutex_);
     cudaError_t e = error_;
-    error_ = cudaSuccess;
+    if (!sticky(e)) error_ = cudaSuccess;
     return e;
+}
+
+void Scheduler::clear_error() {
+    std::lock_guard lock(error_mutex_);
+    error_ = cudaSuccess;
 }
 
 namespace {
 std::mutex pinned_mutex;
-std::map<const char*, size_t> pinned;  // start -> size
+struct PinnedRange {
+    size_t size;
+    bool owned;  // allocated by cudaMallocHost (not registered)
+};
+std::map<const char*, PinnedRange> pinned;  // start -> range
 }  // namespace
 
-void pinned_add(const void* p, size_t size) {
+void pinned_add(const void* p, size_t size, bool owned) {
     std::lock_guard lock(pinned_mutex);
-    pinned[static_cast<const char*>(p)] = size;
+    pinned[static_cast<const char*>(p)] = {size, owned};
 }
 
-void pinned_remove(const void* p) {
+bool pinned_remove(const void* p) {
     std::lock_guard lock(pinned_mutex);
-    pinned.erase(static_cast<const char*>(p));
+    return pinned.erase(static_cast<const char*>(p)) != 0;
+}
+
+bool pinned_owned(const void* p) {
+    std::lock_guard lock(pinned_mutex);
+    auto it = pinned.find(static_cast<const char*>(p));
+    return it != pinned.end() && it->second.owned;
 }
 
 bool pinned_contains(const void* p, size_t size) {
@@ -207,7 +229,7 @@ bool pinned_contains(const void* p, size_t size) {
     auto it = pinned.upper_bound(c);
     if (it == pinned.begin()) return false;
     --it;
-    return c >= it->first && c + size <= it->first + it->second;
+    return c >= it->first && c + size <= it->first + it->second.size;
 }
 
 }  // namespace cpusim::cudart

@@ -9,6 +9,7 @@ const char* error_name(Error e) {
         case Error::MemoryAllocation: return "cudaErrorMemoryAllocation";
         case Error::InitializationError: return "cudaErrorInitializationError";
         case Error::InvalidConfiguration: return "cudaErrorInvalidConfiguration";
+        case Error::InvalidSymbol: return "cudaErrorInvalidSymbol";
         case Error::InvalidDeviceFunction: return "cudaErrorInvalidDeviceFunction";
         case Error::InvalidKernelImage: return "cudaErrorInvalidKernelImage";
         case Error::NoKernelImageForDevice: return "cudaErrorNoKernelImageForDevice";
@@ -23,6 +24,7 @@ const char* error_name(Error e) {
         case Error::InvalidDevice: return "cudaErrorInvalidDevice";
         case Error::OperatingSystem: return "cudaErrorOperatingSystem";
         case Error::IllegalAddress: return "cudaErrorIllegalAddress";
+        case Error::Assert: return "cudaErrorAssert";
         case Error::LaunchFailure: return "cudaErrorLaunchFailure";
         case Error::NotSupported: return "cudaErrorNotSupported";
         case Error::Unknown: return "cudaErrorUnknown";
@@ -37,6 +39,7 @@ const char* error_string(Error e) {
         case Error::MemoryAllocation: return "out of memory";
         case Error::InitializationError: return "initialization error";
         case Error::InvalidConfiguration: return "invalid configuration argument";
+        case Error::InvalidSymbol: return "invalid device symbol";
         case Error::InvalidDeviceFunction: return "invalid device function";
         case Error::InvalidKernelImage: return "device kernel image is invalid";
         case Error::NoKernelImageForDevice: return "no kernel image is available for execution on the device";
@@ -51,6 +54,7 @@ const char* error_string(Error e) {
         case Error::InvalidDevice: return "invalid device ordinal";
         case Error::OperatingSystem: return "OS call failed or operation not supported on this OS";
         case Error::IllegalAddress: return "an illegal memory access was encountered";
+        case Error::Assert: return "device-side assert triggered";
         case Error::LaunchFailure: return "unspecified launch failure";
         case Error::NotSupported: return "operation not supported";
         case Error::Unknown: return "unknown error";

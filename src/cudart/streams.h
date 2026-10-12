@@ -74,6 +74,7 @@ public:
     // The first error of asynchronous work since the last call, cleared (or not).
     cudaError_t take_error();
     cudaError_t peek_error();
+    void clear_error();  // cudaDeviceReset
 
 private:
     friend class Queue;
@@ -91,8 +92,9 @@ Scheduler& scheduler();
 
 // Host memory from cudaMallocHost / cudaHostAlloc: copies from it are not
 // staged (like CUDA, the program must not change it before the copy runs).
-void pinned_add(const void* p, size_t size);
-void pinned_remove(const void* p);
+void pinned_add(const void* p, size_t size, bool owned);
+bool pinned_remove(const void* p);  // false: not recorded
+bool pinned_owned(const void* p);   // allocated by cudaMallocHost itself
 bool pinned_contains(const void* p, size_t size);
 
 }  // namespace cpusim::cudart
@@ -100,4 +102,6 @@ bool pinned_contains(const void* p, size_t size);
 // The stream handle is the queue.
 struct CUstream_st {
     cpusim::cudart::Queue* queue = nullptr;
+    unsigned flags = 0;
+    int priority = 0;
 };

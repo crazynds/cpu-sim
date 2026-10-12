@@ -66,7 +66,10 @@ void on_fault(int sig, siginfo_t* info, void* uctx) {
     StepInfo* s = t_step;
     if (!s || !s->active) {
         // Not ours: behave as if we were never installed.
+        // Not ours: the handler that was there before (the executor's, which
+        // recovers faults of kernels on its workers), left installed.
         struct sigaction* old = sig == SIGSEGV ? &g_old_segv : sig == SIGBUS ? &g_old_bus : &g_old_fpe;
+        if ((old->sa_flags & SA_SIGINFO) && old->sa_sigaction) return old->sa_sigaction(sig, info, uctx);
         sigaction(sig, old, nullptr);
         raise(sig);
         return;
@@ -91,18 +94,6 @@ void install_handlers() {
     });
 }
 
-std::string where_in_code(uintptr_t ip) {
-    Dl_info info{};
-    char buf[512];
-    if (dladdr(reinterpret_cast<void*>(ip), &info) && info.dli_fname) {
-        std::snprintf(buf, sizeof(buf), "%s+0x%lx (in %s+0x%lx)", info.dli_sname ? info.dli_sname : "?",
-                      (unsigned long)(ip - uintptr_t(info.dli_saddr)), info.dli_fname,
-                      (unsigned long)(ip - uintptr_t(info.dli_fbase)));
-    } else {
-        std::snprintf(buf, sizeof(buf), "0x%lx", (unsigned long)ip);
-    }
-    return buf;
-}
 
 // One step under the fault handler. Kept apart so that no local of the caller
 // lives across sigsetjmp. Returns false if the step faulted.
@@ -215,6 +206,19 @@ bool run_debug(cpusim_entry_fn entry, const cpusim_kernel_meta& meta, const Laun
         *report = buf;
     }
     return ok;
+}
+
+std::string where_in_code(uintptr_t ip) {
+    Dl_info info{};
+    char buf[512];
+    if (dladdr(reinterpret_cast<void*>(ip), &info) && info.dli_fname) {
+        std::snprintf(buf, sizeof(buf), "%s+0x%lx (in %s+0x%lx)", info.dli_sname ? info.dli_sname : "?",
+                      (unsigned long)(ip - uintptr_t(info.dli_saddr)), info.dli_fname,
+                      (unsigned long)(ip - uintptr_t(info.dli_fbase)));
+    } else {
+        std::snprintf(buf, sizeof(buf), "0x%lx", (unsigned long)ip);
+    }
+    return buf;
 }
 
 }  // namespace cpusim

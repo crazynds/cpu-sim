@@ -64,6 +64,9 @@ add_executable(cpusimd
     src/driver/monitor.cpp
 )
 target_link_libraries(cpusimd PRIVATE cpusim_device)
+# Kernel modules call back into the driver (device printf): its symbols are
+# what they resolve against when loaded.
+set_target_properties(cpusimd PROPERTIES ENABLE_EXPORTS ON)
 
 add_executable(cpu-smi src/smi/main.cpp)
 target_link_libraries(cpu-smi PRIVATE cpusim_device)

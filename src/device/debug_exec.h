@@ -19,4 +19,7 @@ namespace cpusim {
 bool run_debug(cpusim_entry_fn entry, const cpusim_kernel_meta& meta, const LaunchConfig& cfg, const uint8_t* params,
                uint64_t* counters, bool trace, std::string* report);
 
+// "symbol+offset (in module+offset)" for a code address.
+std::string where_in_code(uintptr_t ip);
+
 }  // namespace cpusim

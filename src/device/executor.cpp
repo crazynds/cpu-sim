@@ -2,21 +2,213 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <ucontext.h>
+#include <unistd.h>
 
 #include <immintrin.h>
 
 #include <cstdlib>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <new>
+#include <string>
 
 #include "common/topology.h"
 
 namespace cpusim {
 
 using AlignedAllocator = AlignedAlloc<uint8_t>;
+
+namespace {
+
+// Where a worker resumes when the kernel it runs faults.
+struct Recovery {
+    sigjmp_buf jump;
+    KernelFault fault;
+};
+thread_local Recovery* t_recovery = nullptr;
+// Set only while the worker runs kernel code: a fault there is the kernel's,
+// and a cancellation may take the worker out of it.
+thread_local volatile sig_atomic_t t_in_kernel = 0;
+thread_local const std::atomic<bool>* t_aborted = nullptr;  // of the job the worker runs
+struct sigaction g_previous[NSIG];
+constexpr int kCancelSignal = SIGUSR2;
+
+inline uint32_t in_kernel(cpusim_entry_fn entry, cpusim_warp_ctx* c) {
+    t_in_kernel = 1;
+    uint32_t r = entry(c);
+    t_in_kernel = 0;
+    return r;
+}
+
+// A fault outside a kernel run: what would have happened without us.
+void forward(int sig, siginfo_t* info, void* uctx) {
+    const struct sigaction& p = g_previous[sig];
+    if ((p.sa_flags & SA_SIGINFO) && p.sa_sigaction) return p.sa_sigaction(sig, info, uctx);
+    if (!(p.sa_flags & SA_SIGINFO) && p.sa_handler != SIG_DFL && p.sa_handler != SIG_IGN) return p.sa_handler(sig);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void on_kernel_fault(int sig, siginfo_t* info, void* uctx) {
+    Recovery* r = t_recovery;
+    if (!r || !t_in_kernel) return forward(sig, info, uctx);
+    t_recovery = nullptr;
+    r->fault.signal = sig;
+    r->fault.address = uintptr_t(info->si_addr);
+    r->fault.ip = uintptr_t(static_cast<ucontext_t*>(uctx)->uc_mcontext.gregs[REG_RIP]);
+    siglongjmp(r->jump, 1);
+}
+
+// The job was cancelled (its program died): leave the kernel now. Outside
+// kernel code the worker sees the flag at its next block.
+void on_cancel(int, siginfo_t*, void*) {
+    Recovery* r = t_recovery;
+    if (!r || !t_in_kernel || !t_aborted || !t_aborted->load(std::memory_order_relaxed)) return;
+    t_recovery = nullptr;
+    r->fault.signal = kCancelSignal;
+    siglongjmp(r->jump, 1);
+}
+
+void install_fault_handlers() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction sa{};
+        sa.sa_sigaction = on_kernel_fault;
+        // On the worker's alternate stack: a runaway recursion faults on the
+        // guard page of its own stack.
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+        for (int sig : {SIGSEGV, SIGBUS, SIGFPE, SIGILL}) sigaction(sig, &sa, &g_previous[sig]);
+        struct sigaction cancel{};
+        cancel.sa_sigaction = on_cancel;
+        cancel.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+        sigaction(kCancelSignal, &cancel, nullptr);
+    });
+}
+
+// The output of device printf for the job this worker runs.
+thread_local int t_output_fd = 1;
+
+}  // namespace
+
+// ---- device printf
+//
+// cpusim-devc turns each printf of device code into calls of these, one per
+// active lane: __cpusim_printf_begin(format) gives a record, one call per
+// argument fills it, __cpusim_printf_end formats it and writes it, whole, to
+// the program's standard output. Kernel modules resolve them here when they
+// are loaded (the driver exports its symbols).
+namespace {
+struct PrintfArg {
+    enum Kind { Int, Float, Pointer } kind;
+    int bytes;
+    union {
+        int64_t i;
+        double f;
+        const void* p;
+    };
+};
+struct PrintfRecord {
+    const char* format = nullptr;
+    std::vector<PrintfArg> args;
+    bool used = false;
+};
+// The records of one worker: the lanes of a warp begin theirs before any ends.
+thread_local std::vector<PrintfRecord> t_printf;
+
+std::string format_record(const PrintfRecord& r) {
+    std::string out;
+    const char* f = r.format;
+    size_t next = 0;
+    char spec[64], buf[512];
+    while (*f) {
+        if (*f != '%') {
+            out += *f++;
+            continue;
+        }
+        if (f[1] == '%') {
+            out += '%';
+            f += 2;
+            continue;
+        }
+        // %[flags][width][.precision][length]conversion, copied whole.
+        const char* start = f++;
+        while (*f && std::strchr("-+ #0123456789.*hlLzjt", *f)) ++f;
+        if (!*f) break;
+        const char conv = *f++;
+        size_t len = std::min<size_t>(size_t(f - start), sizeof(spec) - 1);
+        std::memcpy(spec, start, len);
+        spec[len] = 0;
+        if (next >= r.args.size()) {
+            out += spec;  // more conversions than arguments: printed as written
+            continue;
+        }
+        const PrintfArg& a = r.args[next++];
+        int n = 0;
+        if (std::strchr("diouxXc", conv)) {
+            const bool wide = std::strstr(spec, "l") || std::strchr(spec, 'j') || std::strchr(spec, 'z');
+            // Without a length modifier, the 32-bit value as passed.
+            if (wide) n = std::snprintf(buf, sizeof buf, spec, (long long)a.i);
+            else n = std::snprintf(buf, sizeof buf, spec, int(a.i));
+        } else if (std::strchr("eEfFgGaA", conv)) {
+            n = std::snprintf(buf, sizeof buf, spec, a.kind == PrintfArg::Float ? a.f : double(a.i));
+        } else if (conv == 's') {
+            n = std::snprintf(buf, sizeof buf, spec, a.p ? static_cast<const char*>(a.p) : "(null)");
+        } else if (conv == 'p') {
+            n = std::snprintf(buf, sizeof buf, spec, a.p);
+        } else {
+            n = std::snprintf(buf, sizeof buf, "%s", spec);
+        }
+        if (n > 0) out.append(buf, std::min<size_t>(size_t(n), sizeof buf - 1));
+    }
+    return out;
+}
+}  // namespace
+
+extern "C" {
+__attribute__((visibility("default"), used)) int64_t __cpusim_printf_begin(const char* format) {
+    for (size_t i = 0; i < t_printf.size(); ++i)
+        if (!t_printf[i].used) {
+            t_printf[i] = {format, {}, true};
+            return int64_t(i);
+        }
+    t_printf.push_back({format, {}, true});
+    return int64_t(t_printf.size() - 1);
+}
+__attribute__((visibility("default"), used)) void __cpusim_printf_int(int64_t h, int64_t v, int32_t bytes) {
+    PrintfArg a{PrintfArg::Int, bytes, {}};
+    a.i = v;
+    t_printf[size_t(h)].args.push_back(a);
+}
+__attribute__((visibility("default"), used)) void __cpusim_printf_float(int64_t h, double v) {
+    PrintfArg a{PrintfArg::Float, 8, {}};
+    a.f = v;
+    t_printf[size_t(h)].args.push_back(a);
+}
+__attribute__((visibility("default"), used)) void __cpusim_printf_pointer(int64_t h, const void* v) {
+    PrintfArg a{PrintfArg::Pointer, 8, {}};
+    a.p = v;
+    t_printf[size_t(h)].args.push_back(a);
+}
+__attribute__((visibility("default"), used)) int32_t __cpusim_printf_end(int64_t h) {
+    PrintfRecord& r = t_printf[size_t(h)];
+    std::string text = format_record(r);
+    r.used = false;
+    r.args.clear();
+    // One write: lines from different threads never mix.
+    for (size_t done = 0; done < text.size();) {
+        ssize_t n = write(t_output_fd, text.data() + done, text.size() - done);
+        if (n <= 0) break;
+        done += size_t(n);
+    }
+    return int32_t(text.size());
+}
+}
 
 Executor::Executor(const std::vector<int>& cpus) {
     // Pairs of SMT siblings, both among the workers (read from /sys, never
@@ -35,6 +227,8 @@ Executor::Executor(const std::vector<int>& cpus) {
         }
         pairs_.push_back(std::make_unique<Pair>());
     }
+    install_fault_handlers();
+    current_.assign(cpus.size(), nullptr);
     for (size_t i = 0; i < cpus.size(); ++i) threads_.emplace_back([this, i, cpu = cpus[i]] { worker(int(i), cpu); });
 }
 
@@ -62,8 +256,12 @@ void Executor::worker(int index, int cpu) {
     uint8_t* shared = shared_mem + (uint64_t(index) * 1088) % 4096 / 64 * 64;
     CtxArray ctx;
     std::vector<uint8_t, AlignedAllocator> frames;
+    std::vector<uint8_t> altstack(1 << 16);
+    stack_t ss{};
+    ss.ss_sp = altstack.data();
+    ss.ss_size = altstack.size();
+    sigaltstack(&ss, nullptr);
 
-    uint64_t round = 0;  // blocks this worker's pair went through (both halves agree)
     while (true) {
         Job* job = nullptr;
         {
@@ -79,12 +277,33 @@ void Executor::worker(int index, int cpu) {
         alignas(64) uint64_t counters[CPUSIM_COUNTERS] = {};
         frames.resize(size_t(job->frame_stride) * job->warps->count);
         const auto t0 = std::chrono::steady_clock::now();
-        if (!job->cooperative) run_blocks(*job, index, ctx, shared, counters, frames.data());
-        else run_pair(*job, ctx, shared, counters, *pairs_[pair_of_[index]], half_of_[index], round);
+        Recovery recovery;
+        t_aborted = &job->aborted;
+        t_output_fd = job->cfg.output_fd;
+        {
+            std::lock_guard lock(mutex_);
+            current_[size_t(index)] = job;
+        }
+        if (sigsetjmp(recovery.jump, 1) == 0) {
+            t_recovery = &recovery;
+            if (!job->cooperative) run_blocks(*job, index, ctx, shared, counters, frames.data());
+            else run_pair(*job, ctx, shared, counters, *pairs_[pair_of_[index]], half_of_[index],
+                          pairs_[pair_of_[index]]->round[half_of_[index]]);
+            t_recovery = nullptr;
+        } else {
+            // The kernel faulted, or its program is gone: the job stops. The
+            // sibling of a pair must not wait for this half again.
+            t_in_kernel = 0;
+            job->aborted.store(true, std::memory_order_relaxed);
+            if (job->cooperative) pairs_[pair_of_[index]]->epoch(half_of_[index]).store(UINT64_MAX);
+            std::lock_guard lock(mutex_);
+            if (!job->fault.signal) job->fault = recovery.fault;
+        }
         const uint64_t ns = uint64_t(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
         {
             std::lock_guard lock(mutex_);
+            current_[size_t(index)] = nullptr;
             job->busy_ns += ns;
             if (job->counters)
                 for (int i = 0; i < CPUSIM_COUNTERS; ++i) job->counters[i] += counters[i];
@@ -96,6 +315,7 @@ void Executor::worker(int index, int cpu) {
 }
 
 bool Executor::Job::has_work() const {
+    if (aborted.load(std::memory_order_relaxed)) return false;
     if (!ranges) return next.load(std::memory_order_relaxed) < blocks;
     for (size_t i = 0; i < nranges; ++i)
         if (ranges[i].next.load(std::memory_order_relaxed) < ranges[i].end) return true;
@@ -105,6 +325,7 @@ bool Executor::Job::has_work() const {
 // The next block for `worker`: from its own range, then from the others'
 // (starting with its neighbours, which are on the same CCD more often).
 bool Executor::claim(const Job& job, int worker, uint64_t* b) {
+    if (job.aborted.load(std::memory_order_relaxed)) return false;
     for (size_t k = 0; k < job.nranges; ++k) {
         const size_t w = (size_t(worker) + k) % job.nranges;
         const Job::Range& r = job.ranges[w];
@@ -137,7 +358,7 @@ void Executor::run_blocks(const Job& job, int worker, CtxArray& ctx, uint8_t* sh
         while (claim(job, worker, &u)) {
             cpusim_warp_ctx* c = ctx.at(size_t(u % job.split));
             block_coords(job, u / job.split, c->block_idx);
-            job.entry(c);
+            in_kernel(job.entry, c);
         }
         return;
     }
@@ -153,7 +374,7 @@ void Executor::run_blocks(const Job& job, int worker, CtxArray& ctx, uint8_t* sh
             c->block_idx[2] = bz;
         }
         if (!job.frame_stride) {
-            for (size_t w = 0; w < n; ++w) job.entry(ctx.at(w));
+            for (size_t w = 0; w < n; ++w) in_kernel(job.entry, ctx.at(w));
             continue;
         }
         // Barriers: each call runs a warp up to its next __syncthreads (or its
@@ -161,7 +382,9 @@ void Executor::run_blocks(const Job& job, int worker, CtxArray& ctx, uint8_t* sh
         for (size_t w = 0; w < n; ++w) *reinterpret_cast<uint32_t*>(ctx.at(w)->frame) = 0;
         std::fill(done.begin(), done.end(), 0);
         if (job.block) {
+            t_in_kernel = 1;
             job.block(ctx.at(0), uint32_t(n), done.data());
+            t_in_kernel = 0;
             continue;
         }
         // Always run a warp that is behind (the lowest barrier count). When
@@ -184,7 +407,7 @@ void Executor::run_blocks(const Job& job, int worker, CtxArray& ctx, uint8_t* sh
                 const bool pass = behind == 1 && !disabled;
                 c->barrier_pass = pass;
                 --behind;
-                if (job.entry(c) == CPUSIM_EXIT) {
+                if (in_kernel(job.entry, c) == CPUSIM_EXIT) {
                     done[w] = 1;
                     --remaining;
                 } else {
@@ -252,12 +475,18 @@ void Executor::run_pair(const Job& job, CtxArray& ctx, uint8_t* shared, uint64_t
         if (half == 0) {
             // The other half left block r - 1 (and the slot's last reader is done).
             while (other.load(std::memory_order_acquire) < ((r - 1) << 32 | 0xffffffffu)) _mm_pause();
-            b = job.next.fetch_add(1, std::memory_order_relaxed);
+            b = job.aborted.load(std::memory_order_relaxed) ? job.blocks : job.next.fetch_add(1, std::memory_order_relaxed);
             slot.block = b;
             slot.shared = shared;
             slot.round.store(r, std::memory_order_release);
         } else {
-            while (slot.round.load(std::memory_order_acquire) != r) _mm_pause();
+            while (slot.round.load(std::memory_order_acquire) != r) {
+                if (job.aborted.load(std::memory_order_relaxed)) {  // the first half faulted
+                    mine.store(UINT64_MAX, std::memory_order_release);
+                    return;
+                }
+                _mm_pause();
+            }
             b = slot.block;
         }
         if (b >= job.blocks) {
@@ -267,7 +496,7 @@ void Executor::run_pair(const Job& job, CtxArray& ctx, uint8_t* shared, uint64_t
         c->shared = slot.shared;
         block_coords(job, b, c->block_idx);
         mine.store(r << 32, std::memory_order_release);
-        job.entry(c);
+        in_kernel(job.entry, c);
         mine.store(r << 32 | 0xffffffffu, std::memory_order_release);
     }
 }
@@ -285,10 +514,23 @@ Executor::Job* Executor::pick(int worker) {
     return nullptr;
 }
 
+void Executor::cancel(uint32_t tag) {
+    std::lock_guard lock(mutex_);
+    for (Job* j : active_) {
+        if (tag && j->tag != tag) continue;
+        j->aborted.store(true, std::memory_order_relaxed);
+        if (!j->fault.signal) j->fault.signal = kCancelSignal;
+        for (size_t i = 0; i < threads_.size(); ++i)
+            if (current_[i] == j) pthread_kill(threads_[i].native_handle(), kCancelSignal);
+    }
+}
+
 void Executor::maybe_finish(Job* j) {
     if (j->done || j->inflight > 0) return;
     if (j->cooperative ? j->joins < int(2 * pairs_.size()) : j->has_work()) return;
     j->done = true;
+    if (j->cooperative && j->aborted.load(std::memory_order_relaxed))
+        for (auto& p : pairs_) p->resync();
     active_.erase(std::find(active_.begin(), active_.end(), j));
     done_cv_.notify_all();
 }
@@ -325,7 +567,8 @@ CtxArray Executor::make_groups(const LaunchConfig& cfg, uint32_t lanes) {
 
 void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const cpusim_kernel_meta& meta,
                    const LaunchConfig& cfg, const uint8_t* params, uint64_t* counters, cpusim_block_fn block,
-                   bool cooperative, uint64_t first, uint64_t last, uint64_t* busy_ns) {
+                   bool cooperative, uint64_t first, uint64_t last, uint64_t* busy_ns, KernelFault* fault,
+                   uint32_t tag) {
     CtxArray warps = make_groups(cfg, lanes);
     // Block-wide entries never suspend: no frames.
     uint32_t frame_bytes = 0;
@@ -343,6 +586,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     job.frame_stride = frame_bytes ? cpusim_stagger(frame_bytes) : 0;
     job.block = block;
     job.cooperative = cooperative && !pairs_.empty();
+    job.tag = tag;
     // The warps of a block that has no barrier and no shared memory never
     // talk to each other: with few blocks, hand out its groups one by one
     // (as a GPU schedules warps), so the work spreads over every worker
@@ -382,6 +626,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     start_cv_.notify_all();
     done_cv_.wait(lock, [&] { return job.done; });
     if (busy_ns) *busy_ns = job.busy_ns;
+    if (fault) *fault = job.fault;
     if (job.cooperative) {
         coop_active_ = false;
         done_cv_.notify_all();

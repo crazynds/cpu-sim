@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -39,6 +40,7 @@ struct LaunchConfig {
     uint32_t shared_bytes = 0;
     bool profile = false;  // run the instrumented entry and collect counters
     int debug = 0;         // 1: single-step with guard pages (debug_exec.h); 2: also trace every step
+    int output_fd = 1;     // where the kernel's printf writes (the program's stdout)
 };
 
 struct LaunchResult {
@@ -55,6 +57,15 @@ struct LaunchResult {
 // takes blocks from the oldest one that still has some, so a kernel's last
 // blocks overlap with the next kernel's first ones. Cooperative launches run
 // alone (every pair of siblings has to take part).
+// A kernel that faulted (SIGSEGV, SIGBUS, SIGFPE or SIGILL on a worker): the
+// launch stops, and only it fails; the process (the driver, which serves
+// every program) goes on.
+struct KernelFault {
+    int signal = 0;  // 0: none
+    uintptr_t address = 0;
+    uintptr_t ip = 0;
+};
+
 class Executor {
 public:
     explicit Executor(const std::vector<int>& cpus);
@@ -74,7 +85,13 @@ public:
     void run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const cpusim_kernel_meta& meta,
              const LaunchConfig& cfg, const uint8_t* params, uint64_t* counters = nullptr,
              cpusim_block_fn block = nullptr, bool cooperative = false, uint64_t first = 0,
-             uint64_t last = UINT64_MAX, uint64_t* busy_ns = nullptr);
+             uint64_t last = UINT64_MAX, uint64_t* busy_ns = nullptr, KernelFault* fault = nullptr,
+             uint32_t tag = 0);
+    // Stops the running launches tagged `tag` (0: all): their workers leave
+    // the kernel code they are in. Their run() returns with a fault of
+    // SIGUSR2. Call again while they last: a worker outside kernel code
+    // notices at its next block.
+    void cancel(uint32_t tag);
     // busy_ns: the time workers spent running this launch's blocks, summed
     // over workers. Divided by the blocks, the cost of a block: unlike wall
     // time, it ignores the uneven end of a launch and the launch overhead,
@@ -135,6 +152,10 @@ private:
         uint64_t busy_ns = 0;
         std::vector<char> joined;
         bool done = false;
+        // A worker faulted: the others take no more blocks.
+        mutable std::atomic<bool> aborted{false};
+        KernelFault fault;  // under mutex_
+        uint32_t tag = 0;   // the context that launched it
     };
 
     // Two SMT siblings running blocks together. Barrier epochs (see
@@ -150,6 +171,16 @@ private:
             uint8_t* shared = nullptr;
         } slot[2];
         std::atomic<uint64_t>& epoch(int half) { return half ? epoch1 : epoch0; }
+        // Blocks each half went through (equal between jobs; written only by
+        // that half's worker).
+        uint64_t round[2] = {0, 0};
+        // After a fault ended a job midway: both halves agree again.
+        void resync() {
+            const uint64_t r = std::max(round[0], round[1]);
+            round[0] = round[1] = r;
+            epoch0.store(r << 32 | 0xffffffffu);
+            epoch1.store(r << 32 | 0xffffffffu);
+        }
     };
 
     void worker(int index, int cpu);
@@ -169,6 +200,7 @@ private:
     std::condition_variable start_cv_, done_cv_;
     bool stop_ = false;
     std::vector<Job*> active_;   // oldest first
+    std::vector<Job*> current_;  // under mutex_: the job each worker is in
     bool coop_active_ = false;   // a cooperative job runs alone
 };
 

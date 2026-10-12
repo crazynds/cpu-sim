@@ -159,6 +159,7 @@ void Server::run() {
         if (n < 0 && errno != EINTR) break;
         if (fds[1].revents & POLLIN) break;
         reap_finished();
+        core_.cancel_launches(true);
         if (n <= 0 || !(fds[0].revents & POLLIN)) continue;
 
         int fd = accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
@@ -169,14 +170,21 @@ void Server::run() {
         c.thread = std::thread([this, &c] { serve(&c); });
     }
 
-    // Wake every client thread and wait for it to free its context.
+    // Wake every client thread and wait for it to free its context; a kernel
+    // that never ends must not keep the driver from stopping.
     std::list<Client> remaining;
     {
         std::lock_guard lock(clients_mutex_);
         for (auto& c : clients_) shutdown(c.fd, SHUT_RDWR);
         remaining.splice(remaining.end(), clients_);
     }
-    for (auto& c : remaining) c.thread.join();
+    for (auto& c : remaining) {
+        while (!c.done) {
+            core_.cancel_launches(false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        c.thread.join();
+    }
 }
 
 void Server::reap_finished() {
@@ -250,6 +258,10 @@ void Server::serve(Client* client) {
                     attached = true;
                 } else if (!(req.b & proto::kHelloMonitor)) {
                     ctx = core_.open_context(cred.pid, process_path(cred.pid));
+                    if (passed_fd >= 0) {  // the program's standard output, for device printf
+                        core_.set_output(ctx, passed_fd);
+                        passed_fd = -1;
+                    }
                 }
                 hello = true;
                 h.driver_pid = getpid();
@@ -258,6 +270,7 @@ void Server::serve(Client* client) {
                 h.vram_size = core_.vram().size();
                 copy_str(h.driver_version, CPUSIM_VERSION);
                 h.props = core_.properties();
+                if (passed_fd >= 0) close(passed_fd);
                 send(fd, &h, sizeof(h), MSG_NOSIGNAL);
                 continue;
             }
@@ -337,6 +350,10 @@ void Server::serve(Client* client) {
             case proto::Op::GetFunction:
                 e = core_.get_function(ctx, req.a, std::string(reinterpret_cast<const char*>(payload), payload_size),
                                        &reply.a);
+                break;
+            case proto::Op::BindSymbols:
+                e = core_.bind_symbols(ctx, req.a, std::string(reinterpret_cast<const char*>(payload), payload_size),
+                                       req.b != 0);
                 break;
             case proto::Op::Launch: {
                 proto::LaunchPayload lp;

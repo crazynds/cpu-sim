@@ -125,7 +125,9 @@ public:
             return e;
         }
         proto::HelloReply hello{};
-        e = conn_.call({proto::kMagic, proto::Op::Hello, proto::kVersion, 0, 0}, &hello, sizeof(hello), message);
+        // Our standard output goes along: the kernels' printf writes there.
+        e = conn_.call({proto::kMagic, proto::Op::Hello, proto::kVersion, 0, 0}, &hello, sizeof(hello), message, nullptr,
+                       0, STDOUT_FILENO);
         if (e != Error::Success) {
             if (message->empty()) *message = "the driver rejected this client (version mismatch?)";
             return e;
@@ -240,6 +242,11 @@ public:
         Error e = call(proto::Op::GetFunction, module, 0, 0, &r, name.data(), name.size());
         *function = r.a;
         return e;
+    }
+
+    Error bind_symbols(uint64_t module, const std::string& table, bool init) override {
+        if (table.size() > proto::kMaxPayload) return Error::NotSupported;
+        return call(proto::Op::BindSymbols, module, init ? 1 : 0, 0, nullptr, table.data(), table.size());
     }
 
     Error launch(uint64_t function, const LaunchConfig& cfg, const void* params, size_t param_bytes,

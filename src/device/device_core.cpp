@@ -9,7 +9,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cerrno>
+#include <csignal>
 #include <cstring>
+#include <sstream>
+#include <thread>
 #include <fstream>
 
 #include "common/units.h"
@@ -166,12 +170,36 @@ uint64_t DeviceCore::shared_used() const {
     return shared_allocator_ ? shared_allocator_->used() : 0;
 }
 
+void DeviceCore::set_output(uint32_t id, int fd) {
+    std::lock_guard lock(mutex_);
+    auto it = contexts_.find(id);
+    if (it == contexts_.end()) {
+        close(fd);
+        return;
+    }
+    if (it->second.output_fd != 1) close(it->second.output_fd);
+    it->second.output_fd = fd;
+}
+
 void DeviceCore::close_context(uint32_t id) {
+    // Its kernels still running (the program died with them in flight) stop
+    // first: they use its memory and its modules' code.
+    while (true) {
+        {
+            std::lock_guard lock(mutex_);
+            auto it = contexts_.find(id);
+            if (it == contexts_.end()) return;
+            if (it->second.running == 0) break;
+        }
+        if (executor_) executor_->cancel(id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     std::lock_guard lock(mutex_);
     auto it = contexts_.find(id);
     if (it == contexts_.end()) return;
     for (auto [ptr, size] : it->second.allocations) release_range(ptr);
     for (void* handle : it->second.modules) dlclose(handle);
+    if (it->second.output_fd != 1) close(it->second.output_fd);
     contexts_.erase(it);
 }
 
@@ -339,6 +367,49 @@ Error DeviceCore::load_module(uint32_t id, int fd, uint64_t* module) {
     return Error::Success;
 }
 
+// What a faulted kernel's launch returns: an invalid address, a trap (device
+// assert, __trap), anything else.
+static Error fault_error(int signal) {
+    if (signal == SIGSEGV || signal == SIGBUS) return Error::IllegalAddress;
+    if (signal == SIGILL) return Error::Assert;
+    return Error::LaunchFailure;
+}
+
+void DeviceCore::cancel_launches(bool dead_only) {
+    if (!executor_) return;
+    std::vector<uint32_t> ids;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& [id, c] : contexts_)
+            if (!dead_only || (kill(c.info.pid, 0) != 0 && errno == ESRCH)) ids.push_back(id);
+    }
+    if (!dead_only) ids = {0};
+    for (uint32_t id : ids) executor_->cancel(id);
+}
+
+Error DeviceCore::bind_symbols(uint32_t id, uint64_t module, const std::string& table, bool init) {
+    std::lock_guard lock(mutex_);
+    auto it = contexts_.find(id);
+    if (it == contexts_.end()) return Error::InitializationError;
+    auto& mods = it->second.modules;
+    void* handle = reinterpret_cast<void*>(module);
+    if (std::find(mods.begin(), mods.end(), handle) == mods.end()) return Error::InvalidResourceHandle;
+    const uint8_t* lo = vram().base();
+    const uint8_t* hi = lo + vram().size();
+    std::istringstream in(table);
+    uint64_t address, size;
+    std::string name;
+    while (in >> address >> size >> name) {
+        auto* dst = reinterpret_cast<uint8_t*>(address);
+        if (dst < lo || dst + size > hi) return Error::InvalidValue;
+        // A module without the variable does not use it (dropped as dead).
+        if (auto* slot = static_cast<void**>(dlsym(handle, ("__cpusim_sym_" + name).c_str()))) *slot = dst;
+        if (init)
+            if (const void* src = dlsym(handle, ("__cpusim_init_" + name).c_str())) std::memcpy(dst, src, size);
+    }
+    return Error::Success;
+}
+
 Error DeviceCore::get_function(uint32_t id, uint64_t module, const std::string& name, uint64_t* function) {
     std::lock_guard lock(mutex_);
     auto it = contexts_.find(id);
@@ -379,6 +450,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     uint32_t lanes = CPUSIM_WARP_SIZE;
     uint64_t tuning_key = 0;
     std::vector<Trial> trials;  // width tuning inside this launch
+    int output_fd = 1;
     cpusim_kernel_meta meta{};
     // The executor first: the widths offered depend on its pairs of SMT siblings.
     std::call_once(executor_once_, [this] { executor_ = std::make_unique<Executor>(reserved_cpus()); });
@@ -389,6 +461,8 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
         auto fn = it->second.functions.find(function);
         if (fn == it->second.functions.end()) return Error::InvalidDeviceFunction;
         meta = fn->second.meta;
+        ++it->second.running;
+        output_fd = it->second.output_fd;
         if (cfg.profile) {
             if (!fn->second.profiled) return Error::NotSupported;
             entry = fn->second.profiled;
@@ -400,6 +474,14 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
             if (lanes == CPUSIM_WARP_SIZE && use_block) block_fn = fn->second.block;
         }
     }
+    struct Running {  // the launch counts as running until it returns
+        DeviceCore& core;
+        uint32_t id;
+        ~Running() {
+            std::lock_guard lock(core.mutex_);
+            if (auto it = core.contexts_.find(id); it != core.contexts_.end()) --it->second.running;
+        }
+    } running{*this, id};
     const auto& p = props_;
     uint64_t threads = uint64_t(cfg.block[0]) * cfg.block[1] * cfg.block[2];
     for (int i = 0; i < 3; ++i)
@@ -409,6 +491,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     if (threads > uint64_t(p.maxThreadsPerBlock)) return Error::InvalidConfiguration;
     // Dynamic shared memory goes right after the kernel's static __shared__ variables.
     LaunchConfig run_cfg = cfg;
+    run_cfg.output_fd = output_fd;
     run_cfg.shared_bytes = meta.shared_bytes + cfg.shared_bytes;
     if (run_cfg.shared_bytes > Executor::kMaxSharedBytes) return Error::InvalidValue;
 
@@ -446,11 +529,21 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
                 return Error::IllegalAddress;
             }
         } else {
+            KernelFault fault;
             auto run = [&](uint64_t fn_entry, uint32_t w, uint64_t first, uint64_t last, uint64_t* busy) {
+                if (fault.signal) return;
                 executor_->run(reinterpret_cast<cpusim_entry_fn>(fn_entry), w & 0xffff,
                                w == CPUSIM_WARP_SIZE || (w & kSuspend), meta, run_cfg, aligned,
                                cfg.profile ? result->counters : nullptr, reinterpret_cast<cpusim_block_fn>(block_fn),
-                               (w & kCoop) != 0, first, last, busy);
+                               (w & kCoop) != 0, first, last, busy, &fault, id);
+            };
+            // A fault ends the launch (and only it): an invalid address is
+            // cudaErrorIllegalAddress, anything else an unspecified failure.
+            auto failed = [&]() {
+                if (!fault.signal) return false;
+                std::snprintf(result->report, sizeof(result->report), "%s at address 0x%lx, instruction %s",
+                              strsignal(fault.signal), (unsigned long)fault.address, where_in_code(fault.ip).c_str());
+                return true;
             };
             uint64_t first = 0;
             if (!trials.empty()) {
@@ -471,12 +564,14 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
                     for (size_t r = 1; r < kTrialRounds; ++r) ns[i] = std::min(ns[i], ns[r * n + i]);
                     if (ns[i] < ns[best]) best = i;
                 }
+                if (failed()) return fault_error(fault.signal);
                 choose_width(id, function, tuning_key, std::vector<Trial>(trials.begin(), trials.begin() + n),
                              std::vector<uint64_t>(ns.begin(), ns.begin() + n));
                 entry = trials[best].entry;
                 lanes = trials[best].lanes;
             }
             run(entry, lanes, first, UINT64_MAX, &launch_busy);
+            if (failed()) return fault_error(fault.signal);
         }
         result->kernel_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - start).count());

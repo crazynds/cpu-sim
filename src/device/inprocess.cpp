@@ -162,6 +162,9 @@ public:
     Error get_function(uint64_t module, const std::string& name, uint64_t* function) override {
         return core_->get_function(ctx_, module, name, function);
     }
+    Error bind_symbols(uint64_t module, const std::string& table, bool init) override {
+        return core_->bind_symbols(ctx_, module, table, init);
+    }
     Error launch(uint64_t function, const LaunchConfig& cfg, const void* params, size_t param_bytes,
                  LaunchResult* result) override {
         return core_->launch(ctx_, function, cfg, params, param_bytes, result);
