@@ -66,22 +66,6 @@ struct KernelFault {
     uintptr_t ip = 0;
 };
 
-// A lock held for a few hundred nanoseconds by threads pinned one per CPU:
-// spinning beats sleeping on a futex, which cost every launch tens of
-// microseconds when all the workers joined and left a job at once.
-class SpinMutex {
-public:
-    void lock() {
-        while (locked_.exchange(true, std::memory_order_acquire))
-            while (locked_.load(std::memory_order_relaxed)) __builtin_ia32_pause();
-    }
-    bool try_lock() { return !locked_.load(std::memory_order_relaxed) && !locked_.exchange(true, std::memory_order_acquire); }
-    void unlock() { locked_.store(false, std::memory_order_release); }
-
-private:
-    std::atomic<bool> locked_{false};
-};
-
 class Executor {
 public:
     explicit Executor(const std::vector<int>& cpus);
@@ -236,8 +220,11 @@ private:
     std::vector<std::thread> threads_;
     std::vector<std::unique_ptr<Pair>> pairs_;
     std::vector<int> pair_of_, half_of_;  // per worker; pair -1: no sibling among the workers
-    SpinMutex mutex_;
-    std::condition_variable_any start_cv_, done_cv_;
+    // A plain mutex: the hot paths (joining and leaving a job) take no lock,
+    // and a spin lock whose holder gets preempted (an unpinned thread on its
+    // CPU) stalls every worker waiting for it.
+    std::mutex mutex_;
+    std::condition_variable start_cv_, done_cv_;
     bool stop_ = false;
     // Idle workers and a launching thread spin a while before sleeping: a
     // kernel launched right after another finds the workers awake, with no
