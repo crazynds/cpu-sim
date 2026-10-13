@@ -27,7 +27,13 @@ struct KernelInfo {
     uint64_t param_bytes = 0;
     uint64_t shared_bytes = 0;  // static __shared__ (set by lower_shared_memory)
     uint64_t frame_bytes = 0;   // per-warp state saved at barriers (0: no barrier), 32-lane variants
-    uint64_t frame_bytes_wide[2] = {};  // suspending 64- and 128-lane variants
+    uint64_t frame_bytes_wide[2] = {};  // suspending variants of 2 and 4 warps
+    // Threads per warp (warpSize: 32, or 16 or 64 with CPUSIM_WARP_SIZE), and
+    // the lanes of the warp entry: the warp size, or fewer when the whole
+    // block is smaller (a block of 16 threads with warps of 32 runs in one
+    // 16-lane vector; the missing lanes are threads that do not exist).
+    unsigned warp_size = 32;
+    unsigned warp_lanes = 32;
 };
 
 // Builds `__cpusim_entry_<name>`: the per-thread kernel turned into code that

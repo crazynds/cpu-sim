@@ -119,14 +119,14 @@ bool run_debug(cpusim_entry_fn entry, const cpusim_kernel_meta& meta, const Laun
     sigaltstack(&ss, &old_ss);
 
     const uint32_t threads = cfg.block[0] * cfg.block[1] * cfg.block[2];
-    const uint32_t nwarps = (threads + CPUSIM_WARP_SIZE - 1) / CPUSIM_WARP_SIZE;
+    const uint32_t nwarps = (threads + meta.warp_lanes - 1) / meta.warp_lanes;  // warp entries
     const uint32_t frame_bytes = (meta.frame_bytes + 63) / 64 * 64;
 
     Guarded shared(std::max<uint32_t>(cfg.shared_bytes, 1), 16);
     std::vector<std::unique_ptr<Guarded>> frames;
     for (uint32_t w = 0; w < nwarps && frame_bytes; ++w) frames.push_back(std::make_unique<Guarded>(frame_bytes));
 
-    CtxArray ctxs = Executor::make_groups(cfg, CPUSIM_WARP_SIZE);
+    CtxArray ctxs = Executor::make_groups(cfg, meta.warp_lanes, meta.warp_size);
     for (uint32_t w = 0; w < nwarps; ++w) {
         cpusim_warp_ctx& c = *ctxs.at(w);
         c.params = params;

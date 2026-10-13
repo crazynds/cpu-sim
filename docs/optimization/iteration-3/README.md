@@ -13,6 +13,7 @@ The third round: it started with stability tests that require the same bits in a
 | 29 | [The stress suite](29-stress-suite.md) | 631 cases checked against the GPU: from 174 passing to 629, what broke and why, and the slow cases left for later |
 | 30 | [Launches and the slow cases](30-launches-and-hot-spots.md) | An empty kernel from 42 us to 1.7 us; atomics merged per warp; against OpenMP, 335 of 541 cases faster (233 before) |
 | 31 | [Micro-optimizations and 32-bit gathers](31-gathers-and-scatters.md) | Instruction order and masks do not matter with SMT; addresses recomputed where used and 32-bit gather indices: bitonic sort 1.18x |
+| 32 | [The warp size](32-warp-size.md) | `CPUSIM_WARP_SIZE=16/32/64`; blocks smaller than a warp in fewer lanes (10 to 46% faster) |
 
 ## Tensor core results at the end of the iteration
 

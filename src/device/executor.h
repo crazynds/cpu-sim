@@ -101,7 +101,7 @@ public:
     // and other launches running at the same time (streams).
 
     // Per-call contexts for one block: thread index of every lane, lane masks.
-    static CtxArray make_groups(const LaunchConfig& cfg, uint32_t lanes);
+    static CtxArray make_groups(const LaunchConfig& cfg, uint32_t lanes, uint32_t warp_size);
 
     size_t workers() const { return threads_.size(); }
     // Pairs of SMT siblings among the workers (0: no cooperative launches).

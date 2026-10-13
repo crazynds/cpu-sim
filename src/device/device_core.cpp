@@ -425,18 +425,19 @@ Error DeviceCore::get_function(uint32_t id, uint64_t module, const std::string& 
     Context::FunctionInfo info;
     info.profiled = reinterpret_cast<uint64_t>(prof);
     info.meta = *meta;
-    for (int i = 0; i < 4; ++i)
+    const uint32_t two_warps = 2 * meta->warp_size;  // the narrowest wide variant
+    for (int i = 0; i < 5; ++i)
         if (meta->flags & (1u << (CPUSIM_META_WIDE_SHIFT + i)))
             info.wide[i] = reinterpret_cast<uint64_t>(
-                dlsym(handle, ("__cpusim_entry" + std::to_string(64 << i) + "_" + name).c_str()));
+                dlsym(handle, ("__cpusim_entry" + std::to_string(two_warps << i) + "_" + name).c_str()));
     for (int i = 0; i < 2; ++i)
         if (meta->flags & (1u << (CPUSIM_META_SUSP_SHIFT + i)))
             info.susp[i] = reinterpret_cast<uint64_t>(
-                dlsym(handle, ("__cpusim_entry" + std::to_string(64 << i) + "s_" + name).c_str()));
-    for (int i = 0; i < 4; ++i)
+                dlsym(handle, ("__cpusim_entry" + std::to_string(two_warps << i) + "s_" + name).c_str()));
+    for (int i = 0; i < 5; ++i)
         if (meta->flags & (1u << (CPUSIM_META_COOP_SHIFT + i)))
             info.coop[i] = reinterpret_cast<uint64_t>(
-                dlsym(handle, ("__cpusim_entry" + std::to_string(64 << i) + "c_" + name).c_str()));
+                dlsym(handle, ("__cpusim_entry" + std::to_string(two_warps << i) + "c_" + name).c_str()));
     if (meta->flags & CPUSIM_META_BLOCK_FN)
         info.block = reinterpret_cast<uint64_t>(dlsym(handle, ("__cpusim_block_" + name).c_str()));
     it->second.functions[*function] = info;
@@ -447,7 +448,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
                          size_t param_bytes, LaunchResult* result) {
     uint64_t entry = function;
     uint64_t block_fn = 0;
-    uint32_t lanes = CPUSIM_WARP_SIZE;
+    uint32_t lanes = 0;  // the warp entry's (meta.warp_lanes) unless a wider variant is picked
     uint64_t tuning_key = 0;
     std::vector<Trial> trials;  // width tuning inside this launch
     int output_fd = 1;
@@ -462,6 +463,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
         auto fn = it->second.functions.find(function);
         if (fn == it->second.functions.end()) return Error::InvalidDeviceFunction;
         meta = fn->second.meta;
+        lanes = meta.warp_lanes;
         ++it->second.running;
         output_fd = it->second.output_fd;
         // The span of the allocations of 2 GiB or more, in VRAM and in the
@@ -492,7 +494,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
             // Opt-in: measured slower than per-warp calls, and it does not use
             // barrier_pass (the last warp to arrive still suspends).
             static const bool use_block = std::getenv("CPUSIM_BLOCK_FN") != nullptr;
-            if (lanes == CPUSIM_WARP_SIZE && use_block) block_fn = fn->second.block;
+            if (lanes == meta.warp_lanes && use_block) block_fn = fn->second.block;
         }
     }
     struct Running {  // the launch counts as running until it returns
@@ -556,7 +558,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
             auto run = [&](uint64_t fn_entry, uint32_t w, uint64_t first, uint64_t last, uint64_t* busy) {
                 if (fault.signal) return;
                 executor_->run(reinterpret_cast<cpusim_entry_fn>(fn_entry), w & 0xffff,
-                               w == CPUSIM_WARP_SIZE || (w & kSuspend), meta, run_cfg, aligned,
+                               w == meta.warp_lanes || (w & kSuspend), meta, run_cfg, aligned,
                                cfg.profile ? result->counters : nullptr, reinterpret_cast<cpusim_block_fn>(block_fn),
                                (w & kCoop) != 0, first, last, busy, &fault, id);
             };
@@ -637,21 +639,23 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
     }();
     const uint64_t threads = uint64_t(cfg.block[0]) * cfg.block[1] * cfg.block[2];
     const bool barriers = fn.meta.flags & CPUSIM_META_HAS_BARRIERS;
+    const uint32_t warp = fn.meta.warp_lanes;     // the warp entry
+    const uint32_t two = 2 * fn.meta.warp_size;   // the narrowest wide variant
     auto entry_for = [&](uint32_t w) -> uint64_t {
-        if (w == CPUSIM_WARP_SIZE) return *entry;
+        if (w == warp) return *entry;
         for (int i = 0; i < 2; ++i)
-            if ((64u << i | kSuspend) == w) return fn.susp[i];
-        for (int i = 0; i < 4; ++i)
-            if ((64u << i | kCoop) == w) return fn.coop[i];
-        for (int i = 0; i < 4; ++i)
-            if (64u << i == w) return fn.wide[i];
+            if ((two << i | kSuspend) == w) return fn.susp[i];
+        for (int i = 0; i < 5; ++i)
+            if ((two << i | kCoop) == w) return fn.coop[i];
+        for (int i = 0; i < 5; ++i)
+            if (two << i == w) return fn.wide[i];
         return 0;
     };
-    std::vector<uint32_t> valid{CPUSIM_WARP_SIZE};
+    std::vector<uint32_t> valid{warp};
     for (int i = 0; i < 2; ++i)
-        if (fn.susp[i] && (64u << i) < threads) valid.push_back(64u << i | kSuspend);
-    for (int i = 0; i < 4; ++i) {
-        uint32_t w = 64u << i;
+        if (fn.susp[i] && (two << i) < threads) valid.push_back(two << i | kSuspend);
+    for (int i = 0; i < 5; ++i) {
+        uint32_t w = two << i;
         if (!fn.wide[i]) continue;
         if (barriers) {
             if (threads <= w) {
@@ -664,14 +668,14 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
     }
     // Half the block on each SMT sibling: blocks of w+1 to 2w threads.
     if (barriers && executor_->pairs())
-        for (int i = 0; i < 4; ++i)
-            if (fn.coop[i] && threads > (64u << i) && threads <= (128u << i)) valid.push_back(64u << i | kCoop);
-    // With barriers, the wide variants come first: the 32-lane one, which
+        for (int i = 0; i < 5; ++i)
+            if (fn.coop[i] && threads > (two << i) && threads <= (2 * two << i)) valid.push_back(two << i | kCoop);
+    // With barriers, the wide variants come first: the warp entry, which
     // suspends at every barrier, has been the slowest every time we measured
     // (matmul_tiled, scan, heat2d, fdtd3d), and a program too short for the
     // measurement to finish keeps running the first candidates.
-    if (barriers) std::stable_sort(valid.begin(), valid.end(), [](uint32_t a, uint32_t b) {
-        auto rank = [](uint32_t w) { return w == CPUSIM_WARP_SIZE ? 3 : (w & kSuspend) ? 2 : (w & kCoop) ? 1 : 0; };
+    if (barriers) std::stable_sort(valid.begin(), valid.end(), [&](uint32_t a, uint32_t b) {
+        auto rank = [&](uint32_t w) { return w == warp ? 3 : (w & kSuspend) ? 2 : (w & kCoop) ? 1 : 0; };
         return rank(a) < rank(b) || (rank(a) == rank(b) && (a & 0xffff) > (b & 0xffff));
     });
     // CPUSIM_LANES=<n>, or <n>s for a suspending variant, <n>c for a cooperative one.
@@ -681,9 +685,9 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
                 *entry = entry_for(w);
                 return w;
             }
-        return CPUSIM_WARP_SIZE;
+        return warp;
     }
-    if (valid.size() == 1) return CPUSIM_WARP_SIZE;
+    if (valid.size() == 1) return warp;
 
     uint64_t key = (uint64_t(cfg.block[0]) << 40) ^ (uint64_t(cfg.block[1]) << 20) ^ cfg.block[2];
     Context::Tuning& t = fn.tuning[key];

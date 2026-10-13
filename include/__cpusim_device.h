@@ -68,7 +68,19 @@ extern const __device__ __cpusim_threadIdx_t threadIdx;
 extern const __device__ __cpusim_blockIdx_t blockIdx;
 extern const __device__ __cpusim_blockDim_t blockDim;
 extern const __device__ __cpusim_gridDim_t gridDim;
-static constexpr int warpSize = 32;
+/* Threads per warp: 32 as in CUDA, or 16 or 64 when the program is built
+ * with CPUSIM_WARP_SIZE (cucc passes it here). */
+#ifndef __CPUSIM_WARP_SIZE__
+#define __CPUSIM_WARP_SIZE__ 32
+#endif
+static_assert(__CPUSIM_WARP_SIZE__ == 16 || __CPUSIM_WARP_SIZE__ == 32 || __CPUSIM_WARP_SIZE__ == 64,
+              "CPUSIM_WARP_SIZE must be 16, 32 or 64");
+static constexpr int warpSize = __CPUSIM_WARP_SIZE__;
+#ifdef __CUDA_ARCH__
+/* Tells cpusim-devc (and the JIT, which compiles the same bitcode) the warp
+ * size the code was written against; it removes the variable. */
+extern "C" __device__ const int __cpusim_warp_size = __CPUSIM_WARP_SIZE__;
+#endif
 
 /* min/max: CUDA declares integer and floating point overloads usable on both sides. */
 #define __CPUSIM_MINMAX(T)                                                                 \
@@ -241,16 +253,24 @@ __CPUSIM_DEV double __dadd_rn(double x, double y) { return x + y; }
 __CPUSIM_DEV double __dmul_rn(double x, double y) { return x * y; }
 __CPUSIM_DEV double __fma_rn(double x, double y, double z) { return __builtin_fma(x, y, z); }
 
-/* Warp-level operations. A warp's 32 threads are 32 consecutive lanes of the
- * same vectors and run in lockstep, so everything here sits on two
+/* Warp-level operations. A warp's threads (warpSize) are consecutive lanes
+ * of the same vectors and run in lockstep, so everything here sits on two
  * primitives the SIMT compiler lowers:
- *   __cpusim_shfl(v, src): v of lane `src` (0..31) of the caller's warp
- *                           (a permute inside each 32-lane segment);
+ *   __cpusim_shfl(v, src): v of lane `src` (0..warpSize-1) of the caller's
+ *                           warp (a permute inside each warp's lanes);
  *   __cpusim_ballot(p):     bit i set if lane i of the warp is active here
- *                           and p != 0 (the active mask at this point).
+ *                           and p != 0 (the active mask at this point); 64
+ *                           bits, for warps of 64.
+ * CUDA's masks are 32-bit (unsigned): with warps of 64, __ballot_sync and
+ * __activemask hold lanes 0..31 only, and a mask of 0xffffffff means the
+ * whole warp; __any, __all, __uni and cooperative groups use all 64 lanes.
  * __syncwarp is a no-op: the lanes of a warp never drift apart. */
 extern "C" __device__ __attribute__((convergent)) int __cpusim_shfl(int v, int src_lane);
-extern "C" __device__ __attribute__((convergent)) unsigned __cpusim_ballot(int pred);
+extern "C" __device__ __attribute__((convergent)) unsigned long long __cpusim_ballot(int pred);
+/* The lanes of a CUDA mask: 0xffffffff is the whole warp, whatever its size. */
+static __device__ __forceinline__ unsigned long long __cpusim_lanes(unsigned mask) {
+    return mask == 0xffffffffu ? ~0ull : (unsigned long long)mask;
+}
 
 __CPUSIM_DEV unsigned __cpusim_laneid() { return __nvvm_read_ptx_sreg_laneid(); }
 
@@ -299,32 +319,36 @@ __CPUSIM_DEV T __shfl_down(T var, unsigned int delta, int width = warpSize) {
 template <typename T>
 __CPUSIM_DEV T __shfl_xor(T var, int laneMask, int width = warpSize) { return __shfl_xor_sync(0xffffffffu, var, laneMask, width); }
 
-__CPUSIM_DEV unsigned __activemask() { return __cpusim_ballot(1); }
-__CPUSIM_DEV unsigned __ballot_sync(unsigned mask, int pred) { return __cpusim_ballot(pred) & mask; }
-__CPUSIM_DEV int __any_sync(unsigned mask, int pred) { return __ballot_sync(mask, pred) != 0; }
-__CPUSIM_DEV int __all_sync(unsigned mask, int pred) { return __ballot_sync(mask, !pred) == 0; }
+__CPUSIM_DEV unsigned __activemask() { return (unsigned)__cpusim_ballot(1); }
+__CPUSIM_DEV unsigned __ballot_sync(unsigned mask, int pred) { return (unsigned)__cpusim_ballot(pred) & mask; }
+__CPUSIM_DEV int __any_sync(unsigned mask, int pred) { return (__cpusim_ballot(pred) & __cpusim_lanes(mask)) != 0; }
+__CPUSIM_DEV int __all_sync(unsigned mask, int pred) { return (__cpusim_ballot(!pred) & __cpusim_lanes(mask)) == 0; }
 __CPUSIM_DEV int __uni_sync(unsigned mask, int pred) {
-    unsigned b = __ballot_sync(mask, pred);
-    return b == 0 || b == (__activemask() & mask);
+    unsigned long long m = __cpusim_lanes(mask), b = __cpusim_ballot(pred) & m;
+    return b == 0 || b == (__cpusim_ballot(1) & m);
 }
-__CPUSIM_DEV unsigned __ballot(int pred) { return __cpusim_ballot(pred); }
+__CPUSIM_DEV unsigned __ballot(int pred) { return (unsigned)__cpusim_ballot(pred); }
 __CPUSIM_DEV int __any(int pred) { return __cpusim_ballot(pred) != 0; }
 __CPUSIM_DEV int __all(int pred) { return __cpusim_ballot(!pred) == 0; }
 __CPUSIM_DEV void __syncwarp(unsigned mask = 0xffffffffu) {}
 
-/* Lanes of the warp holding the same value. */
+/* Lanes of the warp holding the same value (all of them, as 64 bits). */
+template <typename T>
+__CPUSIM_DEV unsigned long long __cpusim_match_any(unsigned mask, T value) {
+    unsigned long long r = 0;
+#pragma unroll
+    for (int i = 0; i < warpSize; ++i) r |= (unsigned long long)(__shfl_sync(mask, value, i) == value) << i;
+    return r & __cpusim_ballot(1) & __cpusim_lanes(mask);
+}
 template <typename T>
 __CPUSIM_DEV unsigned __match_any_sync(unsigned mask, T value) {
-    unsigned r = 0;
-#pragma unroll
-    for (int i = 0; i < 32; ++i) r |= (unsigned)(__shfl_sync(mask, value, i) == value) << i;
-    return r & __activemask() & mask;
+    return (unsigned)__cpusim_match_any(mask, value);
 }
 template <typename T>
 __CPUSIM_DEV unsigned __match_all_sync(unsigned mask, T value, int* pred) {
-    unsigned want = __activemask() & mask;
-    *pred = __match_any_sync(mask, value) == want;
-    return *pred ? want : 0;
+    unsigned long long want = __cpusim_ballot(1) & __cpusim_lanes(mask);
+    *pred = __cpusim_match_any(mask, value) == want;
+    return *pred ? (unsigned)want : 0;
 }
 
 /* Warp reductions (sm_80): every lane of `mask` gets the result. */
@@ -332,8 +356,9 @@ __CPUSIM_DEV unsigned __match_all_sync(unsigned mask, T value, int* pred) {
  * once (the others hold nothing of the reduction). */
 #define __CPUSIM_REDUCE(NAME, T, OP)                                    \
     __CPUSIM_DEV T __reduce_##NAME##_sync(unsigned mask, T v) {         \
-        if (mask == 0xffffffffu) {                                      \
-            for (int o = 16; o > 0; o >>= 1) {                          \
+        if (mask == 0xffffffffu ||                                      \
+            (warpSize < 32 && mask == (1u << warpSize) - 1u)) {         \
+            for (int o = warpSize / 2; o > 0; o >>= 1) {                \
                 T w = __shfl_xor_sync(mask, v, o);                      \
                 v = OP;                                                 \
             }                                                           \
@@ -341,7 +366,7 @@ __CPUSIM_DEV unsigned __match_all_sync(unsigned mask, T value, int* pred) {
         }                                                               \
         T mine = v;                                                     \
         bool first = true;                                              \
-        for (int src = 0; src < 32; ++src) {                            \
+        for (int src = 0; src < (warpSize < 32 ? warpSize : 32); ++src) { \
             T w = __shfl_sync(mask, mine, src);                         \
             if (!(mask >> src & 1)) continue;                           \
             if (first) v = w, first = false;                           \

@@ -144,6 +144,14 @@ if(TARGET cpusim-devc)
     # JIT-compiles them): more time.
     set_tests_properties(cuda_wmma cuda_wmma_shapes cuda_wmma_subbyte PROPERTIES
         ENVIRONMENT "FEATURE_ENVS=CPUSIM_TENSOR=int8 CPUSIM_TENSOR=fp16" TIMEOUT 240)
+    # Warps of 16, 32 and 64 threads (CPUSIM_WARP_SIZE at compile time).
+    foreach(warp IN ITEMS 16 32 64)
+        add_test(NAME cuda_warp_size_${warp}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_feature_test.sh ${CMAKE_BINARY_DIR}/cucc
+                    $<TARGET_FILE:cpusimd> ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/warp_size.cu)
+        set_tests_properties(cuda_warp_size_${warp} PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL|LLVM ERROR"
+                             ENVIRONMENT "CPUSIM_WARP_SIZE=${warp}" LABELS features TIMEOUT 120)
+    endforeach()
     # Compares durations (concurrent streams): alone, or other tests' load
     # decides the result.
     set_tests_properties(cuda_async PROPERTIES RUN_SERIAL TRUE)

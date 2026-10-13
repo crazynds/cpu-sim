@@ -53,6 +53,13 @@ Runtime& runtime() {
 }
 
 thread_local cudaError_t last_error = cudaSuccess;
+// Threads per warp the program's kernels were compiled for (CPUSIM_WARP_SIZE
+// at compile time, in each module's manifest): what warpSize reports.
+std::atomic<int> program_warp_size{0};
+int warp_size() {
+    int w = program_warp_size.load();
+    return w ? w : CPUSIM_WARP_SIZE;
+}
 
 cudaError_t record(Error e) {
     auto err = static_cast<cudaError_t>(e);
@@ -228,8 +235,8 @@ void Profiler::report() {
                      human(double(c[CPUSIM_CNT_STORES]), "").c_str(), human(double(c[CPUSIM_CNT_LOAD_BYTES]), "B").c_str(),
                      human(double(c[CPUSIM_CNT_STORE_BYTES]), "B").c_str());
         std::fprintf(stderr, "  branches        %s\n", human(double(c[CPUSIM_CNT_BRANCHES]), "").c_str());
-        std::fprintf(stderr, "  SIMD efficiency %.1f%% (%.1f of 32 lanes active per block executed)\n",
-                     100.0 * lanes / CPUSIM_WARP_SIZE, lanes);
+        std::fprintf(stderr, "  SIMD efficiency %.1f%% (%.1f of %d lanes active per block executed)\n",
+                     100.0 * lanes / warp_size(), lanes, warp_size());
         if (secs > 0) {
             std::fprintf(stderr, "  throughput      %s, %s, %s\n", human(flops / secs, "FLOP/s").c_str(),
                          human(double(c[CPUSIM_CNT_INT_OPS]) / secs, "IOP/s").c_str(),
@@ -524,6 +531,14 @@ bool parse_manifest(const char* text, size_t size, Module* m) {
     // (sm=NN: the compute capability its tensor core types need).
     std::string line;
     std::getline(in, line);
+    // warp=N: the warp size of the module; every module of a program must agree.
+    if (auto pos = line.find("warp="); pos != std::string::npos) {
+        int w = std::atoi(line.c_str() + pos + 5), expected = 0;
+        if (!program_warp_size.compare_exchange_strong(expected, w) && expected != w) {
+            std::fprintf(stderr, "cpusim: kernels compiled with warps of %d and of %d in one program\n", expected, w);
+            return false;
+        }
+    }
     while (std::getline(in, line)) {
         std::istringstream ls(line);
         if (!(ls >> word)) continue;
@@ -594,7 +609,8 @@ cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int dev) {
     std::memcpy(prop->uuid.bytes, p.uuid, sizeof(prop->uuid.bytes));
 #define COPY(f) prop->f = p.f
 #define COPY3(f) COPY(f[0]), COPY(f[1]), COPY(f[2])
-    COPY(totalGlobalMem); COPY(sharedMemPerBlock); COPY(regsPerBlock); COPY(warpSize); COPY(memPitch);
+    COPY(totalGlobalMem); COPY(sharedMemPerBlock); COPY(regsPerBlock); COPY(memPitch);
+    prop->warpSize = warp_size();
     COPY(maxThreadsPerBlock); COPY3(maxThreadsDim); COPY3(maxGridSize); COPY(totalConstMem); COPY(major);
     COPY(minor); COPY(textureAlignment); COPY(texturePitchAlignment); COPY(multiProcessorCount); COPY(integrated);
     COPY(canMapHostMemory); COPY(concurrentKernels); COPY(ECCEnabled); COPY(pciBusID); COPY(pciDeviceID);
@@ -636,7 +652,7 @@ cudaError_t cudaDeviceGetAttribute(int* value, enum cudaDeviceAttr attr, int dev
         case cudaDevAttrMaxGridDimZ: *value = int(p.maxGridSize[2]); break;
         case cudaDevAttrMaxSharedMemoryPerBlock: *value = int(p.sharedMemPerBlock); break;
         case cudaDevAttrTotalConstantMemory: *value = int(p.totalConstMem); break;
-        case cudaDevAttrWarpSize: *value = int(p.warpSize); break;
+        case cudaDevAttrWarpSize: *value = warp_size(); break;
         case cudaDevAttrMaxPitch: *value = int(p.memPitch); break;
         case cudaDevAttrMaxRegistersPerBlock: *value = int(p.regsPerBlock); break;
         case cudaDevAttrClockRate: *value = int(p.clockRate); break;

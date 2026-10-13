@@ -23,8 +23,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CPUSIM_KERNEL_ABI 12
-#define CPUSIM_WARP_SIZE 32   // CUDA's warp: lane ids, warp intrinsics
+#define CPUSIM_KERNEL_ABI 13
+#define CPUSIM_WARP_SIZE 32   // CUDA's warp, the default (cpusim_kernel_meta.warp_size has the module's)
 #define CPUSIM_MAX_LANES 512  // widest group of threads one entry call runs
 
 // Besides the 32-lane entry, a module has "block-wide" variants
@@ -123,9 +123,10 @@ enum cpusim_counter {
 };
 
 #define CPUSIM_META_HAS_BARRIERS 1u
-#define CPUSIM_META_WIDE_SHIFT 8   // bit (8 + i): block-wide variant with 64 << i lanes exists
-#define CPUSIM_META_SUSP_SHIFT 16  // bit (16 + i): suspending variant __cpusim_entry<64 << i>s_ exists
-#define CPUSIM_META_COOP_SHIFT 24  // bit (24 + i): cooperative variant __cpusim_entry<64 << i>c_ exists
+// Variant bits, with W = warp_size (32: the 64..512-lane variants):
+#define CPUSIM_META_WIDE_SHIFT 8   // bit (8 + i): block-wide variant with 2W << i lanes exists
+#define CPUSIM_META_SUSP_SHIFT 16  // bit (16 + i): suspending variant __cpusim_entry<2W << i>s_ exists (i < 2)
+#define CPUSIM_META_COOP_SHIFT 24  // bit (24 + i): cooperative variant __cpusim_entry<2W << i>c_ exists
 #define CPUSIM_META_BLOCK_FN 2u    // __cpusim_block_<name> exists (see below)
 #define CPUSIM_META_YIELDS 4u      // the 32-lane entry may return CPUSIM_YIELD (no barrier pass-through)
 
@@ -140,7 +141,12 @@ typedef struct cpusim_kernel_meta {
     uint32_t frame_bytes;   // per 32-lane warp; 0 without barriers
     uint32_t shared_bytes;  // static __shared__ memory per block
     uint32_t flags;         // CPUSIM_META_*
-    uint32_t frame_bytes_wide[2];  // per group, for the suspending 64- and 128-lane variants
+    uint32_t frame_bytes_wide[2];  // per group, for the suspending variants of 2 and 4 warps
+    // Threads per warp the code was written against (16, 32 or 64), and the
+    // lanes of __cpusim_entry_ (the warp size, or fewer for a block smaller
+    // than a warp: the lanes of threads that do not exist are left out).
+    uint32_t warp_size;
+    uint32_t warp_lanes;
 } cpusim_kernel_meta;
 
 // Distance between consecutive contexts or frames of one block: an odd number

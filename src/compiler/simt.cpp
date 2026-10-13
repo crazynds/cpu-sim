@@ -354,7 +354,7 @@ private:
     // entries share one: the larger).
     void note_frame_size() {
         uint64_t bytes = alignTo(cache_end_, 64);
-        uint64_t& slot = W == CPUSIM_WARP_SIZE ? k_.frame_bytes : k_.frame_bytes_wide[W == 64 ? 0 : 1];
+        uint64_t& slot = W <= k_.warp_size ? k_.frame_bytes : k_.frame_bytes_wide[W == 2 * k_.warp_size ? 0 : 1];
         slot = std::max(slot, bytes);
     }
     Value* clone_invariant(Value* v, DenseMap<Value*, Value*>& memo);
@@ -2111,7 +2111,7 @@ bool WarpBuilder::emit_call(CallInst* call, Value* mask) {
     if (acc) acc->addIncoming(PoisonValue::get(rt), pre);
     Value* bits = b_.CreateBitCast(rem, b_.getIntNTy(W));
     Value* first = b_.CreateBinaryIntrinsic(Intrinsic::cttz, bits, b_.getTrue());
-    Value* t = b_.CreateExtractElement(tv, b_.CreateTrunc(first, b_.getInt32Ty()));
+    Value* t = b_.CreateExtractElement(tv, b_.CreateZExtOrTrunc(first, b_.getInt32Ty()));
     Value* same = b_.CreateAnd(rem, b_.CreateICmpEQ(tv, b_.CreateVectorSplat(W, t)));
     Value* r = dispatch(t, same);
     Value* acc2 = acc ? b_.CreateSelect(same, r, acc) : nullptr;
@@ -2235,7 +2235,7 @@ bool WarpBuilder::emit_atomic(Instruction& inst, Value* mask) {
         PHINode* acc = b_.CreatePHI(rt, 2, "atomic.acc");
         acc->addIncoming(PoisonValue::get(rt), pre);
         Value* first = b_.CreateBinaryIntrinsic(Intrinsic::cttz, b_.CreateBitCast(rem, b_.getIntNTy(W)), b_.getTrue());
-        Value* p = b_.CreateExtractElement(ptrs, b_.CreateTrunc(first, b_.getInt32Ty()));
+        Value* p = b_.CreateExtractElement(ptrs, b_.CreateZExtOrTrunc(first, b_.getInt32Ty()));
         Value* same = b_.CreateAnd(rem, b_.CreateICmpEQ(ptrs, b_.CreateVectorSplat(W, p)));
         Value* r = emit_uniform_rmw(rmw, same, p);
         Value* acc2 = inst.use_empty() ? static_cast<Value*>(acc) : b_.CreateSelect(same, r, acc);
@@ -2271,7 +2271,7 @@ bool WarpBuilder::emit_atomic(Instruction& inst, Value* mask) {
     b_.SetInsertPoint(loop);
     PHINode* rem = b_.CreatePHI(bits->getType(), 2, "atomic.rem");
     rem->addIncoming(bits, pre);
-    Value* lane = b_.CreateTrunc(b_.CreateBinaryIntrinsic(Intrinsic::cttz, rem, b_.getTrue()), b_.getInt32Ty());
+    Value* lane = b_.CreateZExtOrTrunc(b_.CreateBinaryIntrinsic(Intrinsic::cttz, rem, b_.getTrue()), b_.getInt32Ty());
     Instruction* one = inst.clone();
     for (Use& u : one->operands())
         u.set(uni_->is_varying(u.get()) ? b_.CreateExtractElement(vector(u.get()), lane) : scalar(u.get()));
@@ -2321,13 +2321,13 @@ void WarpBuilder::emit_specialized_tid() {
         spec_lane_mask_ = ConstantVector::get(m);
         return;
     }
-    // base = warp_index * 32, a multiple of W here (groups are W lanes).
+    // base = warp_index * warp size, a multiple of W here (groups are W lanes).
     Value* warp = b_.CreateAlignedLoad(i32, b_.CreateConstInBoundsGEP1_64(b_.getInt8Ty(), ctx_arg_, CPUSIM_CTX_WARP_INDEX),
                                        Align(4), "warp");
     cast<Instruction>(warp)->setMetadata(
         LLVMContext::MD_range, MDNode::get(ctx_, {ConstantAsMetadata::get(b_.getInt32(0)),
-                                                  ConstantAsMetadata::get(b_.getInt32((threads + 31) / 32))}));
-    Value* base = b_.CreateMul(warp, b_.getInt32(CPUSIM_WARP_SIZE), "base", true, true);
+                                                  ConstantAsMetadata::get(b_.getInt32((threads + k_.warp_size - 1) / k_.warp_size))}));
+    Value* base = b_.CreateMul(warp, b_.getInt32(k_.warp_size), "base", true, true);
     auto* v = FixedVectorType::get(i32, W);
     if (W % bx == 0 && (bx * by) % W == 0) {
         Value* q = b_.CreateUDiv(base, b_.getInt32(bx));  // first row of the group
@@ -2446,30 +2446,50 @@ Value* WarpBuilder::emit_uniform_division(BinaryOperator* bin) {
 // segment it is in). One vpermi2d per 16 lanes, picking from the warp's two
 // halves.
 Value* WarpBuilder::emit_shfl(Value* v, Value* src) {
+    // Each warp's lanes are 1, 2 or 4 vectors of 16 (S of them present: the
+    // warp size, or fewer when the block is smaller than a warp; a source lane
+    // that does not exist reads the caller's own value).
     Function* perm = Intrinsic::getDeclaration(&m_, Intrinsic::x86_avx512_vpermi2var_d_512);
     auto slice = [&](Value* x, unsigned first) {
         SmallVector<int, 16> idx;
         for (unsigned i = 0; i < 16; ++i) idx.push_back(int(first + i));
         return b_.CreateShuffleVector(x, idx);
     };
-    Value* five_bits = ConstantVector::getSplat(ElementCount::getFixed(16), b_.getInt32(31));
+    auto splat = [&](uint32_t c) { return ConstantVector::getSplat(ElementCount::getFixed(16), b_.getInt32(c)); };
+    const unsigned L = k_.warp_size, S = std::min(L, W);
     std::vector<Value*> parts;
-    for (unsigned w = 0; w < W; w += CPUSIM_WARP_SIZE) {
-        Value* lo = slice(v, w);
-        Value* hi = slice(v, w + 16);
-        for (unsigned h = 0; h < 2; ++h)
-            parts.push_back(b_.CreateCall(perm, {lo, b_.CreateAnd(slice(src, w + 16 * h), five_bits), hi}));
+    for (unsigned w = 0; w < W; w += S) {
+        std::vector<Value*> c;
+        for (unsigned i = 0; i < S; i += 16) c.push_back(slice(v, w + i));
+        for (unsigned h = 0; h < S / 16; ++h) {
+            Value* idx = b_.CreateAnd(slice(src, w + 16 * h), splat(L - 1));
+            Value* r;
+            if (S == 16) {
+                r = b_.CreateCall(perm, {c[0], idx, c[0]});
+            } else if (S == 32) {
+                r = b_.CreateCall(perm, {c[0], idx, c[1]});
+            } else {  // 64: two pairs, then bit 5 of the index picks one
+                Value* lo = b_.CreateCall(perm, {c[0], idx, c[1]});
+                Value* hi = b_.CreateCall(perm, {c[2], idx, c[3]});
+                Value* upper = b_.CreateICmpNE(b_.CreateAnd(idx, splat(32)), splat(0));
+                r = b_.CreateSelect(upper, hi, lo);
+            }
+            if (S < L) r = b_.CreateSelect(b_.CreateICmpUGE(idx, splat(S)), c[h], r);
+            parts.push_back(r);
+        }
     }
     return concat_chunks(parts);
 }
 
-// __cpusim_ballot: every lane of a warp gets the 32-bit mask of its warp's
+// __cpusim_ballot: every lane of a warp gets the 64-bit mask of its warp's
 // lanes that are active here with pred != 0.
 Value* WarpBuilder::emit_ballot(Value* pred, Value* mask) {
+    const unsigned S = std::min(k_.warp_size, W);  // a warp's lanes present in the vector
     Value* bits = b_.CreateAnd(b_.CreateICmpNE(pred, Constant::getNullValue(pred->getType())), mask);
-    Value* words = b_.CreateBitCast(bits, FixedVectorType::get(b_.getInt32Ty(), W / CPUSIM_WARP_SIZE));
+    Value* words = b_.CreateBitCast(bits, FixedVectorType::get(b_.getIntNTy(S), W / S));
+    words = b_.CreateZExt(words, FixedVectorType::get(b_.getInt64Ty(), W / S));
     SmallVector<int, 64> idx;
-    for (unsigned l = 0; l < W; ++l) idx.push_back(int(l / CPUSIM_WARP_SIZE));
+    for (unsigned l = 0; l < W; ++l) idx.push_back(int(l / S));
     return b_.CreateShuffleVector(words, idx, "ballot");
 }
 
@@ -2943,7 +2963,7 @@ void WarpBuilder::emit_prologue() {
     w_ = fn_ ? fn_
              : Function::Create(FunctionType::get(i32, {ptr}, false), GlobalValue::ExternalLinkage,
                                 (profile_ ? std::string("__cpusim_prof_")
-                                 : W == CPUSIM_WARP_SIZE ? std::string("__cpusim_entry_")
+                                 : W <= k_.warp_size ? std::string("__cpusim_entry_")
                                                          : "__cpusim_entry" + std::to_string(W) +
                                                                (coop_ ? "c_" : block_wide_ ? "_" : "s_")) +
                                     k_.name,
@@ -2986,7 +3006,7 @@ void WarpBuilder::emit_prologue() {
         offset = alignTo(offset, align);
         Value* p = b_.CreateConstInBoundsGEP1_64(b_.getInt8Ty(), params, offset);
         scalar_map_[&arg] = byval ? p : b_.CreateAlignedLoad(t, p, Align(align), arg.getName());
-        if (!profile_ && W == CPUSIM_WARP_SIZE) k_.params.push_back({offset, size});
+        if (!profile_ && W <= k_.warp_size) k_.params.push_back({offset, size});
         offset += size;
     }
     if (!fn_) k_.param_bytes = offset;
@@ -3024,10 +3044,10 @@ void WarpBuilder::emit_prologue() {
     special_[(int)SpecialReg::NctaidX] = load_u32(CPUSIM_CTX_GRID_DIM, "nctaid.x");
     special_[(int)SpecialReg::NctaidY] = load_u32(CPUSIM_CTX_GRID_DIM + 4, "nctaid.y");
     special_[(int)SpecialReg::NctaidZ] = load_u32(CPUSIM_CTX_GRID_DIM + 8, "nctaid.z");
-    SmallVector<Constant*, 64> lanes;  // CUDA lane id: position inside the 32-thread warp
-    for (unsigned i = 0; i < W; ++i) lanes.push_back(b_.getInt32(i % CPUSIM_WARP_SIZE));
+    SmallVector<Constant*, 64> lanes;  // CUDA lane id: position inside the warp
+    for (unsigned i = 0; i < W; ++i) lanes.push_back(b_.getInt32(i % k_.warp_size));
     special_[(int)SpecialReg::LaneId] = ConstantVector::get(lanes);
-    special_[(int)SpecialReg::WarpSize] = b_.getInt32(CPUSIM_WARP_SIZE);
+    special_[(int)SpecialReg::WarpSize] = b_.getInt32(k_.warp_size);
     special_[(int)SpecialReg::SharedBase] = b_.CreateAlignedLoad(ptr, field(CPUSIM_CTX_SHARED), Align(8), "shared");
     Value* lane_mask = fn_ ? w_->getArg(1)
                        : spec_lane_mask_
@@ -3854,7 +3874,7 @@ bool WarpBuilder::run(std::string* error) {
     if (dispatch_) emit_dispatch();
     if (fn_) return true;
     if (profile_) k_.profiled = w_;
-    else if (W == CPUSIM_WARP_SIZE) k_.entry = w_;
+    else if (W <= k_.warp_size) k_.entry = w_;
     return true;
 }
 
@@ -3865,7 +3885,7 @@ bool build_warp_entry(Module& m, KernelInfo& kernel, Function& scalar, bool prof
     // Barriers are no-ops in a wide variant: the runtime only uses those when
     // the whole block fits in one call. (Kernels without barriers are free to
     // run any number of warps per call.)
-    WarpBuilder builder(m, kernel, scalar, profile, lanes, lanes > CPUSIM_WARP_SIZE && !suspending && !cooperative,
+    WarpBuilder builder(m, kernel, scalar, profile, lanes, lanes > kernel.warp_size && !suspending && !cooperative,
                         cooperative);
     if (!builder.run(error)) return false;
     // The functions it calls without inlining, and the ones those call.

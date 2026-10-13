@@ -736,7 +736,7 @@ void build_block_function(Module& m, KernelInfo& k) {
 
     b.SetInsertPoint(run);
     Value* c = b.CreateGEP(i8, ctxs, b.CreateMul(b.CreateZExt(w, Type::getInt64Ty(ctx)),
-                                                   b.getInt64(cpusim_stagger(cpusim_ctx_size(CPUSIM_WARP_SIZE)))));
+                                                   b.getInt64(cpusim_stagger(cpusim_ctx_size(k.warp_lanes)))));
     CallInst* call = b.CreateCall(k.entry, {c});
     Value* finished = b.CreateICmpEQ(call, b.getInt32(CPUSIM_EXIT));
     b.CreateStore(b.CreateZExt(finished, i8), done_w);
@@ -809,9 +809,21 @@ int main(int argc, char** argv) {
                                                                   CodeGenOptLevel::Aggressive));
     if (!tm) die("cannot create a target machine for " + opt.cpu);
 
+    // The warp size the code was compiled for: the device header leaves it in
+    // __cpusim_warp_size (CPUSIM_WARP_SIZE at compile time; 32 by default).
+    unsigned warp_size = 32;
+    if (GlobalVariable* g = m->getGlobalVariable("__cpusim_warp_size")) {
+        if (auto* c = dyn_cast_or_null<ConstantInt>(g->hasInitializer() ? g->getInitializer() : nullptr))
+            warp_size = unsigned(c->getZExtValue());
+        g->eraseFromParent();
+    }
+    if (warp_size != 16 && warp_size != 32 && warp_size != 64) die("warp size must be 16, 32 or 64");
+
     std::vector<KernelInfo> kernels = find_kernels(*m);
-    for (auto& k : kernels)
+    for (auto& k : kernels) {
         for (int i = 0; i < 3; ++i) k.spec_block[i] = opt.specialize[i];
+        k.warp_size = k.warp_lanes = warp_size;
+    }
     retarget(*m, tm.get(), kernels);
     lower_nvvm_atomics(*m);
     const std::string symbol_lines = lower_device_globals(*m);
@@ -852,7 +864,8 @@ int main(int argc, char** argv) {
     for (auto& k : kernels) k.spins = mark_spin_loops(*k.scalar);
     if (!opt.emit_scalar_ll.empty()) write_ll(*m, opt.emit_scalar_ll);
 
-    std::string manifest = "cpusim-module " + std::to_string(CPUSIM_KERNEL_ABI) + "\n" + symbol_lines;
+    std::string manifest = "cpusim-module " + std::to_string(CPUSIM_KERNEL_ABI) + " warp=" + std::to_string(warp_size) +
+                           "\n" + symbol_lines;
     int failures = 0;
     for (auto& k : kernels) {
         std::string why;
@@ -869,7 +882,7 @@ int main(int argc, char** argv) {
             Function* copy = CloneFunction(k.scalar, vmap);
             bool ok = cpusim::build_warp_entry(*m, k, *copy, profile, lanes, suspending, &why, cooperative);
             copy->eraseFromParent();
-            if (ok && k.spec_block[0] == 0 && lanes > 32) {
+            if (ok && k.spec_block[0] == 0 && lanes > k.warp_size) {
                 std::string name = "__cpusim_entry" + std::to_string(lanes) +
                                    (cooperative ? "c_" : suspending ? "s_" : "_") + k.name;
                 if (Function* f = m->getFunction(name); f && f->getInstructionCount() > kGenericBudget) {
@@ -927,25 +940,38 @@ int main(int argc, char** argv) {
         // Spinning kernels: one warp per call, as on a GPU (wide variants put
         // the waiting warp and the one it waits for in the same vector).
         const bool narrow = tensor || k.spins;
-        bool ok = build(false, 32) && (spec || build(true, 32));
-        // Wider variants: with barriers, a whole block per call makes them free
-        // (64..512 lanes); without, 2 or 4 warps per call give the core more
-        // independent work. The runtime measures which one wins.
-        for (unsigned i = 0; ok && i < (k.has_barriers ? 4u : 2u); ++i) {
-            if (!wanted(64u << i, true) || narrow) continue;
-            ok = build(false, 64u << i);
+        const unsigned L = k.warp_size;
+        if (tensor && L != 32) {
+            std::fprintf(stderr, "cpusim-devc: kernel %s: tensor cores (wmma) need warps of 32 threads, not %u\n",
+                         k.name.c_str(), L);
+            ++failures;
+            continue;
+        }
+        // A block smaller than a warp: the warp entry has only the lanes of
+        // threads that exist (16, or 32 of a warp of 64), with the warp's
+        // semantics (lane ids, ballots, shuffles) unchanged.
+        if (spec && !tensor)
+            while (k.warp_lanes > 16 && threads <= k.warp_lanes / 2) k.warp_lanes /= 2;
+        bool ok = build(false, k.warp_lanes) && (spec || build(true, k.warp_lanes));
+        // Wider variants (lanes 2L << i, L the warp size): with barriers, a
+        // whole block per call makes them free (up to 512 lanes); without, 2
+        // or 4 warps per call give the core more independent work. The
+        // runtime measures which one wins.
+        for (unsigned i = 0; ok && (2 * L << i) <= CPUSIM_MAX_LANES && (k.has_barriers || i < 2); ++i) {
+            if (!wanted(2 * L << i, true) || narrow) continue;
+            ok = build(false, 2 * L << i);
             if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_WIDE_SHIFT + i);
         }
         // Groups of 2 and 4 warps that still suspend at barriers: fewer switches.
         for (unsigned i = 0; ok && k.has_barriers && !narrow && i < 2; ++i) {
-            if (!wanted(64u << i, false)) continue;
-            ok = build(false, 64u << i, true);
+            if (!wanted(2 * L << i, false)) continue;
+            ok = build(false, 2 * L << i, true);
             if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_SUSP_SHIFT + i);
         }
         // Half a block per call, the two SMT siblings of a core together: for
         // blocks of L+1 to 2L threads.
-        for (unsigned i = 0; ok && k.has_barriers && !narrow && i < 4; ++i) {
-            const unsigned lanes = 64u << i;
+        for (unsigned i = 0; ok && k.has_barriers && !narrow && (2 * L << i) <= CPUSIM_MAX_LANES; ++i) {
+            const unsigned lanes = 2 * L << i;
             if (spec && !(threads > lanes && threads <= 2 * lanes)) continue;
             ok = build(false, lanes, false, true);
             if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_COOP_SHIFT + i);
@@ -955,13 +981,13 @@ int main(int argc, char** argv) {
             ++failures;
             continue;
         }
-        if (k.has_barriers) {
+        if (k.has_barriers && L == 32 && k.warp_lanes == 32) {  // opt-in (CPUSIM_BLOCK_FN), for warps of 32
             build_block_function(*m, k);
             k.wide_variants |= CPUSIM_META_BLOCK_FN;
         }
         // What the runtime needs to know about the kernel, readable with dlsym.
         auto* i32 = Type::getInt32Ty(ctx);
-        auto* meta_ty = StructType::get(ctx, {i32, i32, i32, i32, i32, i32});
+        auto* meta_ty = StructType::get(ctx, {i32, i32, i32, i32, i32, i32, i32, i32});
         new GlobalVariable(*m, meta_ty, true, GlobalValue::ExternalLinkage,
                            ConstantStruct::get(meta_ty, {ConstantInt::get(i32, CPUSIM_KERNEL_ABI),
                                                          ConstantInt::get(i32, k.frame_bytes),
@@ -970,7 +996,9 @@ int main(int argc, char** argv) {
                                                                                    (k.spins ? CPUSIM_META_YIELDS : 0) |
                                                                                    k.wide_variants),
                                                          ConstantInt::get(i32, k.frame_bytes_wide[0]),
-                                                         ConstantInt::get(i32, k.frame_bytes_wide[1])}),
+                                                         ConstantInt::get(i32, k.frame_bytes_wide[1]),
+                                                         ConstantInt::get(i32, k.warp_size),
+                                                         ConstantInt::get(i32, k.warp_lanes)}),
                            "__cpusim_meta_" + k.name);
         manifest += "kernel " + k.name + " " + std::to_string(k.param_bytes) + " " + std::to_string(k.params.size());
         for (const auto& p : k.params) manifest += " " + std::to_string(p.offset) + ":" + std::to_string(p.size);
@@ -1013,7 +1041,7 @@ int main(int argc, char** argv) {
     if (verifyModule(*m, &errs())) die("internal error: generated IR does not verify");
     for (Function& f : *m)
         if (!f.isDeclaration()) {
-            run_function_pipeline(f, tm.get(), "sroa,early-cse,instcombine");
+            run_function_pipeline(f, tm.get(), "sroa,early-cse,instcombine<no-verify-fixpoint>");
             if (refine_uniform_masks(f) && verifyFunction(f, &errs()))
                 die("internal error: IR does not verify after refining masks in " + f.getName().str());
         }

@@ -197,6 +197,16 @@ def launch_shapes(src, common, o, base):
     return sorted(shapes)[:MAX_SPECIALIZED]
 
 
+def warp_size():
+    """CPUSIM_WARP_SIZE: threads per warp the program is compiled for (16, 32
+    as in CUDA, or 64 as on AMD GPUs). Fixed at compile time: the kernels'
+    warpSize, lane ids, ballots and shuffles depend on it."""
+    w = os.environ.get("CPUSIM_WARP_SIZE", "32")
+    if w not in ("16", "32", "64"):
+        die("CPUSIM_WARP_SIZE must be 16, 32 or 64, not %r" % w)
+    return int(w)
+
+
 def run_quiet(cmd, o):
     """Like run(), but returns whether it worked instead of exiting."""
     if o.verbose:
@@ -221,7 +231,7 @@ def compile_cu(src, obj_out, o, tmp):
     # kernel is specialized; with "fast" the backend decides per basic block, so
     # the JIT and generic variants could round differently (tests/cuda/repro.cu).
     contract = ["-ffp-contract=on" if o.fmad else "-ffp-contract=off"]
-    common = CUDA_FLAGS + [o.std] + o.cpp + contract
+    common = CUDA_FLAGS + [o.std] + o.cpp + contract + ["-D__CPUSIM_WARP_SIZE__=%d" % warp_size()]
 
     # Device: per-thread IR, unoptimized but with full metadata (O2 front end, no passes).
     run([CLANG] + common + ["--cuda-device-only", "-O2", "-Xclang", "-disable-llvm-passes",

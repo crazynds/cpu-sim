@@ -607,7 +607,7 @@ void Executor::maybe_finish(Job* j) {
     done_cv_.notify_all();
 }
 
-CtxArray Executor::make_groups(const LaunchConfig& cfg, uint32_t lanes) {
+CtxArray Executor::make_groups(const LaunchConfig& cfg, uint32_t lanes, uint32_t warp_size) {
     // Lane -> thread index; the same for all blocks.
     const uint32_t bx = cfg.block[0], by = cfg.block[1], bz = cfg.block[2];
     const uint32_t threads = bx * by * bz;
@@ -618,7 +618,7 @@ CtxArray Executor::make_groups(const LaunchConfig& cfg, uint32_t lanes) {
     for (uint32_t g = 0; g < groups.count; ++g) {
         cpusim_warp_ctx* c = groups.at(g);
         c->lanes = lanes;
-        c->warp_index = g * lanes / CPUSIM_WARP_SIZE;
+        c->warp_index = g * lanes / warp_size;  // 0 for a block smaller than a warp
         uint32_t* tx = cpusim_ctx_tid(c, 0);
         uint32_t* ty = cpusim_ctx_tid(c, 1);
         uint32_t* tz = cpusim_ctx_tid(c, 2);
@@ -643,11 +643,11 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
                    const LaunchConfig& cfg, const uint8_t* params, uint64_t* counters, cpusim_block_fn block,
                    bool cooperative, uint64_t first, uint64_t last, uint64_t* busy_ns, KernelFault* fault,
                    uint32_t tag) {
-    CtxArray warps = make_groups(cfg, lanes);
+    CtxArray warps = make_groups(cfg, lanes, meta.warp_size);
     // Block-wide entries never suspend: no frames.
     uint32_t frame_bytes = 0;
     if (suspending)
-        frame_bytes = lanes == CPUSIM_WARP_SIZE ? meta.frame_bytes : meta.frame_bytes_wide[lanes == 64 ? 0 : 1];
+        frame_bytes = lanes == meta.warp_lanes ? meta.frame_bytes : meta.frame_bytes_wide[lanes == 2 * meta.warp_size ? 0 : 1];
 
     const uint64_t total = uint64_t(cfg.grid[0]) * cfg.grid[1] * cfg.grid[2];
     Job job;

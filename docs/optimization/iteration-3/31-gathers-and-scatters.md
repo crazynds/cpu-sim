@@ -75,4 +75,4 @@ Over all 104 cases: 31 at least 5% faster, 9 at least 5% slower (the worst, `fus
 - **A gather inside a window.** When the 16 indices fall within 32 consecutive elements (bitonic's strides below 16, a scan's first level, exchanges between neighbors), two aligned loads and a `vpermt2d` replace the gather: 7.3 cycles against 19.4 in a microbenchmark. A scatter has no such shortcut (it needs the inverse permutation).
 - **Width per region.** A loop with many live values could run as two 32-lane halves inside a 64-lane variant, instead of the whole kernel choosing one width; matmul shows the cost it would avoid (128 lanes loses to 64 by spills).
 
-Previous: [30](30-launches-and-hot-spots.md). Back to the [iteration 3 index](README.md).
+Previous: [30](30-launches-and-hot-spots.md). Next: [32](32-warp-size.md). Back to the [iteration 3 index](README.md).

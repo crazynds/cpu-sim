@@ -75,8 +75,9 @@ At the first launch of a block shape that the binary does not carry, the runtime
 
 ### 4.1 Warps and groups of lanes
 
-- **A warp is 32 threads semantically** (`warpSize == 32`, lane ids, warp intrinsics, `__activemask`), because a lot of real code depends on it.
+- **A warp is 32 threads semantically** (`warpSize == 32`, lane ids, warp intrinsics, `__activemask`), because a lot of real code depends on it. `CPUSIM_WARP_SIZE=16` or `64` at compile time changes it for a whole program: 16 fills exactly one register (finer divergence and barrier groups, for code written against `warpSize`), 64 is AMD's wavefront (CUDA's masks are 32-bit, so `__ballot_sync` and `__activemask` then cover lanes 0..31; `__any`, `__all` and cooperative groups use all 64). Tensor cores need 32 ([32](docs/optimization/iteration-3/32-warp-size.md)).
 - Physically, one thread is one 32-bit lane of a zmm register, so a vector holds 16 threads and a 32-thread value takes two registers; the mask of active threads lives in the `k` registers.
+- A block smaller than a warp runs in fewer lanes: with its shape known (section 5.2), a block of up to 16 threads has a 16-lane warp entry (up to 32 with warps of 64), with the warp's semantics unchanged; the lanes left out are threads that do not exist.
 - **The unit of execution is a group of W lanes**: one call of a generated function runs W threads of one block in lockstep, with W from 32 to 512 (section 4.3). The warp's semantics (shuffles, votes) stay per 32 lanes inside the group.
 - There is no independent thread scheduling (Volta and later): the lanes of a group advance together. A lane that waits for another lane of its own warp hangs, as on GPUs before Volta (section 4.7 covers waits between warps).
 
@@ -92,10 +93,12 @@ For each kernel the compiler generates several functions; the runtime picks one 
 
 | Variant | Lanes per call | What happens at `__syncthreads` | Valid for |
 |---|---|---|---|
-| warp (`32`) | 32 | the warp saves its live values in a frame and returns; the executor runs the block's other warps up to the barrier, then resumes each one | every kernel |
-| suspending (`64s`, `128s`) | 64, 128 | the same, for groups of 2 or 4 warps (fewer switches) | kernels with barriers, blocks larger than the group |
-| wide (`64` to `512`) | 64 to 512 | nothing: the whole block is in one call, in lockstep | without barriers: any block of at least W threads; with barriers: the smallest W that covers the block |
+| warp (`32`) | the warp size (fewer for a block smaller than a warp) | the warp saves its live values in a frame and returns; the executor runs the block's other warps up to the barrier, then resumes each one | every kernel |
+| suspending (`64s`, `128s`) | 2 or 4 warps | the same, for groups of 2 or 4 warps (fewer switches) | kernels with barriers, blocks larger than the group |
+| wide (`64` to `512`) | 2 warps up to 512 | nothing: the whole block is in one call, in lockstep | without barriers: any block of at least W threads; with barriers: the smallest W that covers the block |
 | cooperative (`64c` to `512c`) | half a block on each SMT sibling | an inline wait between the two halves (an epoch counter per half, `pause` in the loop); no frames | kernels with barriers, blocks of W+1 to 2W threads, cores with two siblings |
+
+(The names are those of warps of 32; with 16 or 64 the widths scale with the warp.)
 
 Wider groups give the core more independent work per instruction stream; they also multiply the registers each value needs, and past the 32 zmm the spills cost more than the gain. No width wins everywhere, which is why it is measured ([02](docs/optimization/iteration-1/02-width-variants.md)).
 
@@ -227,11 +230,11 @@ A device interface in the style of the CUDA driver API has two implementations, 
 
 ### 6.4 Kernel ABI
 
-The contract between generated code and runtime is `src/device/kernel_abi.h`, versioned (`CPUSIM_KERNEL_ABI`, now 12); the runtime refuses a module of another version. A module exports, per kernel:
+The contract between generated code and runtime is `src/device/kernel_abi.h`, versioned (`CPUSIM_KERNEL_ABI`, now 13); the runtime refuses a module of another version. A module exports, per kernel:
 
 - the entry of each variant (`__cpusim_entry_<k>`, `__cpusim_entry<W>_<k>`, `<W>s`, `<W>c`): it runs one group from its saved state to the next barrier, yield or the end, and returns the reason;
 - an instrumented twin for profiling (`__cpusim_prof_<k>`);
-- metadata (`__cpusim_meta_<k>`): parameter layout, static shared memory, frame size, which variants exist, flags (barriers, waiting loops).
+- metadata (`__cpusim_meta_<k>`): parameter layout, static shared memory, frame size, which variants exist, flags (barriers, waiting loops), the warp size and the warp entry's lanes.
 
 Per module, the pointer slots and initial values of device variables. Each call receives a context with the block's coordinates, dimensions, shared memory base, frame, per-lane thread indices and the address span of the allocations of 2 GiB or more.
 
@@ -272,7 +275,7 @@ These are read by the program and travel with each launch, so the one driver run
 ## 7. Limits and out of scope
 
 - **Out of scope**: Thrust, CUB, cuBLAS and other NVIDIA libraries; inline PTX (`asm()`); dynamic parallelism; textures and surfaces.
-- **Semantics**: no independent thread scheduling inside a warp (section 4.1); managed and mapped memory are coherent with the host at kernel boundaries, not while a kernel runs; a cooperative launch is limited to two blocks per core.
+- **Semantics**: no independent thread scheduling inside a warp (section 4.1); with warps of 64, CUDA's 32-bit warp masks cover only lanes 0..31; managed and mapped memory are coherent with the host at kernel boundaries, not while a kernel runs; a cooperative launch is limited to two blocks per core.
 - **Performance** (the slow cases are listed in [30](docs/optimization/iteration-3/30-launches-and-hot-spots.md)): atomics contended by every core on the same cache lines, kernels tuned for a GPU's memory system, deep per-thread divergence, one-byte-per-thread code (16 bytes per vector where a CPU loop handles 64), and the socket round trip per launch through the driver.
 
 ## 8. Open directions

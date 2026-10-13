@@ -142,9 +142,10 @@ private:
         };
         struct FunctionInfo {
             uint64_t profiled = 0;  // instrumented twin
-            uint64_t wide[4] = {};  // variants with 64, 128, 256, 512 lanes
-            uint64_t susp[2] = {};  // suspending variants with 64, 128 lanes
-            uint64_t coop[4] = {};  // cooperative variants with 64..512 lanes (half a block each)
+            // With W the warp size (cpusim_kernel_meta.warp_size):
+            uint64_t wide[5] = {};  // variants with 2W << i lanes (64..512 for warps of 32)
+            uint64_t susp[2] = {};  // suspending variants with 2W and 4W lanes
+            uint64_t coop[5] = {};  // cooperative variants with 2W << i lanes (half a block each)
             uint64_t block = 0;     // __cpusim_block_: whole block, 32-lane warps, barrier rounds inside
             cpusim_kernel_meta meta{};
             std::map<uint64_t, Tuning> tuning;  // key: block shape

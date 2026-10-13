@@ -1,10 +1,12 @@
 /* Cooperative groups: the subset programs use, on the warp primitives of
- * __cpusim_device.h. A warp is 32 consecutive threads of the block in
- * linear order (x fastest), as on a GPU.
+ * __cpusim_device.h. A warp is warpSize (32, or 16 or 64 with
+ * CPUSIM_WARP_SIZE) consecutive threads of the block in linear order (x
+ * fastest), as on a GPU.
  *
  *   thread_block            this_thread_block(): sync, thread_rank, size...
  *   thread_block_tile<N>    tiled_partition<N>(parent), N a power of two up
- *                           to 32: shfl*, any, all, ballot, match_any/all
+ *                           to 32 and to warpSize: shfl*, any, all, ballot,
+ *                           match_any/all
  *   thread_group            tiled_partition(parent, n): rank, size, sync
  *   coalesced_group         coalesced_threads(): the lanes active here
  *   grid_group              this_grid(): sync is a grid-wide barrier, valid
@@ -24,10 +26,10 @@ __device__ __forceinline__ unsigned linear_tid() {
     return threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
 }
 __device__ __forceinline__ unsigned block_threads() { return blockDim.x * blockDim.y * blockDim.z; }
-__device__ __forceinline__ unsigned lane() { return linear_tid() & 31u; }
+__device__ __forceinline__ unsigned lane() { return linear_tid() & unsigned(warpSize - 1); }
 /* Lane of the n-th set bit of mask. */
-__device__ __forceinline__ int nth_lane(unsigned mask, unsigned n) {
-    for (int l = 0; l < 32; ++l)
+__device__ __forceinline__ int nth_lane(unsigned long long mask, unsigned n) {
+    for (int l = 0; l < warpSize; ++l)
         if (mask >> l & 1u) {
             if (n == 0) return l;
             --n;
@@ -35,11 +37,16 @@ __device__ __forceinline__ int nth_lane(unsigned mask, unsigned n) {
     return 0;
 }
 /* The bits of `bits` at the positions set in `mask`, packed (pext). */
-__device__ __forceinline__ unsigned pack(unsigned bits, unsigned mask) {
-    unsigned r = 0, k = 0;
-    for (int l = 0; l < 32; ++l)
+__device__ __forceinline__ unsigned long long pack(unsigned long long bits, unsigned long long mask) {
+    unsigned long long r = 0;
+    unsigned k = 0;
+    for (int l = 0; l < warpSize; ++l)
         if (mask >> l & 1u) r |= (bits >> l & 1u) << k++;
     return r;
+}
+/* Bits [base, base + n) of a warp-wide 64-bit lane set. */
+__device__ __forceinline__ unsigned tile_bits(unsigned long long lanes, unsigned base, unsigned n) {
+    return unsigned((lanes >> base) & (n >= 32 ? 0xffffffffull : (1ull << n) - 1u));
 }
 }  // namespace __cg
 
@@ -67,13 +74,13 @@ public:
     __device__ unsigned long long meta_group_rank() const { return __cg::linear_tid() / n_; }
     __device__ unsigned long long meta_group_size() const { return (__cg::block_threads() + n_ - 1) / n_; }
     __device__ void sync() const {
-        if (n_ > 32) __syncthreads();
+        if (n_ > unsigned(warpSize)) __syncthreads();
         else __syncwarp(mask());
     }
     __device__ bool is_valid() const { return true; }
     __device__ unsigned mask() const {
-        if (n_ >= 32) return 0xffffffffu;
-        return ((1u << n_) - 1u) << (__cg::lane() / n_ * n_);
+        if (n_ >= unsigned(warpSize) || n_ >= 32) return 0xffffffffu;
+        return ((1u << n_) - 1u) << (__cg::lane() / n_ * n_ % 32);
     }
 
 private:
@@ -82,7 +89,9 @@ private:
 
 template <unsigned N>
 class thread_block_tile {
-    static_assert(N >= 1 && N <= 32 && (N & (N - 1)) == 0, "tile sizes are powers of two up to 32");
+    static_assert(N >= 1 && N <= 32 && N <= unsigned(warpSize) && (N & (N - 1)) == 0,
+                  "tile sizes are powers of two up to 32 and to warpSize");
+    __device__ static unsigned base() { return __cg::lane() / N * N; }
 
 public:
     static constexpr unsigned num_threads_v = N;
@@ -93,7 +102,7 @@ public:
     __device__ unsigned long long meta_group_size() const { return (__cg::block_threads() + N - 1) / N; }
     __device__ bool is_valid() const { return true; }
     __device__ unsigned mask() const {
-        return N == 32 ? 0xffffffffu : ((1u << N) - 1u) << (__cg::lane() / N * N);
+        return N == 32 || N == unsigned(warpSize) ? 0xffffffffu : ((1u << N) - 1u) << (base() % 32);
     }
     __device__ void sync() const { __syncwarp(mask()); }
     template <class T>
@@ -104,18 +113,16 @@ public:
     __device__ T shfl_up(T v, unsigned d) const { return __shfl_up_sync(mask(), v, d, N); }
     template <class T>
     __device__ T shfl_xor(T v, int m) const { return __shfl_xor_sync(mask(), v, m, N); }
-    __device__ unsigned ballot(int p) const {
-        return (__ballot_sync(mask(), p) >> (__cg::lane() / N * N)) & (N == 32 ? 0xffffffffu : (1u << N) - 1u);
-    }
+    __device__ unsigned ballot(int p) const { return __cg::tile_bits(__cpusim_ballot(p), base(), N); }
     __device__ int any(int p) const { return ballot(p) != 0; }
     __device__ int all(int p) const { return ballot(p) == (N == 32 ? 0xffffffffu : (1u << N) - 1u); }
     template <class T>
-    __device__ unsigned match_any(T v) const {
-        return (__match_any_sync(mask(), v) >> (__cg::lane() / N * N)) & (N == 32 ? 0xffffffffu : (1u << N) - 1u);
-    }
+    __device__ unsigned match_any(T v) const { return __cg::tile_bits(__cpusim_match_any(0xffffffffu, v), base(), N); }
     template <class T>
     __device__ unsigned match_all(T v, int& pred) const {
-        return (__match_all_sync(mask(), v, &pred) >> (__cg::lane() / N * N)) & (N == 32 ? 0xffffffffu : (1u << N) - 1u);
+        unsigned any = match_any(v), want = ballot(1);
+        pred = any == want;
+        return pred ? want : 0;
     }
 };
 
@@ -129,35 +136,35 @@ __device__ __forceinline__ thread_group tiled_partition(const thread_group&, uns
 /* The lanes of the warp active where it is created. */
 class coalesced_group {
 public:
-    __device__ explicit coalesced_group(unsigned m) : mask_(m) {}
-    __device__ unsigned long long thread_rank() const { return __popc(mask_ & ((1u << __cg::lane()) - 1u)); }
-    __device__ unsigned long long size() const { return __popc(mask_); }
-    __device__ unsigned long long num_threads() const { return __popc(mask_); }
+    __device__ explicit coalesced_group(unsigned long long m) : mask_(m) {}
+    __device__ unsigned long long thread_rank() const { return __popcll(mask_ & ((1ull << __cg::lane()) - 1u)); }
+    __device__ unsigned long long size() const { return __popcll(mask_); }
+    __device__ unsigned long long num_threads() const { return __popcll(mask_); }
     __device__ unsigned long long meta_group_rank() const { return 0; }
     __device__ unsigned long long meta_group_size() const { return 1; }
     __device__ bool is_valid() const { return true; }
-    __device__ void sync() const { __syncwarp(mask_); }
-    __device__ unsigned mask() const { return mask_; }
+    __device__ void sync() const {}
+    __device__ unsigned mask() const { return unsigned(mask_); }  // lanes 0..31 (CUDA's type)
     template <class T>
-    __device__ T shfl(T v, unsigned rank) const { return __shfl_sync(mask_, v, __cg::nth_lane(mask_, rank)); }
+    __device__ T shfl(T v, unsigned rank) const { return __shfl_sync(mask(), v, __cg::nth_lane(mask_, rank)); }
     template <class T>
     __device__ T shfl_down(T v, unsigned d) const {
         unsigned r = unsigned(thread_rank()) + d;
-        return __shfl_sync(mask_, v, __cg::nth_lane(mask_, r < size() ? r : unsigned(thread_rank())));
+        return __shfl_sync(mask(), v, __cg::nth_lane(mask_, r < size() ? r : unsigned(thread_rank())));
     }
     template <class T>
     __device__ T shfl_up(T v, unsigned d) const {
         unsigned r = unsigned(thread_rank());
-        return __shfl_sync(mask_, v, __cg::nth_lane(mask_, r >= d ? r - d : r));
+        return __shfl_sync(mask(), v, __cg::nth_lane(mask_, r >= d ? r - d : r));
     }
-    __device__ unsigned ballot(int p) const { return __cg::pack(__ballot_sync(mask_, p), mask_); }
-    __device__ int any(int p) const { return __ballot_sync(mask_, p) != 0; }
-    __device__ int all(int p) const { return __ballot_sync(mask_, p) == mask_; }
+    __device__ unsigned ballot(int p) const { return unsigned(__cg::pack(__cpusim_ballot(p) & mask_, mask_)); }
+    __device__ int any(int p) const { return (__cpusim_ballot(p) & mask_) != 0; }
+    __device__ int all(int p) const { return (__cpusim_ballot(p) & mask_) == mask_; }
 
 private:
-    unsigned mask_;
+    unsigned long long mask_;  // all the warp's lanes, 64 with warps of 64
 };
-__device__ __forceinline__ coalesced_group coalesced_threads() { return coalesced_group(__activemask()); }
+__device__ __forceinline__ coalesced_group coalesced_threads() { return coalesced_group(__cpusim_ballot(1)); }
 
 /* Grid-wide barrier: a counter and a generation in device memory. Thread 0
  * of each block arrives once its block is at a barrier; the last one to
