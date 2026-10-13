@@ -873,6 +873,16 @@ int main(int argc, char** argv) {
         k.warp_size = k.warp_lanes = warp_size;
     }
     retarget(*m, tm.get(), kernels);
+    // GEMMs written with wmma: a trace function per candidate kernel, for
+    // the runtime to recognize the launch and run it on AMX tiles.
+    if (!std::getenv("CPUSIM_NO_WMMA_TRACE"))
+        for (auto& k : kernels) {
+            std::string why;
+            k.traced = cpusim::build_wmma_trace(*m, k, &why);
+            if (std::getenv("CPUSIM_DEVC_DEBUG") && why != "no mma_sync")
+                std::fprintf(stderr, "cpusim-devc: %s: wmma GEMM trace %s%s\n", k.name.c_str(),
+                             k.traced ? "built" : "not built: ", why.c_str());
+        }
     lower_half_fma(*m, StringRef(tm->getTargetFeatureString()).contains("+avx512fp16") ||
                            tm->getMCSubtargetInfo()->checkFeatures("+avx512fp16"));
     lower_nvvm_atomics(*m);
@@ -1057,6 +1067,7 @@ int main(int argc, char** argv) {
         for (const auto& p : k.params) manifest += " " + std::to_string(p.offset) + ":" + std::to_string(p.size);
         if (min_sm) manifest += " sm=" + std::to_string(min_sm);
         if (k.shared_bytes) manifest += " smem=" + std::to_string(k.shared_bytes);
+        if (k.traced) manifest += " trace";
         manifest += "\n";
     }
     if (failures) return 1;

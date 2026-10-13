@@ -15,6 +15,7 @@
 #include "common/error.h"
 #include "common/topology.h"
 #include "device/allocator.h"
+#include "device/amx_gemm.h"
 #include "device/executor.h"
 #include "device/properties.h"
 #include "device/vram.h"
@@ -149,8 +150,12 @@ private:
             uint64_t susp[2] = {};  // suspending variants with 2W and 4W lanes
             uint64_t coop[5] = {};  // cooperative variants with 2W << i lanes (half a block each)
             uint64_t block = 0;     // __cpusim_block_: whole block, 32-lane warps, barrier rounds inside
+            uint64_t trace = 0;     // __cpusim_trace_: a wmma GEMM candidate (wmma_trace.h)
             cpusim_kernel_meta meta{};
             std::map<uint64_t, Tuning> tuning;  // key: block shape
+            // Launches of a wmma GEMM candidate, by grid, block and
+            // parameters: the GEMM they compute (type 0: not one).
+            std::map<std::string, GemmArgs> gemm_plans;
         };
         std::map<uint64_t, FunctionInfo> functions;  // entry point handed out
     };

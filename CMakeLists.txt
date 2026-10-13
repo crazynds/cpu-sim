@@ -37,6 +37,7 @@ add_library(cpusim_device STATIC
     src/device/device_core.cpp
     src/device/executor.cpp
     src/device/amx_gemm.cpp
+    src/device/wmma_trace.cpp
     src/device/inprocess.cpp
     src/device/inprocess_status.cpp
     src/device/properties.cpp
@@ -88,6 +89,7 @@ if(LLVM_FOUND AND LLVM_VERSION_MAJOR EQUAL 19)
         src/compiler/main.cpp
         src/compiler/simt.cpp
         src/compiler/uniformity.cpp
+        src/compiler/wmma_trace.cpp
     )
     target_include_directories(cpusim-devc PRIVATE src SYSTEM ${LLVM_INCLUDE_DIRS})
     target_compile_definitions(cpusim-devc PRIVATE ${LLVM_DEFINITIONS})
@@ -139,7 +141,7 @@ add_test(NAME runtime_daemon
 # Self-checking tests of single features (tests/cuda), each run with every
 # lane width, without JIT and on the daemon backend.
 if(TARGET cpusim-devc)
-    foreach(feature IN ITEMS warp_ops math division local_arrays streams async managed types wmma wmma_shapes wmma_subbyte streaming calls)
+    foreach(feature IN ITEMS warp_ops math division local_arrays streams async managed types wmma wmma_shapes wmma_subbyte wmma_gemm streaming calls)
         add_test(NAME cuda_${feature}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_feature_test.sh ${CMAKE_BINARY_DIR}/cucc
                     $<TARGET_FILE:cpusimd> ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/${feature}.cu)

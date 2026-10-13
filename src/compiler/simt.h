@@ -34,6 +34,7 @@ struct KernelInfo {
     // 16-lane vector; the missing lanes are threads that do not exist).
     unsigned warp_size = 32;
     unsigned warp_lanes = 32;
+    bool traced = false;  // has __cpusim_trace_<name> (wmma GEMM candidate)
 };
 
 // Builds `__cpusim_entry_<name>`: the per-thread kernel turned into code that
@@ -79,6 +80,11 @@ inline bool is_cond_load(const llvm::Value* v) {
     auto* call = llvm::dyn_cast<llvm::CallInst>(v);
     return call && call->getCalledFunction() && call->getCalledFunction()->getName().starts_with(kCondLoadPrefix);
 }
+
+// A matrix multiplication written with wmma: builds __cpusim_trace_<name>,
+// the kernel's scalar copy that records its wmma operations instead of doing
+// them (wmma_trace.cpp). False, with the reason, if the kernel cannot be one.
+bool build_wmma_trace(llvm::Module& m, KernelInfo& kernel, std::string* why);
 
 // Gives every __shared__ variable used by the kernel an offset in the block's
 // shared memory and rewrites its uses as shared base + offset.

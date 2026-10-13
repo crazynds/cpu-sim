@@ -1,5 +1,7 @@
 #include "device/device_core.h"
 
+#include "device/wmma_trace.h"
+
 #include <sys/mman.h>
 #include "device/inprocess_status.h"
 
@@ -440,6 +442,7 @@ Error DeviceCore::get_function(uint32_t id, uint64_t module, const std::string& 
                 dlsym(handle, ("__cpusim_entry" + std::to_string(two_warps << i) + "c_" + name).c_str()));
     if (meta->flags & CPUSIM_META_BLOCK_FN)
         info.block = reinterpret_cast<uint64_t>(dlsym(handle, ("__cpusim_block_" + name).c_str()));
+    info.trace = reinterpret_cast<uint64_t>(dlsym(handle, ("__cpusim_trace_" + name).c_str()));
     it->second.functions[*function] = info;
     return Error::Success;
 }
@@ -453,6 +456,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     std::vector<Trial> trials;  // width tuning inside this launch
     int output_fd = 1;
     uint64_t huge_lo = 0, huge_hi = UINT64_MAX;
+    uint64_t trace_fn = 0;
     cpusim_kernel_meta meta{};
     // The executor first: the widths offered depend on its pairs of SMT siblings.
     std::call_once(executor_once_, [this] { executor_ = std::make_unique<Executor>(reserved_cpus()); });
@@ -464,6 +468,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
         if (fn == it->second.functions.end()) return Error::InvalidDeviceFunction;
         meta = fn->second.meta;
         lanes = meta.warp_lanes;
+        trace_fn = fn->second.trace;
         ++it->second.running;
         output_fd = it->second.output_fd;
         // The span of the allocations of 2 GiB or more, in VRAM and in the
@@ -524,6 +529,51 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     std::vector<uint8_t> buffer(std::max<size_t>(param_bytes, 1) + 64);
     auto* aligned = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(buffer.data()) + 63) & ~uintptr_t(63));
     std::memcpy(aligned, params, param_bytes);
+
+    // A matrix multiplication written with wmma: on AMX tiles instead, once
+    // the trace of the launch shows that it is one (wmma_trace.h).
+    if (trace_fn && !cfg.profile && !cfg.debug &&
+        (amx_gemm_available(GemmType::BF16_F32) || amx_gemm_available(GemmType::S8_S32))) {
+        std::string key(reinterpret_cast<const char*>(cfg.grid), sizeof(cfg.grid));
+        key.append(reinterpret_cast<const char*>(cfg.block), sizeof(cfg.block));
+        key.append(reinterpret_cast<const char*>(params), param_bytes);
+        GemmArgs plan;
+        bool known = false;
+        {
+            std::lock_guard lock(mutex_);
+            auto it = contexts_.find(id);
+            if (it != contexts_.end())
+                if (auto fn = it->second.functions.find(function); fn != it->second.functions.end())
+                    if (auto p = fn->second.gemm_plans.find(key); p != fn->second.gemm_plans.end()) plan = p->second, known = true;
+        }
+        if (!known) {
+            const char* why = "";
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!wmma_gemm_plan(*executor_, reinterpret_cast<cpusim_trace_fn>(trace_fn), run_cfg, aligned, &plan, &why) ||
+                !amx_gemm_available(plan.type))
+                plan = GemmArgs{}, plan.M = 0;
+            if (std::getenv("CPUSIM_VERBOSE"))
+                std::fprintf(stderr, "cpusim: wmma GEMM %s: %s (traced in %.1f ms)\n", plan.M ? "recognized" : "not recognized",
+                             plan.M ? (plan.type == GemmType::S8_S32 ? "int8" : "bf16") : why,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            std::lock_guard lock(mutex_);
+            auto it = contexts_.find(id);
+            if (it != contexts_.end())
+                if (auto fn = it->second.functions.find(function); fn != it->second.functions.end())
+                    fn->second.gemm_plans[key] = plan;
+        }
+        if (plan.M) {
+            const auto start = std::chrono::steady_clock::now();
+            KernelFault fault = amx_gemm(*executor_, plan);
+            if (fault.signal) return fault_error(fault.signal);
+            LaunchResult local;
+            if (!result) result = &local;
+            result->kernel_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - start).count());
+            counters_.kernels_launched.fetch_add(1, std::memory_order_relaxed);
+            return Error::Success;
+        }
+    }
 
     LaunchResult local;
     if (!result) result = &local;
