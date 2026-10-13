@@ -20,9 +20,14 @@
 //   1. B is packed into the tile layout AMX's second operand wants (VNNI:
 //      pairs of bf16 or quadruples of int8 of consecutive k interleaved per
 //      column), in panels of 32 columns: [n / 32][k / KT][2 tiles][16 rows][64 B].
-//   2. A is packed into pairs of tiles: [m / 32][k / KT][32 rows][64 B].
-//      Both packed buffers are 2 MiB-aligned: a tile row that straddles two
-//      cache lines halves the throughput (25 against 43 TFLOPS).
+//   2. A needs no new layout: its tiles are loaded from the caller's matrix
+//      when every tile row starts a cache line (A 64-byte aligned, lda a
+//      multiple of 64 bytes). That is twice as fast as packing it, which
+//      cost more than it saved (4096^3 on a Xeon 6548Y+: 15 against 30
+//      TFLOPS, 24 against 52 TOPS). Otherwise A is packed into pairs of
+//      tiles: [m / 32][k / KT][32 rows][64 B]. Packed buffers are 2 MiB-
+//      aligned: a tile row that straddles two cache lines halves the
+//      throughput (25 against 43 TFLOPS).
 //   3. Each unit of work is a 64 x 64 block of C, as four 32 x 32 blocks of
 //      2 x 2 tiles accumulated over the whole of K (C never leaves the tiles
 //      until its last tdp); units go down columns of blocks, so neighbours
@@ -77,6 +82,10 @@ struct Kernel {
     const GemmArgs& g;
     uint8_t *ap, *bp;
     uint32_t kts;
+    // A's tiles: packed (2 KiB per tile step, A1 1 KiB after A0, rows 64
+    // bytes apart) or read in place from the caller's matrix.
+    const uint8_t* a_base = nullptr;
+    size_t a_step = 2048, a_half = 1024, a_ld = 64, a_row32 = 0;
 
     uint8_t* apair(uint32_t m32, uint32_t kt) const { return ap + (size_t(m32) * kts + kt) * 2048; }
     uint8_t* bpanel(uint32_t n32, uint32_t kt) const { return bp + (size_t(n32) * kts + kt) * 2048; }
@@ -116,23 +125,24 @@ struct Kernel {
         }
     }
 
-    // Unit: 32 rows of A (m32), in blocks of 8 tile steps: each row gives
+    // Unit: 32 rows of A (m32) over a block of 8 tile steps: each row gives
     // 512 contiguous bytes to 8 places 2 KiB apart. (A row at a time wrote
     // 128 lines 2 KiB apart, all in two L1 sets; 64 bytes of each of 32 rows
-    // read K elements apart, the same on the reads.)
+    // read K elements apart, the same on the reads. One unit per m32 left
+    // too few units to spread over the workers.)
+    static constexpr uint32_t kAKts = 8;
+    uint32_t a_blocks() const { return (kts + kAKts - 1) / kAKts; }
     __attribute__((target("avx512f"))) void pack_a(uint64_t u) const {
-        const uint32_t m32 = uint32_t(u);
+        const uint32_t m32 = uint32_t(u / a_blocks()), kt0 = uint32_t(u % a_blocks()) * kAKts;
+        const uint32_t kt1 = std::min(kts, kt0 + kAKts);
         const size_t esize = INT8 ? 1 : 2;
         const uint8_t* A = static_cast<const uint8_t*>(g.A) + size_t(m32) * 32 * g.lda * esize;
         uint8_t* base = apair(m32, 0);
-        for (uint32_t kt0 = 0; kt0 < kts; kt0 += 8) {
-            const uint32_t kt1 = std::min(kts, kt0 + 8);
-            for (int r = 0; r < 32; ++r) {
-                const uint8_t* src = A + r * g.lda * esize + size_t(kt0) * 64;
-                uint8_t* dst = base + size_t(kt0) * 2048 + r * 64;
-                for (uint32_t kt = kt0; kt < kt1; ++kt, src += 64, dst += 2048)
-                    _mm512_store_si512(dst, _mm512_loadu_si512(src));
-            }
+        for (int r = 0; r < 32; ++r) {
+            const uint8_t* src = A + r * g.lda * esize + size_t(kt0) * 64;
+            uint8_t* dst = base + size_t(kt0) * 2048 + r * 64;
+            for (uint32_t kt = kt0; kt < kt1; ++kt, src += 64, dst += 2048)
+                _mm512_store_si512(dst, _mm512_loadu_si512(src));
         }
     }
 
@@ -159,7 +169,7 @@ struct Kernel {
     __attribute__((target("amx-tile,amx-bf16,amx-int8"))) void block(uint32_t m0, uint32_t n0) const {
         Acc* c = static_cast<Acc*>(g.C) + size_t(m0) * g.ldc + n0;
         const size_t ldc = g.ldc * sizeof(Acc);
-        const uint8_t* a = apair(m0 / 32, 0);
+        const uint8_t* a = a_base + size_t(m0 / 32) * a_row32;
         const uint8_t* b = bpanel(n0 / 32, 0);
         if (g.accumulate) {
             _tile_loadd(0, c, ldc);
@@ -169,15 +179,16 @@ struct Kernel {
         } else {
             _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3);
         }
-        for (uint32_t i = 0; i + 1 < kts; ++i, a += 2048, b += 2048) {
-            _tile_loadd(4, a, 64); _tile_loadd(6, b, 64); _tile_loadd(7, b + 1024, 64);
+        const size_t step = a_step, half = a_half, ld = a_ld;
+        for (uint32_t i = 0; i + 1 < kts; ++i, a += step, b += 2048) {
+            _tile_loadd(4, a, ld); _tile_loadd(6, b, 64); _tile_loadd(7, b + 1024, 64);
             tdp(0);
-            _tile_loadd(5, a + 1024, 64);
+            _tile_loadd(5, a + half, ld);
             tdp(1); tdp(2); tdp(3);
         }
-        _tile_loadd(4, a, 64); _tile_loadd(6, b, 64); _tile_loadd(7, b + 1024, 64);
+        _tile_loadd(4, a, ld); _tile_loadd(6, b, 64); _tile_loadd(7, b + 1024, 64);
         tdp(0); _tile_stored(0, c, ldc);
-        _tile_loadd(5, a + 1024, 64);
+        _tile_loadd(5, a + half, ld);
         tdp(1); _tile_stored(1, c + 16, ldc);
         tdp(2); _tile_stored(2, c + 16 * g.ldc, ldc);
         tdp(3); _tile_stored(3, c + 16 * g.ldc + 16, ldc);
@@ -201,7 +212,7 @@ KernelFault run(Executor& ex, const GemmArgs& g) {
     Scratch& s = scratch();
     std::lock_guard lock(s.mutex);
     Kernel<INT8> k{g, nullptr, nullptr, g.K / Kernel<INT8>::KT};
-    k.ap = grow(s.a, s.a_size, size_t(g.M) * g.K * (INT8 ? 1 : 2));
+    k.ap = grow(s.a, s.a_size, size_t(g.M) * g.K * (INT8 ? 1 : 2));  // (unused when A is read in place)
     k.bp = grow(s.b, s.b_size, size_t(g.K) * g.N * (INT8 ? 1 : 2));
     if (!k.ap || !k.bp) {
         KernelFault f;
@@ -209,10 +220,18 @@ KernelFault run(Executor& ex, const GemmArgs& g) {
         return f;
     }
     static const bool verbose = std::getenv("CPUSIM_VERBOSE") != nullptr;
+    const size_t esize = INT8 ? 1 : 2;
+    const bool direct = reinterpret_cast<uintptr_t>(g.A) % 64 == 0 && g.lda * esize % 64 == 0;
+    if (direct) {
+        k.a_base = static_cast<const uint8_t*>(g.A);
+        k.a_step = 64, k.a_ld = g.lda * esize, k.a_half = 16 * k.a_ld, k.a_row32 = 32 * k.a_ld;
+    } else {
+        k.a_base = k.ap, k.a_row32 = size_t(k.kts) * 2048;
+    }
     auto t0 = std::chrono::steady_clock::now();
     KernelFault f = ex.run_native(uint64_t(g.N / 32) * k.kts, [&](uint64_t u, int) { k.pack_b(u); }, false);
     auto t1 = std::chrono::steady_clock::now();
-    if (!f.signal) f = ex.run_native(uint64_t(g.M / 32), [&](uint64_t u, int) { k.pack_a(u); }, false);
+    if (!f.signal && !direct) f = ex.run_native(uint64_t(g.M / 32) * k.a_blocks(), [&](uint64_t u, int) { k.pack_a(u); }, false);
     auto t2 = std::chrono::steady_clock::now();
     if (!f.signal)
         f = ex.run_native(uint64_t((g.M + 63) / 64) * ((g.N + 63) / 64), [&](uint64_t u, int) { k.compute(u); }, true);

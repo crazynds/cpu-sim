@@ -1,5 +1,6 @@
 // The AMX GEMM (src/device/amx_gemm.cpp) against a plain reference: bf16 and
-// int8, C = A*B and C += A*B, leading dimensions larger than the matrices.
+// int8, C = A*B and C += A*B, leading dimensions larger than the matrices,
+// A read in place (rows 64-byte aligned) and packed (rows that are not).
 // On a CPU without AMX it reports SKIP. With an argument, also the speed of
 // a square product of that size:  test_amx_gemm [n]
 #include <unistd.h>
@@ -33,13 +34,27 @@ float from_bf16(uint16_t b) {
 
 int failures = 0;
 
+// 64-byte aligned vectors, like device memory.
+template <typename T>
+struct Aligned {
+    using value_type = T;
+    Aligned() = default;
+    template <typename U>
+    Aligned(const Aligned<U>&) {}
+    T* allocate(size_t n) { return static_cast<T*>(std::aligned_alloc(64, (n * sizeof(T) + 63) / 64 * 64)); }
+    void deallocate(T* p, size_t) { std::free(p); }
+    bool operator==(const Aligned&) const { return true; }
+};
+template <typename T>
+using Vec = std::vector<T, Aligned<T>>;
+
 template <bool INT8>
 void check(Executor& ex, uint32_t M, uint32_t N, uint32_t K, uint32_t pad, bool accumulate) {
     using T = std::conditional_t<INT8, int8_t, uint16_t>;
     using Acc = std::conditional_t<INT8, int32_t, float>;
     const uint64_t lda = K + pad, ldb = N + pad, ldc = N + pad;
-    std::vector<T> A(M * lda), B(K * ldb);
-    std::vector<Acc> C(M * ldc), want(M * ldc);
+    Vec<T> A(M * lda), B(K * ldb);
+    Vec<Acc> C(M * ldc), want(M * ldc);
     uint32_t x = 12345;
     auto rnd = [&] { return x = x * 1664525u + 1013904223u, int(x >> 24) % 9 - 4; };  // small integers: sums exact
     for (auto& v : A) v = INT8 ? T(rnd()) : T(to_bf16(float(rnd())));
@@ -78,8 +93,8 @@ template <bool INT8>
 void speed(Executor& ex, uint32_t n) {
     using T = std::conditional_t<INT8, int8_t, uint16_t>;
     using Acc = std::conditional_t<INT8, int32_t, float>;
-    std::vector<T> A(size_t(n) * n, T(INT8 ? 1 : 0x3f80)), B(size_t(n) * n, T(INT8 ? 1 : 0x3f80));
-    std::vector<Acc> C(size_t(n) * n);
+    Vec<T> A(size_t(n) * n, T(INT8 ? 1 : 0x3f80)), B(size_t(n) * n, T(INT8 ? 1 : 0x3f80));
+    Vec<Acc> C(size_t(n) * n);
     GemmArgs g;
     g.type = INT8 ? GemmType::S8_S32 : GemmType::BF16_F32;
     g.A = A.data(), g.B = B.data(), g.C = C.data();
