@@ -318,6 +318,16 @@ private:
     Value* emit_mmav(CallInst* call);
     std::map<std::vector<Value*>, std::array<Value*, 8>> mmav_done_;  // one inline mma per operand set
     AllocaInst* mma_scratch_ = nullptr;
+    // AMX for bf16 mma (decided when compiling, from the function's target
+    // features: nothing is checked at run time). Opt-in (CPUSIM_AMX=1 for
+    // cucc): with the accumulator moved between the tile and zmm registers
+    // around every mma, a 4096^3 GEMM on a Xeon 6548Y+ took 4.6 TFLOPS
+    // against 5.4 with vdpbf16ps; it pays only with the accumulator kept in
+    // a tile through the loop over k (docs/optimization/iteration-3/34).
+    bool amx_bf16() const {
+        static const bool wanted = std::getenv("CPUSIM_AMX") && std::atoi(std::getenv("CPUSIM_AMX")) != 0;
+        return wanted && f_.getFnAttribute("target-features").getValueAsString().contains("+amx-bf16");
+    }
     // p through an empty asm that also clobbers memory: LLVM no longer knows
     // what it points to and cannot move loads above it, so it neither
     // forwards earlier stores to loads through it nor promotes the memory to
@@ -2670,6 +2680,39 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
                 for (unsigned s = 0; s < segs; ++s)
                     bp[p][s] = b_.CreateBitCast(
                         b_.CreateCall(perm, {concat_chunks({b_seg(l0, 2 * p, s), b_seg(l0, 2 * p + 1, s)}), pair_idx}), vbf);
+            // With AMX (the target has amx-bf16, a 32-lane warp, 16 x 16 x
+            // 16): one tdpbf16ps on tiles instead of 128 vdpbf16ps. A's
+            // fragment is its tile row by row (rows 32 bytes apart), B's
+            // pairs above are already the interleaved (VNNI) rows the tile
+            // operand wants, and the accumulator goes through the scratch
+            // area as a 16 x 16 float tile (13 cycles per tdpbf16ps on a
+            // Xeon, but see amx_bf16(): the round trip costs more). LLVM
+            // configures the tiles at the function's entry (ldtilecfg); the
+            // executor asks the OS for the tile state once (arch_prctl).
+            if (amx_bf16() && W == 32 && M == 16 && N == 16 && K == 16 && segs == 1) {
+                auto* i16t = b_.getInt16Ty();
+                auto* i64t = b_.getInt64Ty();
+                Value* scratch = mma_scratch();
+                Value* cbuf = scratch;                                               // 16 rows x 64 bytes
+                Value* bbuf = b_.CreateConstInBoundsGEP1_64(i8, scratch, 1024);      // 8 rows x 64 bytes
+                for (unsigned r = 0; r < 16; ++r)
+                    b_.CreateAlignedStore(acc[r][0], b_.CreateConstInBoundsGEP1_64(i8, cbuf, r * 64), Align(64));
+                for (unsigned p = 0; p < 8; ++p)
+                    b_.CreateAlignedStore(bp[p][0], b_.CreateConstInBoundsGEP1_64(i8, bbuf, p * 64), Align(64));
+                Function* load = Intrinsic::getDeclaration(&m_, Intrinsic::x86_tileloadd64_internal);
+                Function* dpt = Intrinsic::getDeclaration(&m_, Intrinsic::x86_tdpbf16ps_internal);
+                Function* store = Intrinsic::getDeclaration(&m_, Intrinsic::x86_tilestored64_internal);
+                auto c16 = [&](unsigned v) { return ConstantInt::get(i16t, v); };
+                Value* tc = b_.CreateCall(load, {c16(16), c16(64), cbuf, ConstantInt::get(i64t, 64)});
+                Value* ta = b_.CreateCall(load, {c16(16), c16(32), a_at(l0, 0, 0), ConstantInt::get(i64t, 32)});
+                Value* tb = b_.CreateCall(load, {c16(8), c16(64), bbuf, ConstantInt::get(i64t, 64)});
+                Value* td = b_.CreateCall(dpt, {c16(16), c16(64), c16(32), tc, ta, tb});
+                b_.CreateCall(store, {c16(16), c16(64), cbuf, ConstantInt::get(i64t, 64), td});
+                Value* back = launder(cbuf);
+                for (unsigned r = 0; r < 16; ++r)
+                    acc[r][0] = b_.CreateAlignedLoad(acc[r][0]->getType(), b_.CreateConstInBoundsGEP1_64(i8, back, r * 64),
+                                                     Align(64));
+            } else
             for (unsigned r0 = 0; r0 < M; r0 += rows_per_block)
                 for (unsigned p = 0; p < K / 2; ++p)
                     for (unsigned r = r0; r < r0 + rows_per_block; ++r) {

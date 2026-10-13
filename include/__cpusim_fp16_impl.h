@@ -162,8 +162,12 @@ __CPUSIM_HD __CPUSIM_T __hmul_rn(__CPUSIM_T a, __CPUSIM_T b) { return __hmul(a, 
 // One rounding of a*b + c: the product is exact in double; the sum is
 // rounded to odd in double, then in float, then to nearest.
 __CPUSIM_HD __CPUSIM_T __hfma(__CPUSIM_T a, __CPUSIM_T b, __CPUSIM_T c) {
+#ifdef __CPUSIM_FMA_HOOK
+    return __CPUSIM_MK(__CPUSIM_FMA_HOOK(a.__x, b.__x, c.__x));
+#else
     double r = __cpusim_fp::add_odd((double)__CPUSIM_F(a) * (double)__CPUSIM_F(b), (double)__CPUSIM_F(c));
     return __CPUSIM_RN(__cpusim_fp::d2f_odd(r));
+#endif
 }
 __CPUSIM_HD __CPUSIM_T __hneg(__CPUSIM_T a) { return __CPUSIM_MK((unsigned short)(a.__x ^ 0x8000u)); }
 __CPUSIM_HD __CPUSIM_T __habs(__CPUSIM_T a) { return __CPUSIM_MK((unsigned short)(a.__x & 0x7fffu)); }

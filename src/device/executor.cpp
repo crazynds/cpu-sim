@@ -5,6 +5,8 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <cpuid.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -212,7 +214,27 @@ __attribute__((visibility("default"), used)) int32_t __cpusim_printf_end(int64_t
 }
 }
 
+namespace {
+
+// AMX's tile registers are state the kernel saves only for processes that
+// ask (Linux 5.16+): kernels compiled for a CPU with AMX use them for tensor
+// cores (simt.cpp, emit_mmav), so the process asks once, before any worker
+// runs. Without AMX, or on an older kernel, nothing happens (such kernels
+// were compiled for this kind of CPU, so it has AMX; on a kernel too old
+// they fault with SIGILL, reported as a failed launch).
+void request_amx_state() {
+    unsigned a, b, c, d;
+    if (__get_cpuid_max(0, nullptr) < 7) return;
+    __cpuid_count(7, 0, a, b, c, d);
+    if (!(d >> 24 & 1)) return;  // AMX-TILE
+    constexpr long kReqXcompPerm = 0x1023, kXfeatureXtiledata = 18;
+    syscall(SYS_arch_prctl, kReqXcompPerm, kXfeatureXtiledata);
+}
+
+}  // namespace
+
 Executor::Executor(const std::vector<int>& cpus) {
+    request_amx_state();
     // Pairs of SMT siblings, both among the workers (read from /sys, never
     // assumed from the numbering).
     pair_of_.assign(cpus.size(), -1);

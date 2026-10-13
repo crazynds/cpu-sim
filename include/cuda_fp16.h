@@ -19,7 +19,18 @@
 #define __CPUSIM_TOF(bits) __cpusim_fp::half_tof(bits)
 #define __CPUSIM_FROM(f, mode) __cpusim_fp::half_from((f), (mode))
 #define __CPUSIM_INF_BITS 0x7c00u
+/* a*b + c with one rounding. cpusim-devc replaces the calls with the CPU's
+ * half-precision fma (vfmadd*ph) when it compiles for one with AVX512-FP16;
+ * elsewhere this emulation is inlined. */
+extern "C" __host__ __device__ inline unsigned short __cpusim_hfma_half(unsigned short a, unsigned short b,
+                                                                      unsigned short c) {
+    double r = __cpusim_fp::add_odd((double)__cpusim_fp::half_tof(a) * (double)__cpusim_fp::half_tof(b),
+                                    (double)__cpusim_fp::half_tof(c));
+    return __cpusim_fp::half_from(__cpusim_fp::d2f_odd(r), __cpusim_fp::RN);
+}
+#define __CPUSIM_FMA_HOOK(a, b, c) __cpusim_hfma_half((a), (b), (c))
 #include "__cpusim_fp16_impl.h"
+#undef __CPUSIM_FMA_HOOK
 #undef __CPUSIM_T
 #undef __CPUSIM_T2
 #undef __CPUSIM_RAW

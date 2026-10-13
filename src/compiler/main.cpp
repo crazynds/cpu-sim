@@ -13,6 +13,7 @@
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstIterator.h>
+#include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
@@ -546,6 +547,43 @@ void cap_device_malloc(Function& f) {
     }
 }
 
+// Half precision where the CPU has it (AVX512-FP16, decided when compiling):
+// __hfma's emulation (the header's __cpusim_hfma_half, a sum rounded to odd
+// in double) becomes the CPU's fma, one rounding as on the GPU.
+void lower_half_fma(Module& m, bool fp16) {
+    Function* f = m.getFunction("__cpusim_hfma_half");
+    if (!f || !fp16) return;
+    LLVMContext& ctx = m.getContext();
+    Function* fma = Intrinsic::getDeclaration(&m, Intrinsic::fma, {Type::getHalfTy(ctx)});
+    for (User* u : make_early_inc_range(f->users())) {
+        auto* call = dyn_cast<CallInst>(u);
+        if (!call || call->getCalledFunction() != f) continue;
+        IRBuilder<> b(call);
+        auto h = [&](Value* v) { return b.CreateBitCast(v, b.getHalfTy()); };
+        Value* r = b.CreateCall(fma, {h(call->getArgOperand(0)), h(call->getArgOperand(1)), h(call->getArgOperand(2))});
+        call->replaceAllUsesWith(b.CreateBitCast(r, b.getInt16Ty()));
+        call->eraseFromParent();
+    }
+}
+
+// fptrunc(sqrt(fpext h)) to half is the half-precision square root (float
+// has more than twice half's precision, so the double rounding is exact):
+// vsqrtph where the CPU has AVX512-FP16, the same promotion elsewhere.
+void shrink_half_sqrt(Function& f) {
+    for (Instruction& i : make_early_inc_range(instructions(f))) {
+        auto* tr = dyn_cast<FPTruncInst>(&i);
+        if (!tr || !tr->getType()->isHalfTy()) continue;
+        auto* sq = dyn_cast<IntrinsicInst>(tr->getOperand(0));
+        if (!sq || sq->getIntrinsicID() != Intrinsic::sqrt || !sq->getType()->isFloatTy()) continue;
+        auto* ext = dyn_cast<FPExtInst>(sq->getArgOperand(0));
+        if (!ext || !ext->getOperand(0)->getType()->isHalfTy()) continue;
+        IRBuilder<> b(tr);
+        Value* r = b.CreateUnaryIntrinsic(Intrinsic::sqrt, ext->getOperand(0));
+        tr->replaceAllUsesWith(r);
+        tr->eraseFromParent();
+    }
+}
+
 // Device printf: Clang packs the arguments in a local struct and calls
 // vprintf(format, &struct). Each call becomes
 //   h = __cpusim_printf_begin(format); __cpusim_printf_<kind>(h, value)...;
@@ -835,6 +873,8 @@ int main(int argc, char** argv) {
         k.warp_size = k.warp_lanes = warp_size;
     }
     retarget(*m, tm.get(), kernels);
+    lower_half_fma(*m, StringRef(tm->getTargetFeatureString()).contains("+avx512fp16") ||
+                           tm->getMCSubtargetInfo()->checkFeatures("+avx512fp16"));
     lower_nvvm_atomics(*m);
     const std::string symbol_lines = lower_device_globals(*m);
 
@@ -871,6 +911,7 @@ int main(int argc, char** argv) {
                                   "instcombine<no-verify-fixpoint>,simplifycfg,dse,adce,lower-switch,lcssa");
         }
     for (Function* f : per_thread) removeUnreachableBlocks(*f);
+    for (Function* f : per_thread) shrink_half_sqrt(*f);
     for (auto& k : kernels) k.spins = mark_spin_loops(*k.scalar);
     if (!opt.emit_scalar_ll.empty()) write_ll(*m, opt.emit_scalar_ll);
 
