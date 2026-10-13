@@ -91,6 +91,7 @@ struct KernelDesc {
     int min_sm = 0;  // compute capability (major * 10 + minor) it needs, 0: any
     uint64_t shared_bytes = 0;  // static __shared__
     int max_dynamic_shared = -1;  // cudaFuncAttributeMaxDynamicSharedMemorySize (-1: the default)
+    bool lane_independent = false;  // its lanes never look at each other (CPUSIM_META_LANE_INDEPENDENT)
 };
 
 // A module recompiled for one block shape (JIT at launch).
@@ -578,6 +579,7 @@ bool parse_manifest(const char* text, size_t size, Module* m) {
         for (std::string opt; ls >> opt;)
             if (opt.rfind("sm=", 0) == 0) k.min_sm = std::atoi(opt.c_str() + 3);
             else if (opt.rfind("smem=", 0) == 0) k.shared_bytes = std::stoull(opt.substr(5));
+            else if (opt == "indep") k.lane_independent = true;
         m->kernels[k.name] = k;
     }
     return true;
@@ -1394,7 +1396,14 @@ cudaError_t cudaLaunchKernel(const void* func, dim3 grid, dim3 block, void** arg
         return record(Error::NoKernelImageForDevice);
     }
     bool specialized = false;
-    if (!profiler().enabled)
+    // Fewer warps than cores, lanes that never look at each other: the
+    // generic entry, whose lanes the executor can spread over the cores
+    // (randomAccess: one block of 128 threads). The specialized one has its
+    // masks built in.
+    const uint64_t warps = (uint64_t(block.x) * block.y * block.z + 31) / 32;
+    const bool spread = k.lane_independent && shared == 0 &&
+                        uint64_t(grid.x) * grid.y * grid.z * warps < d->properties().multiProcessorCount;
+    if (!profiler().enabled && !spread)
         if (uint64_t jf = jit_function(m, k, {block.x, block.y, block.z}, d)) function = jf, specialized = true;
     if (dump_asm_enabled()) dump_asm(m, specialized ? std::array<uint32_t, 3>{block.x, block.y, block.z}
                                                     : std::array<uint32_t, 3>{0, 0, 0});

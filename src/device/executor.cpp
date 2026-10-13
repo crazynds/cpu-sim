@@ -739,6 +739,35 @@ CtxArray Executor::make_groups(const LaunchConfig& cfg, uint32_t lanes, uint32_t
     return groups;
 }
 
+CtxArray Executor::slice_groups(const CtxArray& groups, uint32_t lanes, uint32_t slices) {
+    const uint32_t width = lanes / slices, words = (lanes + 31) / 32;
+    CtxArray out;
+    out.stride = groups.stride;
+    out.count = 0;
+    out.data.reserve(size_t(groups.stride) * groups.count * slices);
+    for (uint32_t g = 0; g < groups.count; ++g)
+        for (uint32_t s = 0; s < slices; ++s) {
+            // Lanes [s * width, (s + 1) * width) of group g.
+            std::vector<uint8_t> c(groups.data.begin() + size_t(groups.stride) * g,
+                                   groups.data.begin() + size_t(groups.stride) * (g + 1));
+            uint32_t* mask = cpusim_ctx_lane_mask(reinterpret_cast<cpusim_warp_ctx*>(c.data()));
+            bool any = false;
+            for (uint32_t w = 0; w < words; ++w) {
+                uint32_t keep = 0;
+                for (uint32_t b = 0; b < 32; ++b) {
+                    const uint32_t lane = w * 32 + b;
+                    if (lane >= s * width && lane < (s + 1) * width) keep |= 1u << b;
+                }
+                mask[w] &= keep;
+                any |= mask[w] != 0;
+            }
+            if (!any) continue;  // lanes past the block's last thread
+            out.data.insert(out.data.end(), c.begin(), c.end());
+            ++out.count;
+        }
+    return out;
+}
+
 void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const cpusim_kernel_meta& meta,
                    const LaunchConfig& cfg, const uint8_t* params, uint64_t* counters, cpusim_block_fn block,
                    bool cooperative, uint64_t first, uint64_t last, uint64_t* busy_ns, KernelFault* fault,
@@ -762,6 +791,17 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     job.cooperative = cooperative && !pairs_.empty();
     job.tag = tag;
     job.meta_flags = meta.flags;
+    // Lanes that never look at each other, and too few groups for the
+    // workers (randomAccess: one block of 128 threads): the groups are cut
+    // into slices of lanes, each a call of its own. A slice is the group's
+    // context with the other lanes masked off; the split below hands them out.
+    const uint64_t workers = threads_.size();
+    if (!job.cooperative && !block && (meta.flags & CPUSIM_META_LANE_INDEPENDENT) && cfg.shared_bytes == 0 &&
+        total * warps.count < workers) {
+        uint32_t slices = 1;
+        while (slices < lanes && total * warps.count * slices < 2 * workers) slices *= 2;
+        if (slices > 1) warps = slice_groups(warps, lanes, slices);
+    }
     // The warps of a block that has no barrier and no shared memory never
     // talk to each other: with few blocks, hand out its groups one by one
     // (as a GPU schedules warps), so the work spreads over every worker

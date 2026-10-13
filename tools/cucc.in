@@ -40,6 +40,10 @@ CUDA_FLAGS = [
     "-x", "cuda", "--cuda-gpu-arch=sm_70", "--cuda-path=" + CUDA_STUB,
     "-nocudainc", "-nocudalib", "-Wno-unknown-cuda-version",
     "-Xclang", "-target-sdk-version=12.5",
+    # What nvcc defines: code picks its CUDA branch by these (clang defines
+    # __CUDACC__ only in the SDK headers that -nocudainc leaves out).
+    "-D__CUDACC__", "-D__NVCC__", "-D__CUDACC_VER_MAJOR__=12", "-D__CUDACC_VER_MINOR__=5",
+    "-D__CUDACC_VER_BUILD__=0",
     "-I", INCLUDE, "-include", "cuda_runtime.h",
 ]
 

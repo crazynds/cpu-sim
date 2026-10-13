@@ -129,6 +129,10 @@ enum cpusim_counter {
 #define CPUSIM_META_COOP_SHIFT 24  // bit (24 + i): cooperative variant __cpusim_entry<2W << i>c_ exists
 #define CPUSIM_META_BLOCK_FN 2u    // __cpusim_block_<name> exists (see below)
 #define CPUSIM_META_YIELDS 4u      // the 32-lane entry may return CPUSIM_YIELD (no barrier pass-through)
+// No lane ever sees another's state (no barrier, shared memory, shuffle,
+// ballot, match or tensor core op): any subset of a group's lanes can run as
+// a call of its own, on its own worker.
+#define CPUSIM_META_LANE_INDEPENDENT 8u
 
 // Kernels with barriers also get
 //     uint32_t __cpusim_block_<mangled name>(cpusim_warp_ctx* ctxs, uint32_t nwarps, uint8_t* done);

@@ -109,6 +109,8 @@ public:
 
     // Per-call contexts for one block: thread index of every lane, lane masks.
     static CtxArray make_groups(const LaunchConfig& cfg, uint32_t lanes, uint32_t warp_size);
+    // Each group cut into `slices` groups of lanes / slices lanes (empty ones left out).
+    static CtxArray slice_groups(const CtxArray& groups, uint32_t lanes, uint32_t slices);
 
     size_t workers() const { return threads_.size(); }
     // Pairs of SMT siblings among the workers (0: no cooperative launches).

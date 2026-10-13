@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -983,6 +984,41 @@ int main(int argc, char** argv) {
                                       call->getIntrinsicID() == Intrinsic::nvvm_bar_sync ||
                                       call->getIntrinsicID() == Intrinsic::nvvm_barrier ||
                                       call->getIntrinsicID() == Intrinsic::nvvm_barrier_n;
+        // Lanes that never look at each other (CPUSIM_META_LANE_INDEPENDENT):
+        // nothing shared, nothing collective, in the kernel or what it calls.
+        // Only for the generic module: a module specialized for a block shape
+        // has its entry masks built in, so it cannot run a subset of lanes.
+        bool lane_independent = k.spec_block[0] == 0 && !k.has_barriers && !k.spins && k.shared_bytes == 0 && min_sm == 0;
+        {
+            std::vector<Function*> todo{k.scalar};
+            std::set<Function*> seen{k.scalar};
+            while (lane_independent && !todo.empty()) {
+                Function* f = todo.back();
+                todo.pop_back();
+                for (BasicBlock& bb : *f)
+                    for (Instruction& inst : bb) {
+                        auto* call = dyn_cast<CallBase>(&inst);
+                        if (!call) continue;
+                        Function* callee = call->getCalledFunction();
+                        if (!callee) {
+                            if (!call->isInlineAsm()) lane_independent = false;  // unknown target
+                            continue;
+                        }
+                        const StringRef n = callee->getName();
+                        if (n == cpusim::kShflFn || n == cpusim::kBallotFn || n == cpusim::kSharedBaseFn ||
+                            n == cpusim::kYieldFn || n.starts_with(cpusim::kMmaPrefix) ||
+                            n.starts_with(cpusim::kMmavPrefix) || n.starts_with(cpusim::kTensorPrefix) ||
+                            n.contains("grid_barrier") ||
+                            (n.starts_with("llvm.nvvm.") &&
+                             (n.contains("shfl") || n.contains("vote") || n.contains("match") || n.contains("redux") ||
+                              n.contains("bar") || n.contains("wmma") || n.contains("mma")))) {
+                            lane_independent = false;
+                            break;
+                        }
+                        if (!callee->isDeclaration() && seen.insert(callee).second) todo.push_back(callee);
+                    }
+            }
+        }
         // With a known block shape (JIT at launch) only the variants the
         // runtime can pick are built, and no instrumented one (profiling runs
         // the generic module).
@@ -1048,6 +1084,26 @@ int main(int argc, char** argv) {
             build_block_function(*m, k);
             k.wide_variants |= CPUSIM_META_BLOCK_FN;
         }
+        // Spreading lanes pays only when a lane's work is serial in the warp
+        // code: atomics (one lane at a time) and gathers or scatters (one
+        // memory access per lane, latency bound), in a loop. Plain vector
+        // code costs the same with one lane active as with all of them.
+        if (lane_independent) {
+            bool serial = false;
+            if (Function* e = m->getFunction("__cpusim_entry_" + k.name); e && !e->isDeclaration()) {
+                DominatorTree dt(*e);
+                LoopInfo li(dt);
+                for (BasicBlock& bb : *e)
+                    for (Instruction& inst : bb) {
+                        if (!li.getLoopFor(&bb)) continue;
+                        if (isa<AtomicRMWInst>(inst) || isa<AtomicCmpXchgInst>(inst)) serial = true;
+                        if (auto* ii = dyn_cast<IntrinsicInst>(&inst))
+                            serial |= ii->getIntrinsicID() == Intrinsic::masked_gather ||
+                                      ii->getIntrinsicID() == Intrinsic::masked_scatter;
+                    }
+            }
+            lane_independent = serial;
+        }
         // What the runtime needs to know about the kernel, readable with dlsym.
         auto* i32 = Type::getInt32Ty(ctx);
         auto* meta_ty = StructType::get(ctx, {i32, i32, i32, i32, i32, i32, i32, i32});
@@ -1057,6 +1113,7 @@ int main(int argc, char** argv) {
                                                          ConstantInt::get(i32, k.shared_bytes),
                                                          ConstantInt::get(i32, (k.has_barriers ? CPUSIM_META_HAS_BARRIERS : 0) |
                                                                                    (k.spins ? CPUSIM_META_YIELDS : 0) |
+                                                                                   (lane_independent ? CPUSIM_META_LANE_INDEPENDENT : 0) |
                                                                                    k.wide_variants),
                                                          ConstantInt::get(i32, k.frame_bytes_wide[0]),
                                                          ConstantInt::get(i32, k.frame_bytes_wide[1]),
@@ -1068,6 +1125,7 @@ int main(int argc, char** argv) {
         if (min_sm) manifest += " sm=" + std::to_string(min_sm);
         if (k.shared_bytes) manifest += " smem=" + std::to_string(k.shared_bytes);
         if (k.traced) manifest += " trace";
+        if (lane_independent) manifest += " indep";
         manifest += "\n";
     }
     if (failures) return 1;
