@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -96,6 +97,11 @@ public:
     // SIGUSR2. Call again while they last: a worker outside kernel code
     // notices at its next block.
     void cancel(uint32_t tag);
+    // Runs fn(unit, worker) for every unit in [0, units) on the workers
+    // (native code instead of a kernel: the AMX GEMM). one_per_core: one
+    // worker per physical core (state such as AMX tiles that two SMT
+    // threads would share). Returns the fault that stopped it, if any.
+    KernelFault run_native(uint64_t units, const std::function<void(uint64_t, int)>& fn, bool one_per_core);
     // busy_ns: the time workers spent running this launch's blocks, summed
     // over workers. Divided by the blocks, the cost of a block: unlike wall
     // time, it ignores the uneven end of a launch and the launch overhead,
@@ -165,6 +171,8 @@ private:
         // At most this many workers inside at once (Executor::cap_for).
         int64_t cap = INT64_MAX;
         uint64_t nodes = ~0ull;  // bit n: workers of node n may join
+        const std::function<void(uint64_t, int)>* native = nullptr;  // run_native's function, if any
+        bool one_per_core = false;                                   // only one SMT sibling of each core joins
         bool try_join() {
             int64_t v = state.load(std::memory_order_relaxed);
             while (!(v & kClosed) && v < cap)
@@ -224,6 +232,12 @@ private:
     void learn_cost(uint64_t key, uint64_t units, uint64_t busy_ns);
     std::unordered_map<uint64_t, double> cost_ns_;  // per (entry, width, split): ns per unit, under mutex_
     void worker(int index, int cpu);
+    void post_and_wait(Job& job, uint64_t first);
+    // The worker may not join the job: the second SMT sibling of a core
+    // when the job runs one worker per core.
+    bool excluded(const Job& job, int worker) const {
+        return job.one_per_core && pair_of_[size_t(worker)] >= 0 && half_of_[size_t(worker)] == 1;
+    }
     Job* pick(int worker);    // under mutex_: a job this worker should take part in, or null
     void maybe_finish(Job* job);  // under mutex_
     void run_blocks(const Job& job, int worker, CtxArray& ctx, uint8_t* shared, uint64_t* counters, uint8_t* frames);

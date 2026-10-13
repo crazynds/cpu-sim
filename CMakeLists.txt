@@ -36,6 +36,7 @@ add_library(cpusim_device STATIC
     src/device/debug_exec.cpp
     src/device/device_core.cpp
     src/device/executor.cpp
+    src/device/amx_gemm.cpp
     src/device/inprocess.cpp
     src/device/inprocess_status.cpp
     src/device/properties.cpp
@@ -118,6 +119,12 @@ add_test(NAME allocator COMMAND test_allocator)
 add_executable(test_config tests/test_config.cpp)
 target_link_libraries(test_config PRIVATE cpusim_common)
 add_test(NAME config COMMAND test_config)
+
+# The AMX GEMM against a reference (SKIP on CPUs without AMX).
+add_executable(test_amx_gemm tests/amx_gemm_test.cpp)
+target_link_libraries(test_amx_gemm PRIVATE cpusim_device)
+add_test(NAME amx_gemm COMMAND test_amx_gemm)
+set_tests_properties(amx_gemm PROPERTIES PASS_REGULAR_EXPRESSION "amx_gemm: (PASS|SKIP)" TIMEOUT 60)
 
 add_executable(test_runtime tests/test_runtime.cpp)
 target_link_libraries(test_runtime PRIVATE cudart)
