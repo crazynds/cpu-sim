@@ -99,4 +99,4 @@ Launch-bound stress cases after the fixes: `smith_waterman_diag_launches` (2047 
 - **Byte and atomic cases** from [30](30-launches-and-hot-spots.md) are still the slowest against OpenMP (`histogram_global_atomics`, `sobel_u8`, `spmv_csr_scalar`).
 - **A one-off `cudaMemset` "invalid argument"** in `sync_locks` (1 of 17 runs, never reproduced): look at context and allocation lookups under concurrent programs.
 
-Previous: [32](32-warp-size.md). Back to the [iteration 3 index](README.md).
+Previous: [32](32-warp-size.md). Next: [34](34-adapting-to-the-cpu.md). Back to the [iteration 3 index](README.md).

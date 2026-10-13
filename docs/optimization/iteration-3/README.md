@@ -15,6 +15,7 @@ The third round: it started with stability tests that require the same bits in a
 | 31 | [Micro-optimizations and 32-bit gathers](31-gathers-and-scatters.md) | Instruction order and masks do not matter with SMT; addresses recomputed where used and 32-bit gather indices: bitonic sort 1.18x |
 | 32 | [The warp size](32-warp-size.md) | `CPUSIM_WARP_SIZE=16/32/64`; blocks smaller than a warp in fewer lanes (10 to 46% faster) |
 | 33 | [A two-socket Xeon](33-xeon-server.md) | H100, OpenMP and the simulator on 2 x 32 cores; launches 816 to 3.7 us (monitor, wake-ups, workers per job, C-states) |
+| 34 | [Adapting to the CPU](34-adapting-to-the-cpu.md) | Code for this CPU only; native fp16 fma/sqrt; AMX tensor path (opt-in); small launches on one socket |
 
 ## Tensor core results at the end of the iteration
 

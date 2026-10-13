@@ -164,6 +164,7 @@ private:
         std::atomic<int64_t> state{0};
         // At most this many workers inside at once (Executor::cap_for).
         int64_t cap = INT64_MAX;
+        uint64_t nodes = ~0ull;  // bit n: workers of node n may join
         bool try_join() {
             int64_t v = state.load(std::memory_order_relaxed);
             while (!(v & kClosed) && v < cap)
@@ -239,25 +240,37 @@ private:
     // and a spin lock whose holder gets preempted (an unpinned thread on its
     // CPU) stalls every worker waiting for it.
     std::mutex mutex_;
-    std::condition_variable start_cv_, done_cv_;
+    std::condition_variable done_cv_;
     bool stop_ = false;
     // Idle workers and a launching thread spin a while before sleeping: a
     // kernel launched right after another finds the workers awake, with no
     // system call on either side (waking 28 sleeping threads per launch cost
     // tens of microseconds). Jobs posted so far, to notice a new one.
     std::atomic<uint64_t> posted_{0};
-    // Workers a posted job can use (its blocks, at most every worker): an
-    // idle worker takes one before it takes the lock, so a one-block kernel
-    // does not have every worker queue on the mutex.
-    std::atomic<int> demand_{0};
-    std::atomic<int> spinners_{0};  // idle workers spinning for a demand slot
+    // The workers of one NUMA node (one socket). A job that needs no more
+    // workers than a node has takes them from one node only (run()): joining and leaving a job are atomic operations
+    // on lines all its workers touch, and across sockets each costs several
+    // times more (a 1024-block kernel took 120 us with both sockets of a
+    // Xeon, 40 with one). One node on a single-socket machine.
+    struct alignas(64) Node {
+        // Workers a posted job can use here (its blocks, at most the node's
+        // workers): an idle worker takes one before it takes the lock, so a
+        // one-block kernel does not have every worker queue on the mutex.
+        std::atomic<int> demand{0};
+        alignas(64) std::atomic<int> spinners{0};  // idle workers spinning for a slot
+        std::condition_variable cv;                // where its idle workers sleep
+        int workers = 0;
+        bool take_demand() {
+            int d = demand.load(std::memory_order_relaxed);
+            while (d > 0)
+                if (demand.compare_exchange_weak(d, d - 1, std::memory_order_acquire)) return true;
+            return false;
+        }
+    };
+    std::unique_ptr<Node[]> nodes_;
+    size_t node_count_ = 1;
+    std::vector<int> node_of_;  // per worker: index in nodes_
     static constexpr int kWakeFanout = 2;  // sleepers each wake-up passes on (worker())
-    bool take_demand() {
-        int d = demand_.load(std::memory_order_relaxed);
-        while (d > 0)
-            if (demand_.compare_exchange_weak(d, d - 1, std::memory_order_acquire)) return true;
-        return false;
-    }
     std::atomic<bool> stopping_{false};
     std::vector<Job*> active_;   // oldest first
     std::unique_ptr<std::atomic<Job*>[]> current_;  // the job each worker is in (for cancel)

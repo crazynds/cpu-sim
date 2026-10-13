@@ -251,6 +251,27 @@ Executor::Executor(const std::vector<int>& cpus) {
         }
         pairs_.push_back(std::make_unique<Pair>());
     }
+    // NUMA nodes of the workers' CPUs (/sys; one node if it says nothing).
+    {
+        std::vector<int> node_ids;
+        node_of_.assign(cpus.size(), 0);
+        for (size_t i = 0; i < cpus.size(); ++i) {
+            int id = 0;
+            for (int n = 0; n < 64; ++n) {
+                std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpus[i]) + "/node" + std::to_string(n);
+                if (access(path.c_str(), F_OK) == 0) {
+                    id = n;
+                    break;
+                }
+            }
+            auto it = std::find(node_ids.begin(), node_ids.end(), id);
+            if (it == node_ids.end()) node_ids.push_back(id), it = node_ids.end() - 1;
+            node_of_[i] = int(it - node_ids.begin());
+        }
+        node_count_ = std::max<size_t>(1, node_ids.size());
+        nodes_.reset(new Node[node_count_]);
+        for (int n : node_of_) ++nodes_[size_t(n)].workers;
+    }
     install_fault_handlers();
     current_.reset(new std::atomic<Job*>[cpus.size()]);
     for (size_t i = 0; i < cpus.size(); ++i) current_[i] = nullptr;
@@ -263,7 +284,7 @@ Executor::~Executor() {
         stop_ = true;
         stopping_ = true;
     }
-    start_cv_.notify_all();
+    for (size_t n = 0; n < node_count_; ++n) nodes_[n].cv.notify_all();
     for (auto& t : threads_) t.join();
 }
 
@@ -288,6 +309,8 @@ void Executor::worker(int index, int cpu) {
     ss.ss_size = altstack.size();
     sigaltstack(&ss, nullptr);
 
+    Node& node = nodes_[size_t(node_of_[size_t(index)])];
+    const uint64_t node_bit = 1ull << node_of_[size_t(index)];
     while (true) {
         Job* job = nullptr;
         {
@@ -304,27 +327,29 @@ void Executor::worker(int index, int cpu) {
                 // another worker; then sleep.
                 bool slot = false;
                 const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(cpusim::spin_ns());
-                spinners_.fetch_add(1, std::memory_order_relaxed);
+                node.spinners.fetch_add(1, std::memory_order_relaxed);
                 // Parked on the demand's cache line where the CPU allows it:
                 // a pause loop would slow down the SMT sibling still running
                 // the last blocks of a job.
                 const bool park = cpusim::park_kind() != cpusim::Park::None;
                 for (unsigned i = 1; !stopping_.load(std::memory_order_relaxed); ++i) {
-                    if (demand_.load(std::memory_order_relaxed) > 0 && take_demand()) {
+                    if (node.demand.load(std::memory_order_relaxed) > 0 && node.take_demand()) {
                         slot = true;
                         break;
                     }
-                    if (park) cpusim::park_on(&demand_, 4000);  // about a microsecond
+                    if (park) cpusim::park_on(&node.demand, 4000);  // about a microsecond
                     else _mm_pause();
                     if ((park || i % 256 == 0) && std::chrono::steady_clock::now() > until) break;
                 }
-                spinners_.fetch_sub(1, std::memory_order_relaxed);
+                node.spinners.fetch_sub(1, std::memory_order_relaxed);
                 if (slot) {
                     // The latest job, without the lock (usually the one that
                     // gave the slot).
                     readers_.fetch_add(1, std::memory_order_seq_cst);
                     Job* hot = hot_.load(std::memory_order_seq_cst);
-                    if (hot && !hot->exhausted.load(std::memory_order_relaxed) && hot->try_join()) job = hot;
+                    if (hot && (hot->nodes & node_bit) && !hot->exhausted.load(std::memory_order_relaxed) &&
+                        hot->try_join())
+                        job = hot;
                     readers_.fetch_sub(1, std::memory_order_release);
                 }
                 if (!job) {
@@ -334,17 +359,17 @@ void Executor::worker(int index, int cpu) {
                         job = pick(index);
                         if (!job) continue;  // its job needed no more workers
                     } else {
-                        start_cv_.wait(lock, [&] { return stop_ || (job = pick(index)) != nullptr; });
+                        node.cv.wait(lock, [&] { return stop_ || (job = pick(index)) != nullptr; });
                         if (!job) break;  // stopping
                         // Woken for a job: take a slot, and pass the wake-up on
                         // to up to two more sleepers while the job wants more
                         // workers than are spinning. A tree of wake-ups instead
                         // of the launch waking them all one by one on one
                         // futex (124 workers: hundreds of microseconds).
-                        take_demand();
-                        const int left = demand_.load(std::memory_order_relaxed) -
-                                         spinners_.load(std::memory_order_relaxed);
-                        for (int i = 0; i < std::min(left, kWakeFanout); ++i) start_cv_.notify_one();
+                        node.take_demand();
+                        const int left = node.demand.load(std::memory_order_relaxed) -
+                                         node.spinners.load(std::memory_order_relaxed);
+                        for (int i = 0; i < std::min(left, kWakeFanout); ++i) node.cv.notify_one();
                     }
                     lock.unlock();
                 }
@@ -639,8 +664,8 @@ Executor::Job* Executor::pick(int worker) {
             if (pair_of_[size_t(worker)] >= 0 && !j->joined[size_t(worker)]) return j;
             continue;
         }
-        if (!j->exhausted.load(std::memory_order_relaxed) && !j->aborted.load(std::memory_order_relaxed) &&
-            j->try_join())
+        if ((j->nodes & (1ull << node_of_[size_t(worker)])) && !j->exhausted.load(std::memory_order_relaxed) &&
+            !j->aborted.load(std::memory_order_relaxed) && j->try_join())
             return j;
     }
     return nullptr;
@@ -772,29 +797,53 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     } else {
         done_cv_.wait(lock, [&] { return !coop_active_; });
     }
+    const int workers = int(threads_.size());
+    const uint64_t units = job.cooperative ? uint64_t(workers) : job.blocks - first;
+    const int want = int(std::min<uint64_t>({units, uint64_t(workers), uint64_t(job.cap)}));
+    // One node when the job fits in it, else all of them, each asked for
+    // its share. The node with the most workers awake (spinning), the first
+    // one on a tie: usually the one the previous launch ran on, whose
+    // caches hold its data (taking nodes in turn moved a small kernel's data
+    // between sockets every launch). Decided before the job is visible.
+    size_t one = node_count_;
+    if (!job.cooperative && node_count_ > 1) {
+        int awake = -1;
+        for (size_t n = 0; n < node_count_; ++n) {
+            const int s = nodes_[n].spinners.load(std::memory_order_relaxed);
+            if (want <= nodes_[n].workers && s > awake) awake = s, one = n;
+        }
+    }
+    if (one < node_count_) job.nodes = 1ull << one;
     active_.push_back(&job);
     if (!job.cooperative) hot_.store(&job, std::memory_order_release);
     posted_.fetch_add(1, std::memory_order_release);
     {
-        const int workers = int(threads_.size());
-        const uint64_t units = job.cooperative ? uint64_t(workers) : job.blocks - first;
-        const int want = int(std::min<uint64_t>({units, uint64_t(workers), uint64_t(job.cap)}));
-        if (demand_.fetch_add(want, std::memory_order_release) + want > workers)
-            demand_.store(workers, std::memory_order_relaxed);  // stale demand of finished jobs
+        auto post = [&](size_t n, int share) {
+            Node& nd = nodes_[n];
+            if (nd.demand.fetch_add(share, std::memory_order_release) + share > nd.workers)
+                nd.demand.store(nd.workers, std::memory_order_relaxed);  // stale demand of finished jobs
+            if (job.cooperative) {
+                nd.cv.notify_all();
+            } else {
+                // The first ones of a tree (see worker()): each sleeper woken
+                // wakes up to kWakeFanout more while workers are missing.
+                const int missing = share - nd.spinners.load(std::memory_order_relaxed);
+                for (int i = 0; i < std::min(missing, kWakeFanout); ++i) nd.cv.notify_one();
+            }
+        };
         // Wake only the sleepers the idle workers spinning cannot cover: a
         // one-block kernel must not wake every idle worker, and with 124
         // workers waking all of them at once (notify_all) cost ~150 context
-        // switches per launch, serialized on the condition variable's futex. (One that stops spinning meanwhile finds the
-        // job when it goes to sleep: it looks for one under the lock first,
-        // and the job is already listed. Any worker that joins steals the
-        // others' blocks, so the job finishes with however many come.)
-        if (job.cooperative) {
-            start_cv_.notify_all();
+        // switches per launch, serialized on the condition variable's futex.
+        // (One that stops spinning meanwhile finds the job when it goes to
+        // sleep: it looks for one under the lock first, and the job is
+        // already listed. Any worker that joins steals the others' blocks, so
+        // the job finishes with however many come.)
+        if (one < node_count_) {
+            post(one, want);
         } else {
-            // The first ones of a tree (see worker()): each sleeper woken
-            // wakes up to kWakeFanout more while workers are missing.
-            const int missing = want - spinners_.load(std::memory_order_relaxed);
-            for (int i = 0; i < std::min(missing, kWakeFanout); ++i) start_cv_.notify_one();
+            for (size_t n = 0; n < node_count_; ++n)
+                post(n, int((int64_t(want) * nodes_[n].workers + workers - 1) / workers));
         }
     }
     // Short kernels end within the spin: no sleep, no wake-up.
