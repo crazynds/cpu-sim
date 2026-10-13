@@ -10,6 +10,7 @@
 
 #include <immintrin.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <algorithm>
 #include <chrono>
@@ -285,7 +286,7 @@ void Executor::worker(int index, int cpu) {
                 // Parked on the demand's cache line where the CPU allows it:
                 // a pause loop would slow down the SMT sibling still running
                 // the last blocks of a job.
-                const bool park = cpusim::has_mwaitx();
+                const bool park = cpusim::park_kind() != cpusim::Park::None;
                 for (unsigned i = 1; !stopping_.load(std::memory_order_relaxed); ++i) {
                     if (demand_.load(std::memory_order_relaxed) > 0 && take_demand()) {
                         slot = true;
@@ -313,6 +314,15 @@ void Executor::worker(int index, int cpu) {
                     } else {
                         start_cv_.wait(lock, [&] { return stop_ || (job = pick(index)) != nullptr; });
                         if (!job) break;  // stopping
+                        // Woken for a job: take a slot, and pass the wake-up on
+                        // to up to two more sleepers while the job wants more
+                        // workers than are spinning. A tree of wake-ups instead
+                        // of the launch waking them all one by one on one
+                        // futex (124 workers: hundreds of microseconds).
+                        take_demand();
+                        const int left = demand_.load(std::memory_order_relaxed) -
+                                         spinners_.load(std::memory_order_relaxed);
+                        for (int i = 0; i < std::min(left, kWakeFanout); ++i) start_cv_.notify_one();
                     }
                     lock.unlock();
                 }
@@ -564,6 +574,41 @@ void Executor::run_pair(const Job& job, CtxArray& ctx, uint8_t* shared, uint64_t
     }
 }
 
+namespace {
+
+// Work per worker called (CPUSIM_TARGET_US, 0: every worker for every launch).
+uint64_t target_ns() {
+    static const uint64_t ns = [] {
+        const char* v = std::getenv("CPUSIM_TARGET_US");
+        return uint64_t(v ? std::atof(v) * 1000 : 2000);
+    }();
+    return ns;
+}
+
+}  // namespace
+
+// Unknown kernels get every worker; then the estimate (cost per unit from the
+// last launches, times the units) divided by the target, at least one. A
+// launch that turns out longer than estimated still finishes: the workers
+// called take every block, and the next launch learns the new cost.
+int Executor::cap_for(uint64_t key, uint64_t units) {
+    const int workers = int(threads_.size());
+    if (!target_ns()) return workers;
+    std::lock_guard lock(mutex_);
+    auto it = cost_ns_.find(key);
+    if (it == cost_ns_.end()) return workers;
+    const double est = it->second * double(units);
+    return int(std::clamp<double>(std::ceil(est / double(target_ns())), 1.0, double(workers)));
+}
+
+void Executor::learn_cost(uint64_t key, uint64_t units, uint64_t busy_ns) {
+    if (!units) return;
+    const double c = double(busy_ns) / double(units);
+    std::lock_guard lock(mutex_);
+    auto [it, fresh] = cost_ns_.emplace(key, c);
+    if (!fresh) it->second = 0.5 * it->second + 0.5 * c;
+}
+
 Executor::Job* Executor::pick(int worker) {
     for (Job* j : active_) {
         if (j->cooperative) {
@@ -676,9 +721,15 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     if (counters) std::memset(counters, 0, sizeof(uint64_t) * CPUSIM_COUNTERS);
     if (busy_ns) *busy_ns = 0;
     if (first >= job.blocks) return;
+    // What the kernel costs per unit, learned from its previous launches.
+    const uint64_t cost_key = reinterpret_cast<uintptr_t>(entry) ^ (uint64_t(lanes) << 48) ^ (uint64_t(job.split) << 40) ^
+                              (block ? 1ull << 39 : 0);
     if (!job.cooperative) {
-        // Worker w's sequence: chunks w, w + n, w + 2n... of `chunk` blocks.
-        job.nranges = threads_.size();
+        // The workers it is worth calling, and their sequences: worker w's is
+        // chunks w, w + n, w + 2n... of `chunk` blocks, n = the workers called
+        // (any other worker that joins only takes from theirs).
+        job.cap = cap_for(cost_key, job.blocks - first);
+        job.nranges = size_t(job.cap);
         job.ranges.reset(new Job::Range[job.nranges]);
         job.first = first;
         const uint64_t count = job.blocks - first;
@@ -705,14 +756,24 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     {
         const int workers = int(threads_.size());
         const uint64_t units = job.cooperative ? uint64_t(workers) : job.blocks - first;
-        const int want = int(std::min<uint64_t>(units, uint64_t(workers)));
+        const int want = int(std::min<uint64_t>({units, uint64_t(workers), uint64_t(job.cap)}));
         if (demand_.fetch_add(want, std::memory_order_release) + want > workers)
             demand_.store(workers, std::memory_order_relaxed);  // stale demand of finished jobs
-        // Wake sleepers only if the idle workers spinning are too few: a
-        // one-block kernel must not wake every idle worker. (One that stops
-        // spinning meanwhile finds the job when it goes to sleep: it looks
-        // for one under the lock first, and the job is already listed.)
-        if (job.cooperative || want > spinners_.load(std::memory_order_relaxed)) start_cv_.notify_all();
+        // Wake only the sleepers the idle workers spinning cannot cover: a
+        // one-block kernel must not wake every idle worker, and with 124
+        // workers waking all of them at once (notify_all) cost ~150 context
+        // switches per launch, serialized on the condition variable's futex. (One that stops spinning meanwhile finds the
+        // job when it goes to sleep: it looks for one under the lock first,
+        // and the job is already listed. Any worker that joins steals the
+        // others' blocks, so the job finishes with however many come.)
+        if (job.cooperative) {
+            start_cv_.notify_all();
+        } else {
+            // The first ones of a tree (see worker()): each sleeper woken
+            // wakes up to kWakeFanout more while workers are missing.
+            const int missing = want - spinners_.load(std::memory_order_relaxed);
+            for (int i = 0; i < std::min(missing, kWakeFanout); ++i) start_cv_.notify_one();
+        }
     }
     // Short kernels end within the spin: no sleep, no wake-up.
     lock.unlock();
@@ -730,6 +791,11 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     while (readers_.load(std::memory_order_seq_cst)) _mm_pause();
     if (busy_ns) *busy_ns = job.busy_ns;
     if (fault) *fault = job.fault;
+    if (!job.cooperative && !job.fault.signal) {
+        lock.unlock();  // learn_cost takes it
+        learn_cost(cost_key, job.blocks - first, job.busy_ns);
+        return;
+    }
     if (job.cooperative) {
         coop_active_ = false;
         done_cv_.notify_all();

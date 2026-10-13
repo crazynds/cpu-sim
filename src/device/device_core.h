@@ -76,6 +76,8 @@ public:
     const std::vector<PhysicalCore>& reserved_cores() const { return cores_; }
     std::vector<int> reserved_cpus() const;
     VramPool& vram() { return *vram_; }
+    // VRAM bytes backed by host RAM (only the allocated ranges are looked at).
+    uint64_t vram_resident() const;
     DeviceCounters& counters() { return counters_; }
     std::chrono::system_clock::time_point started() const { return started_; }
 

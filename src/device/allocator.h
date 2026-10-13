@@ -31,6 +31,8 @@ public:
     uint64_t used() const { return used_; }
     size_t allocation_count() const { return allocated_.size(); }
     uint64_t largest_free() const;
+    // The allocations, as offset -> length.
+    const std::map<uint64_t, uint64_t>& allocations() const { return allocated_; }
     // Allocations of 2 GiB or more ("huge"), placed at the top of the range.
     // An offset inside any other allocation fits in 32 signed bits, so the
     // kernels gather with 32-bit indices through every pointer outside

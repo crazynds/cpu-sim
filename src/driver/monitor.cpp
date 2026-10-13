@@ -17,7 +17,7 @@ namespace cpusim {
 Monitor::Monitor(DeviceCore& core)
     : core_(core), sensors_(core.reserved_cpus()), inprocess_dir_(inprocess_status_dir(core.config())) {
     latest_.sensors = sensors_.sample();
-    latest_.vram_resident = core_.vram().resident_bytes();
+    latest_.vram_resident = core_.vram_resident();
     uint64_t k = 0, c = 0;
     scan_inprocess(&latest_, &k, &c);  // primes the per-app deltas
     thread_ = std::thread([this] { run(); });
@@ -112,7 +112,7 @@ void Monitor::run() {
         s.gpu_util = std::clamp(100.0 * double(kernel_delta) / window_ns, 0.0, 100.0);
         s.memory_util = std::clamp(100.0 * double(copy_delta) / window_ns, 0.0, 100.0);
         s.sensors = sensors_.sample();
-        s.vram_resident = core_.vram().resident_bytes();
+        s.vram_resident = core_.vram_resident();
 
         prev_kernel = kernel;
         prev_copy = copy;

@@ -780,6 +780,15 @@ void DeviceCore::record_timing(uint32_t id, uint64_t function, uint64_t key, uin
     }
 }
 
+uint64_t DeviceCore::vram_resident() const {
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    {
+        std::lock_guard lock(mutex_);
+        ranges.assign(allocator_->allocations().begin(), allocator_->allocations().end());
+    }
+    return vram_->resident_bytes(ranges);
+}
+
 void DeviceCore::mem_info(uint64_t* free, uint64_t* total, uint64_t* largest_free) const {
     std::lock_guard lock(mutex_);
     *total = allocator_->size();

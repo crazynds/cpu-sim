@@ -6,10 +6,29 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cstring>
+
 #include "stress.cuh"
 
-static inline unsigned short hbits(__half h) { return __half_as_ushort(h); }
-static inline unsigned short bbits(__nv_bfloat16 h) { return __bfloat16_as_ushort(h); }
+// Host side, by copy: the bit casts and __halves2half2 / __low2float are
+// device-only before CUDA 12.2.
+template <class To, class From>
+static inline To bits_as(From v) {
+    static_assert(sizeof(To) == sizeof(From));
+    To r;
+    std::memcpy(&r, &v, sizeof(r));
+    return r;
+}
+static inline unsigned short hbits(__half h) { return bits_as<unsigned short>(h); }
+static inline unsigned short bbits(__nv_bfloat16 h) { return bits_as<unsigned short>(h); }
+static inline __half2 h2_of(__half lo, __half hi) {
+    __half2 r;
+    std::memcpy(reinterpret_cast<char*>(&r), &lo, 2);
+    std::memcpy(reinterpret_cast<char*>(&r) + 2, &hi, 2);
+    return r;
+}
+static inline float h2_low(__half2 v) { return __half2float(bits_as<__half>((unsigned short)(bits_as<unsigned>(v) & 0xffffu))); }
+static inline float h2_high(__half2 v) { return __half2float(bits_as<__half>((unsigned short)(bits_as<unsigned>(v) >> 16))); }
 static inline bool h_nan(unsigned short b) { return (b & 0x7c00) == 0x7c00 && (b & 0x3ff); }
 static inline bool b_nan(unsigned short b) { return (b & 0x7f80) == 0x7f80 && (b & 0x7f); }
 
@@ -100,7 +119,7 @@ __global__ void k_half_dot(const __half* a, const __half* b, __half* out, int n)
     out[i] = acc;
 }
 
-static double hd(unsigned short b) { return double(__half2float(__ushort_as_half(b))); }
+static double hd(unsigned short b) { return double(__half2float(bits_as<__half>(b))); }
 static unsigned short h_of(double v) { return hbits(__double2half(v)); }
 static double bd(__nv_bfloat16 b) { return double(__bfloat162float(b)); }
 static unsigned short b_of(double v) { return bbits(__double2bfloat16(v)); }
@@ -194,18 +213,18 @@ int main() {
         auto f = random_floats(6 * size_t(n), 7, -4, 4);
         std::vector<__half2> a(n), b(n), c(n);
         for (int i = 0; i < n; ++i) {
-            a[i] = __halves2half2(__double2half(f[6 * i]), __double2half(f[6 * i + 1]));
-            b[i] = __halves2half2(__double2half(f[6 * i + 2]), __double2half(f[6 * i + 3]));
-            c[i] = __halves2half2(__double2half(f[6 * i + 4]), __double2half(f[6 * i + 5]));
+            a[i] = h2_of(__double2half(f[6 * i]), __double2half(f[6 * i + 1]));
+            b[i] = h2_of(__double2half(f[6 * i + 2]), __double2half(f[6 * i + 3]));
+            c[i] = h2_of(__double2half(f[6 * i + 4]), __double2half(f[6 * i + 5]));
         }
         std::vector<unsigned short> want(8 * size_t(n));
         std::vector<float> wf(2 * size_t(n));
         double ref = best_ms([&] {
 #pragma omp parallel for
             for (int i = 0; i < n; ++i) {
-                double xl = double(__low2float(a[i])), xh = double(__high2float(a[i]));
-                double yl = double(__low2float(b[i])), yh = double(__high2float(b[i]));
-                double zl = double(__low2float(c[i])), zh = double(__high2float(c[i]));
+                double xl = double(h2_low(a[i])), xh = double(h2_high(a[i]));
+                double yl = double(h2_low(b[i])), yh = double(h2_high(b[i]));
+                double zl = double(h2_low(c[i])), zh = double(h2_high(c[i]));
                 unsigned short* w = &want[8 * size_t(i)];
                 w[0] = h_of(xl + yl), w[1] = h_of(xh + yh);
                 w[2] = h_of(xl * yl), w[3] = h_of(xh * yh);

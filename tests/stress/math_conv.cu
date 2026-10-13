@@ -5,6 +5,8 @@
 // Inputs stay in the destination's range; ties (k + 0.5) are frequent.
 #include <cuda_fp16.h>
 
+#include <cstring>
+
 #include "stress.cuh"
 
 using u64 = unsigned long long;
@@ -67,7 +69,7 @@ __device__ u64 dev_op(In x) {
     else if constexpr (F == LL2D_RN) return u64(__double_as_longlong(__ll2double_rn(x.ll)));
     else if constexpr (F == I2D) return u64(__double_as_longlong(__int2double_rn(x.i)));
     else if constexpr (F == F2H_RN) return __half_as_ushort(__float2half_rn(x.f * 1e-5f));
-    else if constexpr (F == SAT) return __float_as_uint(__saturatef(x.f * 1e-9f + 0.5f));
+    else if constexpr (F == SAT) return __float_as_uint(__saturatef(__fadd_rn(__fmul_rn(x.f, 1e-9f), 0.5f)));  // no FMA contraction
     else if constexpr (F == RINT) return __float_as_uint(rintf(x.f));
     else if constexpr (F == NEARBYINT) return __float_as_uint(nearbyintf(x.f));
     else if constexpr (F == LRINT) return u64(lrintf(x.f));
@@ -138,9 +140,15 @@ static u64 ref_op(int f, const In& x) {
         case LL2F_RZ: return fb(to_float((long double)x.ll, 1));
         case LL2D_RN: return db(double(x.ll));
         case I2D: return db(double(x.i));
-        case F2H_RN: return __half_as_ushort(__double2half(double(x.f * 1e-5f)));
+        case F2H_RN: {  // the bits by copy: __half_as_ushort is device-only before CUDA 12.2
+            const __half h = __double2half(double(x.f * 1e-5f));
+            unsigned short bits;
+            std::memcpy(&bits, &h, sizeof(bits));
+            return bits;
+        }
         case SAT: {
-            float v = x.f * 1e-9f + 0.5f;
+            volatile float p = x.f * 1e-9f;  // rounded on its own, as on the device: no FMA contraction
+            float v = p + 0.5f;
             return fb(std::isnan(v) ? 0.0f : std::min(1.0f, std::max(0.0f, v)));
         }
         case RINT:

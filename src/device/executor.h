@@ -8,6 +8,7 @@
 #include <mutex>
 #include <new>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "device/kernel_abi.h"
@@ -161,9 +162,11 @@ private:
         // last one left with no block to hand out (then nobody can join).
         static constexpr int64_t kClosed = int64_t(1) << 62;
         std::atomic<int64_t> state{0};
+        // At most this many workers inside at once (Executor::cap_for).
+        int64_t cap = INT64_MAX;
         bool try_join() {
             int64_t v = state.load(std::memory_order_relaxed);
-            while (!(v & kClosed))
+            while (!(v & kClosed) && v < cap)
                 if (state.compare_exchange_weak(v, v + 1, std::memory_order_acquire)) return true;
             return false;
         }
@@ -210,6 +213,15 @@ private:
         }
     };
 
+    // Workers worth calling for a launch of `units` blocks (or groups) of a
+    // kernel whose cost per unit was measured before: about CPUSIM_TARGET_US
+    // (2 us) of work each. Every worker that joins a job costs a few atomic operations
+    // on lines all the others touch too, serialized, and across sockets on a
+    // two-socket machine: with 124 workers a 1024-block kernel of 50 us of
+    // work took 170 us, nearly all of it joining and leaving.
+    int cap_for(uint64_t key, uint64_t units);
+    void learn_cost(uint64_t key, uint64_t units, uint64_t busy_ns);
+    std::unordered_map<uint64_t, double> cost_ns_;  // per (entry, width, split): ns per unit, under mutex_
     void worker(int index, int cpu);
     Job* pick(int worker);    // under mutex_: a job this worker should take part in, or null
     void maybe_finish(Job* job);  // under mutex_
@@ -239,6 +251,7 @@ private:
     // does not have every worker queue on the mutex.
     std::atomic<int> demand_{0};
     std::atomic<int> spinners_{0};  // idle workers spinning for a demand slot
+    static constexpr int kWakeFanout = 2;  // sleepers each wake-up passes on (worker())
     bool take_demand() {
         int d = demand_.load(std::memory_order_relaxed);
         while (d > 0)

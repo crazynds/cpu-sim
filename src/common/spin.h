@@ -41,22 +41,50 @@ inline uint64_t wait_spin_ns() {  // every other thread
     return ns;
 }
 
-// MONITORX/MWAITX (AMD, user mode): a waiting thread parks on a cache line
-// until it is written or a timeout, without taking execution resources from
-// the SMT sibling the way a pause loop does. CPUID 0x80000001, ECX bit 29.
-inline bool has_mwaitx() {
-    static const bool yes = [] {
+// Parking on a cache line, in user mode, where the CPU allows it: a waiting
+// thread stops until the line is written or a timeout, without taking
+// execution resources from the SMT sibling the way a pause loop does.
+//   - AMD: MONITORX/MWAITX (CPUID 0x80000001, ECX bit 29).
+//   - Intel: UMONITOR/UMWAIT, WAITPKG (CPUID 7.0, ECX bit 5), in the C0.1
+//     state (the faster wake-up); the OS caps each wait (IA32_UMWAIT_CONTROL,
+//     100k cycles by default), which a timeout of a microsecond is far below.
+// CPUSIM_PARK=0 turns parking off (a pause loop instead).
+enum class Park { None, Mwaitx, Umwait };
+
+inline Park park_kind() {
+    static const Park kind = [] {
+        if (const char* v = std::getenv("CPUSIM_PARK"); v && std::atoi(v) == 0) return Park::None;
         unsigned a = 0x80000001, b = 0, c = 0, d = 0;
         __asm__("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d) : "c"(0));
-        return (c >> 29) & 1;
+        if ((c >> 29) & 1) return Park::Mwaitx;
+        a = 7, b = c = d = 0;
+        __asm__("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+        if ((c >> 5) & 1) return Park::Umwait;
+        return Park::None;
     }();
-    return yes;
+    return kind;
 }
 
-// One short wait for a write to `line` (at most ~`ticks` TSC ticks).
-__attribute__((target("mwaitx"))) inline void park_on(const void* line, unsigned ticks) {
+inline bool has_mwaitx() { return park_kind() == Park::Mwaitx; }
+
+__attribute__((target("mwaitx"))) inline void park_mwaitx(const void* line, unsigned ticks) {
     _mm_monitorx(const_cast<void*>(line), 0, 0);
     _mm_mwaitx(2 /* timer */, 0, ticks);
+}
+
+__attribute__((target("waitpkg"))) inline void park_umwait(const void* line, unsigned ticks) {
+    _umonitor(const_cast<void*>(line));
+    _umwait(1 /* C0.1 */, __rdtsc() + ticks);
+}
+
+// One short wait for a write to `line` (at most ~`ticks` TSC ticks); returns
+// false when the CPU cannot park (the caller pauses instead).
+inline bool park_on(const void* line, unsigned ticks) {
+    switch (park_kind()) {
+        case Park::Mwaitx: park_mwaitx(line, ticks); return true;
+        case Park::Umwait: park_umwait(line, ticks); return true;
+        default: return false;
+    }
 }
 
 // Spins until ready() holds or the time is up; returns ready()'s last answer.

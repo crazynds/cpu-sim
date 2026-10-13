@@ -70,15 +70,19 @@ void VramPool::populate(uint64_t begin, uint64_t end) {
     for (uint64_t off = b; off < e; off += page_size_) *reinterpret_cast<volatile uint8_t*>(base_ + off) = 0;
 }
 
-uint64_t VramPool::resident_bytes() const {
+uint64_t VramPool::resident_bytes(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) const {
     const uint64_t page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
     const uint64_t chunk = 256 * MiB;
     std::vector<unsigned char> vec(chunk / page);
     uint64_t resident = 0;
-    for (uint64_t off = 0; off < size_; off += chunk) {
-        uint64_t len = std::min(chunk, size_ - off);
-        if (mincore(base_ + off, len, vec.data()) != 0) return 0;
-        for (uint64_t i = 0; i < (len + page - 1) / page; ++i) resident += vec[i] & 1;
+    for (auto [start, length] : ranges) {
+        // Whole pages around the range (mincore wants an aligned start).
+        const uint64_t begin = start / page * page, end = std::min(size_, (start + length + page - 1) / page * page);
+        for (uint64_t off = begin; off < end; off += chunk) {
+            const uint64_t len = std::min(chunk, end - off);
+            if (mincore(base_ + off, len, vec.data()) != 0) return 0;
+            for (uint64_t i = 0; i < (len + page - 1) / page; ++i) resident += vec[i] & 1;
+        }
     }
     return resident * page;
 }

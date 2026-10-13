@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "common/config.h"
 
@@ -36,8 +38,11 @@ public:
     // costs a 2 MiB clear in the middle of a launch).
     void populate(uint64_t begin, uint64_t end);
 
-    // Bytes of the pool currently backed by host RAM.
-    uint64_t resident_bytes() const;
+    // Bytes of [offset, offset + length) ranges of the pool backed by host RAM
+    // (the allocations: freed memory goes back to the OS). Walking only them
+    // keeps it cheap with a large pool: the whole of a 256 GiB pool is 64M
+    // page entries, most of a second per call.
+    uint64_t resident_bytes(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) const;
 
 private:
     VramPool() = default;

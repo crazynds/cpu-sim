@@ -14,6 +14,7 @@ The third round: it started with stability tests that require the same bits in a
 | 30 | [Launches and the slow cases](30-launches-and-hot-spots.md) | An empty kernel from 42 us to 1.7 us; atomics merged per warp; against OpenMP, 335 of 541 cases faster (233 before) |
 | 31 | [Micro-optimizations and 32-bit gathers](31-gathers-and-scatters.md) | Instruction order and masks do not matter with SMT; addresses recomputed where used and 32-bit gather indices: bitonic sort 1.18x |
 | 32 | [The warp size](32-warp-size.md) | `CPUSIM_WARP_SIZE=16/32/64`; blocks smaller than a warp in fewer lanes (10 to 46% faster) |
+| 33 | [A two-socket Xeon](33-xeon-server.md) | H100, OpenMP and the simulator on 2 x 32 cores; launches 816 to 3.7 us (monitor, wake-ups, workers per job, C-states) |
 
 ## Tensor core results at the end of the iteration
 

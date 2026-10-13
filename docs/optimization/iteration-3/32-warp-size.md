@@ -74,4 +74,4 @@ The whole stress suite rebuilt with each size (631 cases): with 16, 591 pass; 32
 
 Two fixes along the way. Three loops over the active lanes (atomics grouped by address, per-lane external calls, calls through a pointer) turned the index of the first lane, a W-bit count, into an `i32` with a truncation, which is invalid IR when W is 16; it is now a zero extension or a truncation as needed (`wl_graph` and `wl_sort` did not compile with warps of 16). And the clean-up pipeline after the SIMT pass ran `instcombine` with LLVM's fixpoint verification, which aborted on the 16-lane entries ("Instruction Combining did not reach a fixpoint"); every other pipeline of `cpusim-devc` already turned it off ([11](../iteration-1/11-llvm-tuning.md)).
 
-Previous: [31](31-gathers-and-scatters.md). Back to the [iteration 3 index](README.md).
+Previous: [31](31-gathers-and-scatters.md). Next: [33](33-xeon-server.md). Back to the [iteration 3 index](README.md).
