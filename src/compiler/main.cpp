@@ -40,6 +40,7 @@
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Transforms/Utils/LowerMemIntrinsics.h>
 
+#include "common/cpu_id.h"
 #include "compiler/simt.h"
 #include "device/kernel_abi.h"
 
@@ -56,6 +57,11 @@ namespace {
 struct Options {
     std::string input, output, manifest, emit_ll, emit_scalar_ll, emit_raw_ll, emit_asm;
     std::string cpu = "native";  // the CPU this runs on (the JIT runs where the kernels run)
+    // With "native": the extensions this CPU really has (not the defaults of
+    // its model: a virtual machine may hide some), and its signature in the
+    // manifest, so the runtime uses this code only on the same kind of CPU.
+    std::string features;
+    uint64_t signature = 0;
     uint32_t specialize[3] = {0, 0, 0};
 };
 
@@ -85,7 +91,11 @@ Options parse_args(int argc, char** argv) {
     }
     if (o.input.empty() || o.output.empty() || o.manifest.empty())
         die("usage: cpusim-devc device.bc -o kernels.o --manifest kernels.manifest");
-    if (o.cpu == "native") o.cpu = sys::getHostCPUName().str();
+    if (o.cpu == "native") {
+        o.cpu = sys::getHostCPUName().str();
+        for (const auto& f : sys::getHostCPUFeatures()) o.features += (o.features.empty() ? "" : ",") + std::string(f.getValue() ? "+" : "-") + f.getKey().str();
+        o.signature = cpusim::cpu_signature();
+    }
     return o;
 }
 
@@ -805,7 +815,7 @@ int main(int argc, char** argv) {
     const Target* target = TargetRegistry::lookupTarget(triple, err);
     if (!target) die(err);
     TargetOptions to;
-    std::unique_ptr<TargetMachine> tm(target->createTargetMachine(triple, opt.cpu, "", to, Reloc::PIC_, std::nullopt,
+    std::unique_ptr<TargetMachine> tm(target->createTargetMachine(triple, opt.cpu, opt.features, to, Reloc::PIC_, std::nullopt,
                                                                   CodeGenOptLevel::Aggressive));
     if (!tm) die("cannot create a target machine for " + opt.cpu);
 
@@ -864,8 +874,10 @@ int main(int argc, char** argv) {
     for (auto& k : kernels) k.spins = mark_spin_loops(*k.scalar);
     if (!opt.emit_scalar_ll.empty()) write_ll(*m, opt.emit_scalar_ll);
 
+    char cpu_tag[32] = "";
+    if (opt.signature) std::snprintf(cpu_tag, sizeof(cpu_tag), " cpu=%016llx", (unsigned long long)opt.signature);
     std::string manifest = "cpusim-module " + std::to_string(CPUSIM_KERNEL_ABI) + " warp=" + std::to_string(warp_size) +
-                           "\n" + symbol_lines;
+                           cpu_tag + "\n" + symbol_lines;
     int failures = 0;
     for (auto& k : kernels) {
         std::string why;

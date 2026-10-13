@@ -24,6 +24,7 @@
 
 extern char** environ;
 
+#include "common/cpu_id.h"
 #include "cudart/streams.h"
 #include "cuda_runtime_api.h"
 #include "device/device.h"
@@ -122,6 +123,10 @@ struct Module {
     }
     bool loaded = false;
     uint64_t handle = 0;
+    // Its code was compiled for another kind of CPU (common/cpu_id.h): its
+    // kernels do not launch (cudaErrorNoKernelImageForDevice), as a CUDA
+    // binary without code for the GPU it runs on.
+    bool foreign = false;
     std::map<std::array<uint32_t, 3>, JitModule> jit;  // by block shape
     std::map<std::array<uint32_t, 3>, bool> dumped;    // CPUSIM_DUMP_ASM, by block shape ({0,0,0}: generic)
 };
@@ -303,6 +308,9 @@ uint64_t bitcode_hash(const Module& m) {
     }();
     h = (h ^ devc_id) * 1099511628211ull;
 #endif
+    // The CPU it compiles for: a cache shared by machines (a home on NFS)
+    // must not hand one machine's code to another.
+    h = (h ^ cpusim::cpu_signature()) * 1099511628211ull;
     return h ^ CPUSIM_KERNEL_ABI;
 }
 
@@ -531,6 +539,10 @@ bool parse_manifest(const char* text, size_t size, Module* m) {
     // (sm=NN: the compute capability its tensor core types need).
     std::string line;
     std::getline(in, line);
+    // cpu=<signature>: the module was compiled for "this machine" (cucc's
+    // default, --mcpu=native); it runs only on the same kind of CPU.
+    if (auto pos = line.find("cpu="); pos != std::string::npos)
+        m->foreign = std::strtoull(line.c_str() + pos + 4, nullptr, 16) != cpusim::cpu_signature();
     // warp=N: the warp size of the module; every module of a program must agree.
     if (auto pos = line.find("warp="); pos != std::string::npos) {
         int w = std::atoi(line.c_str() + pos + 5), expected = 0;
@@ -1373,6 +1385,14 @@ cudaError_t cudaLaunchKernel(const void* func, dim3 grid, dim3 block, void** arg
     uint64_t function = f.handle;
     // Instrumented launches run the generic module (the JIT one has no
     // instrumented entries).
+    if (m.foreign) {
+        static std::once_flag told;
+        std::call_once(told, [] {
+            std::fprintf(stderr, "cpusim: the kernels were compiled for another kind of CPU (cucc --mcpu=native "
+                                 "on another machine); rebuild them here, or with --mcpu=<cpu> for both\n");
+        });
+        return record(Error::NoKernelImageForDevice);
+    }
     bool specialized = false;
     if (!profiler().enabled)
         if (uint64_t jf = jit_function(m, k, {block.x, block.y, block.z}, d)) function = jf, specialized = true;
