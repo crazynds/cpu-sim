@@ -984,12 +984,12 @@ int main(int argc, char** argv) {
                                       call->getIntrinsicID() == Intrinsic::nvvm_bar_sync ||
                                       call->getIntrinsicID() == Intrinsic::nvvm_barrier ||
                                       call->getIntrinsicID() == Intrinsic::nvvm_barrier_n;
-        // Lanes that never look at each other (CPUSIM_META_LANE_INDEPENDENT):
-        // nothing shared, nothing collective, in the kernel or what it calls.
-        // Only for the generic module: a module specialized for a block shape
-        // has its entry masks built in, so it cannot run a subset of lanes.
-        bool lane_independent = k.spec_block[0] == 0 && !k.has_barriers && !k.spins && k.shared_bytes == 0 && min_sm == 0;
+        // Lanes that never look at each other: nothing shared, nothing
+        // collective, in the kernel or what it calls. They can run apart
+        // (CPUSIM_META_LANE_INDEPENDENT) or take other threads (refill).
+        bool collective_free = !k.has_barriers && !k.spins && k.shared_bytes == 0 && min_sm == 0;
         {
+            bool& lane_independent = collective_free;
             std::vector<Function*> todo{k.scalar};
             std::set<Function*> seen{k.scalar};
             while (lane_independent && !todo.empty()) {
@@ -1019,6 +1019,9 @@ int main(int argc, char** argv) {
                     }
             }
         }
+        // Spreading lanes over workers: only for the generic module (a module
+        // specialized for a block shape has its entry masks built in).
+        bool lane_independent = collective_free && k.spec_block[0] == 0;
         // With a known block shape (JIT at launch) only the variants the
         // runtime can pick are built, and no instrumented one (profiling runs
         // the generic module).
@@ -1083,6 +1086,25 @@ int main(int argc, char** argv) {
         if (k.has_barriers && L == 32 && k.warp_lanes == 32) {  // opt-in (CPUSIM_BLOCK_FN), for warps of 32
             build_block_function(*m, k);
             k.wide_variants |= CPUSIM_META_BLOCK_FN;
+        }
+        // Lanes that refill (make_refill_kernel): one more candidate for the
+        // runtime's measurement, for kernels with a loop.
+        static const bool no_refill = std::getenv("CPUSIM_NO_REFILL") != nullptr;
+        if (collective_free && !no_refill) {
+            ValueToValueMapTy vmap;
+            Function* copy = CloneFunction(k.scalar, vmap);
+            std::string rwhy;
+            bool built = cpusim::make_refill_kernel(*copy, k, &rwhy);
+            if (built && std::getenv("CPUSIM_DEVC_REFILL_LL")) copy->print(errs());  // the rewritten per-thread code
+            built = built && cpusim::build_warp_entry(*m, k, *copy, false, k.warp_lanes, false, &rwhy, false, true);
+            copy->eraseFromParent();
+            if (built) {
+                k.wide_variants |= CPUSIM_META_REFILL;
+            } else {
+                if (Function* f = m->getFunction("__cpusim_entryr_" + k.name)) f->eraseFromParent();
+                if (std::getenv("CPUSIM_DEVC_DEBUG"))
+                    std::fprintf(stderr, "cpusim-devc: %s: no refill entry: %s\n", k.name.c_str(), rwhy.c_str());
+            }
         }
         // Spreading lanes pays only when a lane's work is serial in the warp
         // code: atomics (one lane at a time) and gathers or scatters (one

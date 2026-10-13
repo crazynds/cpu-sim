@@ -476,6 +476,20 @@ void Executor::run_blocks(const Job& job, int worker, CtxArray& ctx, uint8_t* sh
     }
     std::vector<uint8_t> done(n);
     std::vector<uint32_t> phase(n);
+    if (job.refill_blocks) {
+        // A run of blocks per unit: one call, its lanes take the threads.
+        const uint64_t per_block = uint64_t(job.cfg.block[0]) * job.cfg.block[1] * job.cfg.block[2];
+        cpusim_warp_ctx* c = ctx.at(0);
+        uint64_t u;
+        while (claim(job, worker, &u)) {
+            const uint64_t b0 = job.refill_first + u * job.refill_blocks;
+            const uint64_t b1 = std::min(b0 + job.refill_blocks, job.refill_last);
+            c->refill_next = b0 * per_block;
+            c->refill_end = b1 * per_block;
+            in_kernel(job.entry, c);
+        }
+        return;
+    }
     if (job.split > 1) {
         // One group of a block per unit; the groups need nothing else.
         uint64_t u;
@@ -771,7 +785,7 @@ CtxArray Executor::slice_groups(const CtxArray& groups, uint32_t lanes, uint32_t
 void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const cpusim_kernel_meta& meta,
                    const LaunchConfig& cfg, const uint8_t* params, uint64_t* counters, cpusim_block_fn block,
                    bool cooperative, uint64_t first, uint64_t last, uint64_t* busy_ns, KernelFault* fault,
-                   uint32_t tag) {
+                   uint32_t tag, bool refill) {
     CtxArray warps = make_groups(cfg, lanes, meta.warp_size);
     // Block-wide entries never suspend: no frames.
     uint32_t frame_bytes = 0;
@@ -796,7 +810,17 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     // into slices of lanes, each a call of its own. A slice is the group's
     // context with the other lanes masked off; the split below hands them out.
     const uint64_t workers = threads_.size();
-    if (!job.cooperative && !block && (meta.flags & CPUSIM_META_LANE_INDEPENDENT) && cfg.shared_bytes == 0 &&
+    if (refill) {
+        // Runs of blocks, about 8 per worker: enough threads per call for
+        // its lanes to refill many times, enough calls to balance.
+        const uint64_t blocks = job.blocks - std::min(first, job.blocks);
+        job.refill_blocks = std::clamp<uint64_t>(blocks / (8 * workers), 1, 64);
+        job.refill_first = first;
+        job.refill_last = job.blocks;
+        job.blocks = (blocks + job.refill_blocks - 1) / job.refill_blocks;
+        first = 0;
+    }
+    if (!refill && !job.cooperative && !block && (meta.flags & CPUSIM_META_LANE_INDEPENDENT) && cfg.shared_bytes == 0 &&
         total * warps.count < workers) {
         uint32_t slices = 1;
         while (slices < lanes && total * warps.count * slices < 2 * workers) slices *= 2;
@@ -806,7 +830,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     // talk to each other: with few blocks, hand out its groups one by one
     // (as a GPU schedules warps), so the work spreads over every worker
     // instead of one worker per block. matrix-rotate launches 10 blocks.
-    if (!job.cooperative && !block && !(meta.flags & CPUSIM_META_HAS_BARRIERS) && cfg.shared_bytes == 0 &&
+    if (!refill && !job.cooperative && !block && !(meta.flags & CPUSIM_META_HAS_BARRIERS) && cfg.shared_bytes == 0 &&
         warps.count > 1 && total < 8 * threads_.size()) {
         job.split = warps.count;
         job.blocks *= job.split;
@@ -818,7 +842,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     if (first >= job.blocks) return;
     // What the kernel costs per unit, learned from its previous launches.
     const uint64_t cost_key = reinterpret_cast<uintptr_t>(entry) ^ (uint64_t(lanes) << 48) ^ (uint64_t(job.split) << 40) ^
-                              (block ? 1ull << 39 : 0);
+                              (block ? 1ull << 39 : 0) ^ (refill ? 1ull << 38 : 0);
     if (!job.cooperative) {
         // The workers it is worth calling, and their sequences: worker w's is
         // chunks w, w + n, w + 2n... of `chunk` blocks, n = the workers called

@@ -78,8 +78,10 @@ public:
           profile_(profile), ctx_(m.getContext()), b_(ctx_), fn_(target) {}
 
     bool run(std::string* error);
+    void set_refill() { refill_ = true; }
 
 private:
+    bool refill_ = false;  // __cpusim_entryr_: lanes refill (make_refill_kernel)
     // ---- preparation and analysis
     bool check_supported();
     bool insert_prefetches();
@@ -98,6 +100,7 @@ private:
     // `ptr`: the address of every lane in `mask` (default: the instruction's
     // own, uniform). Null if the operation has no reduction.
     Value* emit_uniform_rmw(AtomicRMWInst* rmw, Value* mask, Value* ptr = nullptr);
+    Value* emit_refill(bool first, Value* mask);
     // Operations emit_uniform_rmw reduces across lanes.
     static bool groupable(const AtomicRMWInst* rmw) {
         using Op = AtomicRMWInst::BinOp;
@@ -672,7 +675,8 @@ bool WarpBuilder::check_supported() {
                     continue;  // through a pointer: emit_call
                 } else if (callee->getName() == kSharedBaseFn || is_cond_load(call)) continue;
                 else if (callee->getName() == kShflFn || callee->getName() == kBallotFn || is_mma(call) || is_mmav(call) ||
-                         callee->getName() == kYieldFn)
+                         callee->getName() == kYieldFn || callee->getName() == kRefillFirstFn ||
+                         callee->getName() == kRefillNextFn)
                     continue;
                 else if (unsigned n; !libmvec_name(*call, &n).empty()) continue;
                 else if (!callee->isIntrinsic() && !callee->isDeclaration() && !callee->isVarArg()) continue;  // emit_call
@@ -1052,6 +1056,7 @@ void WarpBuilder::demote() {
     for (PHINode* phi : phis) {
         bool varying = uni_->is_varying(phi);
         AllocaInst* slot = DemotePHIToStack(phi);
+        if (!slot) continue;  // no uses: erased
         record(slot, varying);
         phi_slots.push_back({slot, varying});
     }
@@ -2493,6 +2498,38 @@ Value* WarpBuilder::emit_shfl(Value* v, Value* src) {
 
 // __cpusim_ballot: every lane of a warp gets the 64-bit mask of its warp's
 // lanes that are active here with pred != 0.
+// The next threads of the call's range (refill_next .. refill_end) for the
+// lanes in `mask`, in lane order: lane l gets next + the number of lanes of
+// the mask below l. The first call gives every lane one (mask: all lanes).
+// Past the end: ~0.
+Value* WarpBuilder::emit_refill(bool first, Value* mask) {
+    auto* i64 = b_.getInt64Ty();
+    Value* next_p = b_.CreateConstInBoundsGEP1_64(b_.getInt8Ty(), ctx_arg_, CPUSIM_CTX_REFILL_NEXT);
+    Value* end = b_.CreateAlignedLoad(i64, b_.CreateConstInBoundsGEP1_64(b_.getInt8Ty(), ctx_arg_, CPUSIM_CTX_REFILL_END),
+                                      Align(8), "refill.end");
+    Value* next = b_.CreateAlignedLoad(i64, next_p, Align(8), "refill.next");
+    Value* rank;
+    Value* count;
+    if (first) {
+        SmallVector<Constant*, 64> l;
+        for (unsigned i = 0; i < W; ++i) l.push_back(b_.getInt64(i));
+        rank = ConstantVector::get(l);
+        count = b_.getInt64(W);
+    } else {
+        // Lanes of the mask below each lane: popcount(bits & ((1 << l) - 1)).
+        Value* bits = b_.CreateZExt(b_.CreateBitCast(mask, b_.getIntNTy(W)), i64);
+        SmallVector<Constant*, 64> below;
+        for (unsigned i = 0; i < W; ++i) below.push_back(b_.getInt64(i == 64 ? ~0ull : (1ull << i) - 1));
+        Value* masked = b_.CreateAnd(b_.CreateVectorSplat(W, bits), ConstantVector::get(below));
+        rank = b_.CreateUnaryIntrinsic(Intrinsic::ctpop, masked);
+        count = b_.CreateUnaryIntrinsic(Intrinsic::ctpop, bits);
+    }
+    Value* lin = b_.CreateAdd(b_.CreateVectorSplat(W, next), rank, "refill.lin");
+    b_.CreateAlignedStore(b_.CreateAdd(next, count), next_p, Align(8));
+    Value* past = b_.CreateICmpUGE(lin, b_.CreateVectorSplat(W, end));
+    return b_.CreateSelect(past, ConstantVector::getSplat(ElementCount::getFixed(W), b_.getInt64(~0ull)), lin);
+}
+
 Value* WarpBuilder::emit_ballot(Value* pred, Value* mask) {
     const unsigned S = std::min(k_.warp_size, W);  // a warp's lanes present in the vector
     Value* bits = b_.CreateAnd(b_.CreateICmpNE(pred, Constant::getNullValue(pred->getType())), mask);
@@ -3005,7 +3042,8 @@ void WarpBuilder::emit_prologue() {
 
     w_ = fn_ ? fn_
              : Function::Create(FunctionType::get(i32, {ptr}, false), GlobalValue::ExternalLinkage,
-                                (profile_ ? std::string("__cpusim_prof_")
+                                (refill_ ? std::string("__cpusim_entryr_")
+                                 : profile_ ? std::string("__cpusim_prof_")
                                  : W <= k_.warp_size ? std::string("__cpusim_entry_")
                                                          : "__cpusim_entry" + std::to_string(W) +
                                                                (coop_ ? "c_" : block_wide_ ? "_" : "s_")) +
@@ -3049,7 +3087,7 @@ void WarpBuilder::emit_prologue() {
         offset = alignTo(offset, align);
         Value* p = b_.CreateConstInBoundsGEP1_64(b_.getInt8Ty(), params, offset);
         scalar_map_[&arg] = byval ? p : b_.CreateAlignedLoad(t, p, Align(align), arg.getName());
-        if (!profile_ && W <= k_.warp_size) k_.params.push_back({offset, size});
+        if (!profile_ && !refill_ && W <= k_.warp_size) k_.params.push_back({offset, size});
         offset += size;
     }
     if (!fn_) k_.param_bytes = offset;
@@ -3093,6 +3131,7 @@ void WarpBuilder::emit_prologue() {
     special_[(int)SpecialReg::WarpSize] = b_.getInt32(k_.warp_size);
     special_[(int)SpecialReg::SharedBase] = b_.CreateAlignedLoad(ptr, field(CPUSIM_CTX_SHARED), Align(8), "shared");
     Value* lane_mask = fn_ ? w_->getArg(1)
+                       : refill_ ? Constant::getAllOnesValue(mask_type_)  // lanes without a thread leave at once
                        : spec_lane_mask_
                            ? spec_lane_mask_
                            : b_.CreateBitCast(b_.CreateAlignedLoad(b_.getIntNTy(W), field(CPUSIM_CTX_LANE_MASK(W)),
@@ -3775,6 +3814,7 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
         StringRef name = call->getCalledFunction()->getName();
         if (name == kShflFn) return set(emit_shfl(vector(call->getArgOperand(0)), vector(call->getArgOperand(1))));
         if (name == kBallotFn) return set(emit_ballot(vector(call->getArgOperand(0)), mask));
+        if (name == kRefillFirstFn || name == kRefillNextFn) return set(emit_refill(name == kRefillFirstFn, mask));
     }
     if (auto* call = dyn_cast<CallInst>(&inst)) {
         if (unsigned arity; true) {
@@ -3924,12 +3964,13 @@ bool WarpBuilder::run(std::string* error) {
 }  // namespace
 
 bool build_warp_entry(Module& m, KernelInfo& kernel, Function& scalar, bool profile, unsigned lanes, bool suspending,
-                      std::string* error, bool cooperative) {
+                      std::string* error, bool cooperative, bool refill) {
     // Barriers are no-ops in a wide variant: the runtime only uses those when
     // the whole block fits in one call. (Kernels without barriers are free to
     // run any number of warps per call.)
     WarpBuilder builder(m, kernel, scalar, profile, lanes, lanes > kernel.warp_size && !suspending && !cooperative,
                         cooperative);
+    if (refill) builder.set_refill();
     if (!builder.run(error)) return false;
     // The functions it calls without inlining, and the ones those call.
     auto& pending = pending_functions();

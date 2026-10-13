@@ -14,7 +14,7 @@
 namespace cg = cooperative_groups;
 
 // warpSize on the host: cucc's is a constant; nvcc's exists only on the device.
-#ifdef __NVCC__
+#if defined(__NVCC__) && !defined(__CPUSIM__)
 constexpr int kWarp = 32;
 #else
 constexpr int kWarp = warpSize;

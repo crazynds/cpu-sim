@@ -21,4 +21,5 @@ Failures seen once or now and then, not reproduced on demand, kept here to look 
 ## Timing-sensitive tests on machines with power management
 
 - **Seen:** `cuda_async` failed on the Xeon with the `schedutil` governor: two kernels in two streams did not overlap enough. With the `performance` governor it passed every time.
+- **Seen:** 2026-10-13, laptop (`balance_performance`): `cuda_async` failed once in `ctest -L features -j6` and once alone ("kernels of two streams overlap", 98 against 81 ms), then passed alone. Same check, same cause as above as far as known.
 - **Known:** the test compares durations; a core that ramps its clock from idle makes the first kernel slower than the second. Not a simulator bug; the test could warm the cores first.

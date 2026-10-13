@@ -49,6 +49,11 @@ constexpr const char* kBallotFn = "__cpusim_ballot";
 // (cpusim-devc inserts it): the warp suspends there as at a barrier and lets
 // the other warps of its block run.
 constexpr const char* kYieldFn = "__cpusim_yield";
+// Refill entries (make_refill_kernel): the first thread of each lane, and the
+// next thread for each lane that calls it (linear indices over the grid;
+// ~0 when the call's range is used up).
+constexpr const char* kRefillFirstFn = "__cpusim_refill_first";
+constexpr const char* kRefillNextFn = "__cpusim_refill_next";
 inline bool is_yield(const llvm::Instruction& i) {
     auto* call = llvm::dyn_cast<llvm::CallInst>(&i);
     return call && call->getCalledFunction() && call->getCalledFunction()->getName() == kYieldFn;
@@ -100,6 +105,16 @@ void lower_shared_memory(llvm::Module& m, KernelInfo& kernel);
 // `cooperative`: half of a block per call (the SMT sibling runs the other
 // half), barriers call ctx->coop_barrier: `__cpusim_entry<lanes>c_<name>`.
 bool build_warp_entry(llvm::Module& m, KernelInfo& kernel, llvm::Function& scalar, bool profile, unsigned lanes,
-                      bool suspending, std::string* error, bool cooperative = false);
+                      bool suspending, std::string* error, bool cooperative = false, bool refill = false);
+
+// Rewrites a kernel whose lanes never look at each other (no barrier, shared
+// memory or warp collective) so that its lanes refill: the main loop (its
+// largest top-level loop) also runs, for a lane whose thread is done, the
+// rest of that thread, then the code before the loop for the lane's next
+// thread, and goes on; the warp only leaves the loop when no thread is left.
+// threadIdx and blockIdx come from the lane's current thread. The result is
+// built with build_warp_entry(..., refill = true). False (and *why) when the
+// kernel does not fit (no loop, other special registers).
+bool make_refill_kernel(llvm::Function& f, const KernelInfo& k, std::string* why);
 
 }  // namespace cpusim

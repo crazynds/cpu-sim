@@ -88,6 +88,10 @@ typedef struct __attribute__((aligned(64))) cpusim_warp_ctx {
     // inclusive: a pointer one past a huge object may still index back into
     // it. (Shared memory and per-thread arrays are always small.)
     uint64_t huge_lo, huge_hi;
+    // Refill entries (__cpusim_entryr_): the threads of the call, as linear
+    // indices over the grid (block * threads per block + thread), next one
+    // to hand out and end. A lane that finishes its thread takes the next.
+    uint64_t refill_next, refill_end;
 } cpusim_warp_ctx;
 
 #define CPUSIM_CTX_HEADER 128
@@ -133,6 +137,10 @@ enum cpusim_counter {
 // ballot, match or tensor core op): any subset of a group's lanes can run as
 // a call of its own, on its own worker.
 #define CPUSIM_META_LANE_INDEPENDENT 8u
+// __cpusim_entryr_<name> exists: the warp entry with lanes that refill (a
+// lane that finishes its thread takes the next one of the call's range, see
+// refill_next), for kernels whose lanes diverge in their main loop.
+#define CPUSIM_META_REFILL 16u
 
 // Kernels with barriers also get
 //     uint32_t __cpusim_block_<mangled name>(cpusim_warp_ctx* ctxs, uint32_t nwarps, uint8_t* done);
@@ -175,6 +183,8 @@ static inline uint32_t cpusim_stagger(uint32_t bytes) {
 #define CPUSIM_CTX_COOP_OTHER 88
 #define CPUSIM_CTX_HUGE_LO 96
 #define CPUSIM_CTX_HUGE_HI 104
+#define CPUSIM_CTX_REFILL_NEXT 112
+#define CPUSIM_CTX_REFILL_END 120
 
 #ifdef __cplusplus
 static_assert(sizeof(cpusim_warp_ctx) == CPUSIM_CTX_HEADER);
@@ -191,6 +201,8 @@ static_assert(offsetof(cpusim_warp_ctx, coop_epoch) == CPUSIM_CTX_COOP_EPOCH);
 static_assert(offsetof(cpusim_warp_ctx, coop_other) == CPUSIM_CTX_COOP_OTHER);
 static_assert(offsetof(cpusim_warp_ctx, huge_lo) == CPUSIM_CTX_HUGE_LO);
 static_assert(offsetof(cpusim_warp_ctx, huge_hi) == CPUSIM_CTX_HUGE_HI);
+static_assert(offsetof(cpusim_warp_ctx, refill_next) == CPUSIM_CTX_REFILL_NEXT);
+static_assert(offsetof(cpusim_warp_ctx, refill_end) == CPUSIM_CTX_REFILL_END);
 #endif
 
 typedef uint32_t (*cpusim_entry_fn)(const cpusim_warp_ctx*);

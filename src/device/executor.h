@@ -91,7 +91,7 @@ public:
              const LaunchConfig& cfg, const uint8_t* params, uint64_t* counters = nullptr,
              cpusim_block_fn block = nullptr, bool cooperative = false, uint64_t first = 0,
              uint64_t last = UINT64_MAX, uint64_t* busy_ns = nullptr, KernelFault* fault = nullptr,
-             uint32_t tag = 0);
+             uint32_t tag = 0, bool refill = false);
     // Stops the running launches tagged `tag` (0: all): their workers leave
     // the kernel code they are in. Their run() returns with a fault of
     // SIGUSR2. Call again while they last: a worker outside kernel code
@@ -133,6 +133,10 @@ private:
         // (kernels without barriers or shared memory, small grids): `next`
         // and `blocks` count units, unit u = block u / split, group u % split.
         uint32_t split = 1;
+        // > 0: a refill entry (CPUSIM_META_REFILL); the unit is a run of this
+        // many blocks from refill_first (up to refill_last), all its threads
+        // handed to one call.
+        uint64_t refill_blocks = 0, refill_first = 0, refill_last = 0;
         mutable std::atomic<uint64_t> next{0};  // cooperative jobs: next block to hand out
         // Everything else: blocks (units) dealt out in chunks of kChunk, chunk
         // c to worker c % workers, each walking its chunks in order; a worker

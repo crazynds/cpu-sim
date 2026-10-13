@@ -151,6 +151,7 @@ private:
             uint64_t coop[5] = {};  // cooperative variants with 2W << i lanes (half a block each)
             uint64_t block = 0;     // __cpusim_block_: whole block, 32-lane warps, barrier rounds inside
             uint64_t trace = 0;     // __cpusim_trace_: a wmma GEMM candidate (wmma_trace.h)
+            uint64_t refill = 0;    // __cpusim_entryr_: warp entry whose lanes refill (CPUSIM_META_REFILL)
             cpusim_kernel_meta meta{};
             std::map<uint64_t, Tuning> tuning;  // key: block shape
             // Launches of a wmma GEMM candidate, by grid, block and
