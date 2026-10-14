@@ -6,7 +6,9 @@
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <algorithm>
 #include <set>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -27,6 +29,10 @@
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Support/Program.h>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Transforms/Utils/SplitModule.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/SourceMgr.h>
@@ -65,6 +71,9 @@ struct Options {
     std::string features;
     uint64_t signature = 0;
     uint32_t specialize[3] = {0, 0, 0};
+    // With --specialize: only these kernels (the ones launched with that
+    // block shape); empty: all of them.
+    std::set<std::string> only;
 };
 
 Options parse_args(int argc, char** argv) {
@@ -87,6 +96,14 @@ Options parse_args(int argc, char** argv) {
             std::string v = value();
             if (std::sscanf(v.c_str(), "%u,%u,%u", &o.specialize[0], &o.specialize[1], &o.specialize[2]) != 3)
                 die("--specialize expects X,Y,Z");
+        }
+        else if (a == "--kernels") {  // name,name,...
+            std::string v = value();
+            for (size_t b = 0, e; b <= v.size(); b = e + 1) {
+                e = v.find(',', b);
+                if (e == std::string::npos) e = v.size();
+                if (e > b) o.only.insert(v.substr(b, e - b));
+            }
         }
         else if (!a.empty() && a[0] == '-') die("unknown option " + a);
         else o.input = a;
@@ -705,6 +722,26 @@ bool mark_spin_loops(Function& f) {
     return any;
 }
 
+// Loops with a barrier stay loops: unrolled, every copy of the barrier is
+// one more place where a warp suspends and resumes, and a barrier costs the
+// same inside a loop as outside. (HeCBench sc: 32 copies of a prefix sum
+// with barriers in its loops, over ten minutes to compile.)
+void keep_barrier_loops_rolled(Function& f) {
+    DominatorTree dt(f);
+    LoopInfo li(dt);
+    for (Loop* l : li.getLoopsInPreorder()) {
+        bool barrier = false;
+        for (BasicBlock* bb : l->blocks())
+            for (Instruction& i : *bb)
+                if (auto* ii = dyn_cast<IntrinsicInst>(&i)) {
+                    const Intrinsic::ID id = ii->getIntrinsicID();
+                    barrier |= id == Intrinsic::nvvm_barrier0 || id == Intrinsic::nvvm_bar_sync ||
+                               id == Intrinsic::nvvm_barrier || id == Intrinsic::nvvm_barrier_n;
+                }
+        if (barrier) l->setLoopAlreadyUnrolled();
+    }
+}
+
 bool has_alloca(const Function& f) {
     for (const BasicBlock& bb : f)
         for (const Instruction& i : bb)
@@ -869,6 +906,29 @@ int main(int argc, char** argv) {
     if (warp_size != 16 && warp_size != 32 && warp_size != 64) die("warp size must be 16, 32 or 64");
 
     std::vector<KernelInfo> kernels = find_kernels(*m);
+    // A specialized module holds only the kernels launched with its shape:
+    // building every kernel of the file once per shape made files with many
+    // kernels take kernels x shapes x widths builds (segsort, hadamard, sc:
+    // over ten minutes). The others run the generic module's code.
+    // Not with device functions whose address is taken (vtables, tables of
+    // function pointers): a call through a pointer reaches the vector
+    // versions built for the kernels that set the pointers up, so every
+    // kernel stays.
+    bool addresses_taken = false;
+    {
+        std::set<const Function*> entry_points;
+        for (const KernelInfo& k : kernels) entry_points.insert(k.scalar);
+        for (Function& f : *m)
+            if (!f.isDeclaration() && !entry_points.count(&f) && f.hasAddressTaken(nullptr, true, true, true, true))
+                addresses_taken = true;
+    }
+    if (!opt.only.empty() && !addresses_taken) {
+        for (KernelInfo& k : kernels)
+            if (!opt.only.count(k.name) && k.scalar->use_empty()) k.scalar->deleteBody();
+        kernels.erase(std::remove_if(kernels.begin(), kernels.end(),
+                                     [&](const KernelInfo& k) { return !opt.only.count(k.name); }),
+                      kernels.end());
+    }
     for (auto& k : kernels) {
         for (int i = 0; i < 3; ++i) k.spec_block[i] = opt.specialize[i];
         k.warp_size = k.warp_lanes = warp_size;
@@ -916,6 +976,7 @@ int main(int argc, char** argv) {
             run_function_pipeline(*f, tm.get(),
                                   "early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,lower-switch,lcssa");
         else if (has_alloca(*f)) {
+            keep_barrier_loops_rolled(*f);
             run_function_pipeline(*f, tm.get(),
                                   "loop-simplify,lcssa,loop(loop-rotate,indvars,loop-unroll-full),sroa<modify-cfg>,"
                                   "early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,gvn,"
@@ -940,8 +1001,23 @@ int main(int argc, char** argv) {
         // grows faster than linearly with size (register allocation), and the
         // JIT builds the variant the launch's block shape needs anyway.
         constexpr size_t kGenericBudget = 12000;
+        // Any module: a wide variant whose size, estimated from the warp
+        // entry's (it grows about with the lanes), passes this is not built
+        // at all. A kernel already large at 32 lanes (HeCBench hadamard: a
+        // fully unrolled template) took minutes per wide variant, for code
+        // with no registers left to gain from width.
+        constexpr size_t kWideBudget = 24000;
+        size_t warp_entry_size = 0;
         bool dropped = false;
         auto build = [&](bool profile, unsigned lanes, bool suspending = false, bool cooperative = false) {
+            if (!profile && lanes > k.warp_lanes && warp_entry_size &&
+                warp_entry_size * lanes / k.warp_lanes > (k.spec_block[0] ? kWideBudget : kGenericBudget)) {
+                if (std::getenv("CPUSIM_DEVC_DEBUG"))
+                    std::fprintf(stderr, "cpusim-devc: %s: %u lanes not built (warp entry: %zu instructions)\n",
+                                 k.name.c_str(), lanes, warp_entry_size);
+                dropped = true;
+                return true;
+            }
             ValueToValueMapTy vmap;
             Function* copy = CloneFunction(k.scalar, vmap);
             bool ok = cpusim::build_warp_entry(*m, k, *copy, profile, lanes, suspending, &why, cooperative);
@@ -1055,6 +1131,7 @@ int main(int argc, char** argv) {
         if (spec && !tensor)
             while (k.warp_lanes > 16 && threads <= k.warp_lanes / 2) k.warp_lanes /= 2;
         bool ok = build(false, k.warp_lanes) && (spec || build(true, k.warp_lanes));
+        if (Function* f = m->getFunction("__cpusim_entry_" + k.name)) warp_entry_size = f->getInstructionCount();
         // Wider variants (lanes 2L << i, L the warp size): with barriers, a
         // whole block per call makes them free (up to 512 lanes); without, 2
         // or 4 warps per call give the core more independent work. The
@@ -1083,7 +1160,11 @@ int main(int argc, char** argv) {
             ++failures;
             continue;
         }
-        if (k.has_barriers && L == 32 && k.warp_lanes == 32) {  // opt-in (CPUSIM_BLOCK_FN), for warps of 32
+        // Opt-in at run time (CPUSIM_BLOCK_FN), slower where measured: built
+        // only when asked for at compile time too (one more large function
+        // per kernel with barriers otherwise).
+        static const bool block_fn = std::getenv("CPUSIM_BLOCK_FN") != nullptr;
+        if (block_fn && k.has_barriers && L == 32 && k.warp_lanes == 32) {
             build_block_function(*m, k);
             k.wide_variants |= CPUSIM_META_BLOCK_FN;
         }
@@ -1162,6 +1243,7 @@ int main(int argc, char** argv) {
     // every module of the program (the generic one and each block shape's),
     // so a pointer stored by one kernel is called right by any other. Its
     // upper bits make it a non-canonical address, never a real one.
+    bool function_pointers = false;  // some address became a number (see below)
     {
         std::vector<Function*> left;
         for (Function& f : *m)
@@ -1169,6 +1251,7 @@ int main(int argc, char** argv) {
         for (Function* f : left) f->dropAllReferences();
         for (Function* f : left) {
             if (!f->use_empty()) {
+                function_pointers = true;
                 uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a
                 for (char c : f->getName()) h = (h ^ uint8_t(c)) * 0x100000001b3ull;
                 const uint64_t id = 0x8000000000000000ull | (h & 0x00007ffffffffff0ull);
@@ -1189,11 +1272,80 @@ int main(int argc, char** argv) {
             if (refine_uniform_masks(f) && verifyFunction(f, &errs()))
                 die("internal error: IR does not verify after refining masks in " + f.getName().str());
         }
+    std::error_code ec;
+    // Optimization and code generation in parallel: the module split into
+    // parts (kernels that share nothing go apart), each optimized and turned
+    // into an object in a thread of its own with its own context, the
+    // objects joined into one. One file's kernels used to go one after the
+    // other (HeCBench hadamard: 18 kernels, 90 s on one core).
+    const unsigned parts = std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()), 16);
+    size_t kernel_functions = 0;
+    for (Function& f : *m)
+        if (!f.isDeclaration() && f.getName().starts_with("__cpusim_")) ++kernel_functions;
+    // (Not with function pointers: a vtable of numbers is read where it is
+    // defined; split apart, the calls through it went wrong.)
+    if (parts > 1 && kernel_functions > 1 && !function_pointers && opt.emit_ll.empty() && opt.emit_asm.empty()) {
+        // A definition another part may use must survive its own part's
+        // clean-up: linkonce (vtables, inline functions) would be dropped
+        // where unused and missing where used.
+        for (GlobalValue& g : m->global_values())
+            if (!g.isDeclaration() && (g.hasLinkOnceLinkage() || g.hasAvailableExternallyLinkage()))
+                g.setLinkage(GlobalValue::WeakODRLinkage);
+        std::vector<SmallString<0>> bitcode;
+        SplitModule(
+            *m, std::min<unsigned>(parts, unsigned(kernel_functions)),
+            [&](std::unique_ptr<Module> part) {
+                SmallString<0> buf;
+                raw_svector_ostream os(buf);
+                WriteBitcodeToFile(*part, os);
+                bitcode.push_back(std::move(buf));
+            },
+            false);
+        std::vector<std::string> objects(bitcode.size());
+        std::vector<std::string> errors(bitcode.size());
+        std::vector<std::thread> threads;
+        for (size_t i = 0; i < bitcode.size(); ++i)
+            threads.emplace_back([&, i] {
+                LLVMContext c;
+                Expected<std::unique_ptr<Module>> part =
+                    parseBitcodeFile(MemoryBufferRef(StringRef(bitcode[i].data(), bitcode[i].size()), "part"), c);
+                if (!part) {
+                    errors[i] = toString(part.takeError());
+                    return;
+                }
+                std::unique_ptr<TargetMachine> t(target->createTargetMachine(
+                    triple, opt.cpu, opt.features, to, Reloc::PIC_, std::nullopt, CodeGenOptLevel::Aggressive));
+                run_pipeline(**part, t.get(), "O3");
+                widen_mask_selects(**part);
+                objects[i] = opt.output + ".part" + std::to_string(i) + ".o";
+                std::error_code e;
+                raw_fd_ostream out(objects[i], e, sys::fs::OF_None);
+                legacy::PassManager pm;
+                if (e || t->addPassesToEmitFile(pm, out, nullptr, CodeGenFileType::ObjectFile)) {
+                    errors[i] = "cannot emit " + objects[i];
+                    return;
+                }
+                pm.run(**part);
+            });
+        for (auto& th : threads) th.join();
+        for (const auto& e : errors)
+            if (!e.empty()) die(e);
+        std::vector<std::string> cmd{CPUSIM_CLANG_PATH, "-r", "-nostdlib", "-o", opt.output};
+        cmd.insert(cmd.end(), objects.begin(), objects.end());
+        std::vector<StringRef> args(cmd.begin(), cmd.end());
+        std::string msg;
+        const int rc = sys::ExecuteAndWait(cmd[0], args, std::nullopt, {}, 0, 0, &msg);
+        for (const auto& o : objects) sys::fs::remove(o);
+        if (rc != 0) die("joining the objects failed: " + msg);
+        std::ofstream mf(opt.manifest);
+        mf << manifest;
+        return mf ? 0 : 1;
+    }
+
     run_pipeline(*m, tm.get(), "O3");
     widen_mask_selects(*m);
     if (!opt.emit_ll.empty()) write_ll(*m, opt.emit_ll);
 
-    std::error_code ec;
     if (!opt.emit_asm.empty()) {
         // Code generation changes the module, so the listing comes from a copy.
         std::unique_ptr<Module> copy = CloneModule(*m);

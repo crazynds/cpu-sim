@@ -129,6 +129,9 @@ struct Module {
     // binary without code for the GPU it runs on.
     bool foreign = false;
     std::map<std::array<uint32_t, 3>, JitModule> jit;  // by block shape
+    // Compiled at run time, one kernel for one shape (the ahead-of-time
+    // modules hold only the kernels launched with their constant shape).
+    std::map<std::pair<std::array<uint32_t, 3>, std::string>, JitModule> jit_kernel;
     std::map<std::array<uint32_t, 3>, bool> dumped;    // CPUSIM_DUMP_ASM, by block shape ({0,0,0}: generic)
 };
 
@@ -316,15 +319,16 @@ uint64_t bitcode_hash(const Module& m) {
 }
 
 // Path of the specialized shared object, compiling it if it is not cached.
-bool jit_object(const Module& m, const std::array<uint32_t, 3>& block, std::string* path) {
+bool jit_object(const Module& m, const std::array<uint32_t, 3>& block, const std::string& kernel, std::string* path) {
 #if defined(CPUSIM_DEVC_PATH) && defined(CPUSIM_CLANG_PATH)
     const auto* base = reinterpret_cast<const uint8_t*>(m.header);
     const uint8_t* bc = base + m.header->bitcode_offset;
     const uint64_t n = m.header->bitcode_size;
     const uint64_t h = bitcode_hash(m);
 
-    char name[96];
-    std::snprintf(name, sizeof(name), "/%016llx-%ux%ux%u", (unsigned long long)h, block[0], block[1], block[2]);
+    char name[128];
+    std::snprintf(name, sizeof(name), "/%016llx-%ux%ux%u-%016llx", (unsigned long long)h, block[0], block[1], block[2],
+                  (unsigned long long)std::hash<std::string>{}(kernel));
     std::string stem = jit_cache_dir() + name;
     *path = stem + ".so";
     if (access(path->c_str(), R_OK) == 0) return true;
@@ -339,19 +343,19 @@ bool jit_object(const Module& m, const std::array<uint32_t, 3>& block, std::stri
     std::snprintf(spec, sizeof(spec), "%u,%u,%u", block[0], block[1], block[2]);
     auto start = std::chrono::steady_clock::now();
     bool ok = run_tool({CPUSIM_DEVC_PATH, tmp + ".bc", "-o", tmp + ".o", "--manifest", tmp + ".manifest",
-                        "--specialize", spec}) &&
+                        "--specialize", spec, "--kernels", kernel}) &&
               run_tool({CPUSIM_CLANG_PATH, "-shared", "-nostdlib", "-o", tmp + ".so", tmp + ".o", "-Wl,--as-needed",
                         "-lmvec", "-lm", "-L" CPUSIM_LIB_DIR_PATH, "-lcpusim_tensor",
                         "-Wl,-rpath," CPUSIM_LIB_DIR_PATH}) &&
               std::rename((tmp + ".so").c_str(), path->c_str()) == 0;
     for (const char* ext : {".bc", ".o", ".manifest", ".so"}) std::remove((tmp + ext).c_str());
     if (std::getenv("CPUSIM_VERBOSE"))
-        std::fprintf(stderr, "cpusim: JIT for block (%u,%u,%u): %s in %.1f s\n", block[0], block[1], block[2],
-                     ok ? "compiled" : "FAILED",
+        std::fprintf(stderr, "cpusim: JIT of %s for block (%u,%u,%u): %s in %.1f s\n", kernel.c_str(), block[0],
+                     block[1], block[2], ok ? "compiled" : "FAILED",
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
     return ok;
 #else
-    (void)m, (void)block, (void)path;
+    (void)m, (void)block, (void)kernel, (void)path;
     return false;
 #endif
 }
@@ -493,35 +497,51 @@ const cpusim_fatbin_specialized* specialized_object(const Module& m, const std::
 
 uint64_t jit_function(Module& m, const KernelDesc& k, const std::array<uint32_t, 3>& block, cpusim::Device* d) {
     if (!specialization_enabled() || (!m.header->bitcode_size && !m.header->specialized_count)) return 0;
-    JitModule& j = m.jit[block];
-    if (!j.tried) {
-        j.tried = true;
-        std::string path;
-        if (const cpusim_fatbin_specialized* s = specialized_object(m, block)) {
-            // Compiled ahead of time: nothing to wait for.
+    auto lookup = [&](JitModule& jm) -> uint64_t {
+        if (!jm.ok) return 0;
+        auto it = jm.functions.find(k.name);
+        if (it != jm.functions.end()) return it->second;
+        uint64_t fn = 0;
+        if (d->get_function(jm.handle, k.name, &fn) != Error::Success) fn = 0;
+        jm.functions[k.name] = fn;
+        return fn;
+    };
+    // The program's variables, already in the VRAM (the generic module is
+    // loaded first).
+    auto bind = [&](JitModule& jm) {
+        if (jm.ok && !m.symbols.empty()) jm.ok = d->bind_symbols(jm.handle, m.symbol_table(), false) == Error::Success;
+    };
+    // Compiled ahead of time for this shape: the kernels launched with it.
+    if (const cpusim_fatbin_specialized* s = specialized_object(m, block)) {
+        JitModule& j = m.jit[block];
+        if (!j.tried) {
+            j.tried = true;
             j.ok = d->load_module(reinterpret_cast<const uint8_t*>(m.header) + s->offset, s->size, &j.handle) ==
                    Error::Success;
+            bind(j);
             if (std::getenv("CPUSIM_VERBOSE"))
                 std::fprintf(stderr, "cpusim: block (%u,%u,%u): specialized ahead of time%s\n", block[0], block[1],
                              block[2], j.ok ? "" : ", but it does not load");
-        } else if (m.header->bitcode_size && jit_object(m, block, &path)) {
+        }
+        if (uint64_t fn = lookup(j)) return fn;
+    }
+    // Otherwise the JIT: this kernel for this shape (compiling every kernel
+    // of the file for each shape cost minutes on files with many kernels).
+    if (!m.header->bitcode_size) return 0;
+    JitModule& r = m.jit_kernel[{block, k.name}];
+    if (!r.tried) {
+        r.tried = true;
+        std::string path;
+        if (jit_object(m, block, k.name, &path)) {
             std::ifstream f(path, std::ios::binary);
             std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-            j.ok = !bytes.empty() && d->load_module(bytes.data(), bytes.size(), &j.handle) == Error::Success;
+            r.ok = !bytes.empty() && d->load_module(bytes.data(), bytes.size(), &r.handle) == Error::Success;
         }
-        // The program's variables, already in the VRAM (the generic module
-        // is loaded first).
-        if (j.ok && !m.symbols.empty()) j.ok = d->bind_symbols(j.handle, m.symbol_table(), false) == Error::Success;
-        if (!j.ok && std::getenv("CPUSIM_VERBOSE"))
+        bind(r);
+        if (!r.ok && std::getenv("CPUSIM_VERBOSE"))
             std::fprintf(stderr, "cpusim: JIT unavailable, using the generic kernels\n");
     }
-    if (!j.ok) return 0;
-    auto it = j.functions.find(k.name);
-    if (it != j.functions.end()) return it->second;
-    uint64_t fn = 0;
-    if (d->get_function(j.handle, k.name, &fn) != Error::Success) fn = 0;
-    j.functions[k.name] = fn;
-    return fn;
+    return lookup(r);
 }
 
 struct LaunchConfiguration {

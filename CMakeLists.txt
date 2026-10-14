@@ -95,9 +95,11 @@ if(LLVM_FOUND AND LLVM_VERSION_MAJOR EQUAL 19)
     target_include_directories(cpusim-devc PRIVATE src SYSTEM ${LLVM_INCLUDE_DIRS})
     target_compile_definitions(cpusim-devc PRIVATE ${LLVM_DEFINITIONS})
     target_compile_options(cpusim-devc PRIVATE -fno-rtti -Wno-unused-parameter)
-    target_link_libraries(cpusim-devc PRIVATE LLVM)
+    target_link_libraries(cpusim-devc PRIVATE LLVM Threads::Threads)
     set_target_properties(cpusim-devc PROPERTIES BUILD_RPATH "${LLVM_LIBRARY_DIR}")
     set(CPUSIM_CLANG "${LLVM_TOOLS_BINARY_DIR}/clang++" CACHE FILEPATH "clang++ used by cucc")
+    # cpusim-devc joins the objects it generates in parallel with it (clang -r).
+    target_compile_definitions(cpusim-devc PRIVATE CPUSIM_CLANG_PATH="${CPUSIM_CLANG}")
 
     # cucc: the nvcc replacement, configured with the paths of this build.
     set(CPUSIM_DEVC "${CMAKE_BINARY_DIR}/cpusim-devc")

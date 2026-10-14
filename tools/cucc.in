@@ -26,6 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 CLANG = "@CPUSIM_CLANG@"
 DEVC = "@CPUSIM_DEVC@"
@@ -200,15 +201,43 @@ PUSH_CONFIG = re.compile(r"@__cudaPushCallConfiguration\(i64 [^,]+, i32 [^,]+, i
 MAX_SPECIALIZED = 32
 
 
+STUB = re.compile(r"@((?:_Z[A-Za-z0-9_]*?)?__device_stub__[A-Za-z0-9_]+)")
+
+
+def stub_kernel(stub):
+    """The kernel a launch stub is for: _Z21__device_stub__kernelPf ->
+    _Z6kernelPf (the stub's name is the kernel's with __device_stub__ in
+    front), __device_stub__foo -> foo (extern "C")."""
+    if stub.startswith("__device_stub__"):
+        return stub[len("__device_stub__"):]
+    m = re.search(r"(\d+)__device_stub__", stub)
+    return stub[:m.start()] + str(int(m.group(1)) - len("__device_stub__")) + stub[m.end():]
+
+
 def launch_shapes(src, common, o, base):
+    """The constant block shapes of the launches, each with the kernels
+    launched with it (None: some launch of it could not be traced to its
+    kernel, so all of them). Each specialized module then holds only those
+    kernels instead of every kernel of the file."""
     ll = base + ".host.ll"
     run([CLANG] + common + o.host + ["--cuda-host-only", "-O2", "-S", "-emit-llvm", "-o", ll, src], o)
-    shapes = set()
-    for xy, z in PUSH_CONFIG.findall(open(ll).read()):
-        x, y, z = int(xy) & 0xFFFFFFFF, int(xy) >> 32, int(z)
-        if 0 < x * y * z <= 1024:
-            shapes.add((x, y, z))
-    return sorted(shapes)[:MAX_SPECIALIZED]
+    text = open(ll).read()
+    shapes = {}
+    for m in PUSH_CONFIG.finditer(text):
+        xy, z = int(m.group(1)), int(m.group(2))
+        x, y = xy & 0xFFFFFFFF, xy >> 32
+        if not 0 < x * y * z <= 1024:
+            continue
+        # The launch's stub: the next one called in the same function.
+        end = text.find("\n}\n", m.end())
+        stub = STUB.search(text, m.end(), end if end >= 0 else len(text))
+        kernels = shapes.setdefault((x, y, z), set())
+        if kernels is not None:
+            if stub:
+                kernels.add(stub_kernel(stub.group(1)))
+            else:
+                shapes[(x, y, z)] = None
+    return {shape: shapes[shape] for shape in sorted(shapes)[:MAX_SPECIALIZED]}
 
 
 def warp_size():
@@ -225,7 +254,10 @@ def run_quiet(cmd, o):
     """Like run(), but returns whether it worked instead of exiting."""
     if o.verbose:
         sys.stderr.write("+ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
+    start = time.monotonic()
     code = subprocess.run(cmd).returncode
+    if o.verbose:
+        sys.stderr.write("  (%s: %.1f s)\n" % (os.path.basename(cmd[0]), time.monotonic() - start))
     if code < 0:  # killed by a signal: a crash says nothing by itself
         sys.stderr.write("cucc: %s died (signal %d)\n" % (os.path.basename(cmd[0]), -code))
     return code == 0
@@ -257,12 +289,13 @@ def compile_cu(src, obj_out, o, tmp):
         devc += ["--emit-ll", base + ".warp.ll", "--emit-scalar-ll", base + ".thread.ll", "--emit-raw-ll", base + ".raw.ll",
                  "--emit-asm", base + ".warp.s"]
     # The generic module and one per constant block shape, all at once.
-    shapes = launch_shapes(src, common, o, base) if o.specialize and not os.environ.get("CPUSIM_SPECIALIZE") else []
+    shapes = launch_shapes(src, common, o, base) if o.specialize and not os.environ.get("CPUSIM_SPECIALIZE") else {}
     jobs = {None: [devc, link_kernels(base + ".dev.o", base + ".kernels.so", o)]}
-    for x, y, z in shapes:
+    for (x, y, z), kernels in shapes.items():
         stem = "%s.%dx%dx%d" % (base, x, y, z)
+        only = ["--kernels", ",".join(sorted(kernels))] if kernels else []
         jobs[(x, y, z)] = [[DEVC, base + ".dev.bc", "-o", stem + ".o", "--manifest", stem + ".manifest", "--mcpu",
-                            o.mcpu, "--specialize", "%d,%d,%d" % (x, y, z)],
+                            o.mcpu, "--specialize", "%d,%d,%d" % (x, y, z)] + only,
                            link_kernels(stem + ".o", stem + ".so", o)]
     run_all = lambda cmds: all(run_quiet(c, o) for c in cmds)
     with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
