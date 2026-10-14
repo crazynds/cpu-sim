@@ -22,6 +22,7 @@ struct KernelInfo {
     bool has_barriers = false;
     bool spins = false;  // waits for other warps in a loop (yield points): 32-lane variants only
     uint32_t spec_block[3] = {0, 0, 0};  // block shape the code is specialized for (0: any)
+    uint32_t spec_class = 0;  // or the class of shapes (cpusim_shape_class), with spec_block {0, 0, 0}
     uint32_t wide_variants = 0;  // CPUSIM_META_WIDE_SHIFT / CPUSIM_META_SUSP_SHIFT bits
     std::vector<ParamSlot> params;
     uint64_t param_bytes = 0;

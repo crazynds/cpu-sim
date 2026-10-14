@@ -172,10 +172,11 @@ def build_fatbin(manifest_path, so_path, bc_path, out_path, specialized=()):
     obj_off = align(manifest_off + len(manifest), 4096)
     bc_off = align(obj_off + len(obj), 64)
     table_off = align(bc_off + len(bitcode), 64)
-    objects = [(shape, open(path, "rb").read()) for shape, path in specialized]
+    # (shape, path): shape is (x, y, z), or (0, 0, 0, class) for a class of shapes.
+    objects = [(tuple(shape) + (0,) * (4 - len(shape)), open(path, "rb").read()) for shape, path in specialized]
     entries, offset = [], align(table_off + 32 * len(objects), 64)
     for shape, data in objects:
-        entries.append(struct.pack("<4I2Q", shape[0], shape[1], shape[2], 0, offset, len(data)))
+        entries.append(struct.pack("<4I2Q", shape[0], shape[1], shape[2], shape[3], offset, len(data)))
         offset = align(offset + len(data), 64)
     header = FATBIN_MAGIC + struct.pack("<II8Q", abi, 0, manifest_off, len(manifest), obj_off, len(obj),
                                         bc_off if bitcode else 0, len(bitcode), table_off if objects else 0,
@@ -201,43 +202,26 @@ PUSH_CONFIG = re.compile(r"@__cudaPushCallConfiguration\(i64 [^,]+, i32 [^,]+, i
 MAX_SPECIALIZED = 32
 
 
-STUB = re.compile(r"@((?:_Z[A-Za-z0-9_]*?)?__device_stub__[A-Za-z0-9_]+)")
-
-
-def stub_kernel(stub):
-    """The kernel a launch stub is for: _Z21__device_stub__kernelPf ->
-    _Z6kernelPf (the stub's name is the kernel's with __device_stub__ in
-    front), __device_stub__foo -> foo (extern "C")."""
-    if stub.startswith("__device_stub__"):
-        return stub[len("__device_stub__"):]
-    m = re.search(r"(\d+)__device_stub__", stub)
-    return stub[:m.start()] + str(int(m.group(1)) - len("__device_stub__")) + stub[m.end():]
-
-
 def launch_shapes(src, common, o, base):
-    """The constant block shapes of the launches, each with the kernels
-    launched with it (None: some launch of it could not be traced to its
-    kernel, so all of them). Each specialized module then holds only those
-    kernels instead of every kernel of the file."""
     ll = base + ".host.ll"
     run([CLANG] + common + o.host + ["--cuda-host-only", "-O2", "-S", "-emit-llvm", "-o", ll, src], o)
-    text = open(ll).read()
-    shapes = {}
-    for m in PUSH_CONFIG.finditer(text):
-        xy, z = int(m.group(1)), int(m.group(2))
-        x, y = xy & 0xFFFFFFFF, xy >> 32
-        if not 0 < x * y * z <= 1024:
-            continue
-        # The launch's stub: the next one called in the same function.
-        end = text.find("\n}\n", m.end())
-        stub = STUB.search(text, m.end(), end if end >= 0 else len(text))
-        kernels = shapes.setdefault((x, y, z), set())
-        if kernels is not None:
-            if stub:
-                kernels.add(stub_kernel(stub.group(1)))
-            else:
-                shapes[(x, y, z)] = None
-    return {shape: shapes[shape] for shape in sorted(shapes)[:MAX_SPECIALIZED]}
+    shapes = set()
+    for xy, z in PUSH_CONFIG.findall(open(ll).read()):
+        x, y, z = int(xy) & 0xFFFFFFFF, int(xy) >> 32, int(z)
+        if 0 < x * y * z <= 1024:
+            shapes.add((x, y, z))
+    return sorted(shapes)[:MAX_SPECIALIZED]
+
+
+def shape_class(x, y, z):
+    """cpusim_shape_class (src/device/kernel_abi.h): the class of block shapes
+    whose specialized code is the same, 0 for none."""
+    if y == 1 and z == 1:
+        if x % 128 == 0:
+            return 1
+        if x % 32 == 0:
+            return 2
+    return 0
 
 
 def warp_size():
@@ -263,12 +247,33 @@ def run_quiet(cmd, o):
     return code == 0
 
 
-def link_kernels(obj, so, o):
+def link_kernels(objs, so, o):
     # libmvec/libm: the vector and scalar math the device code calls;
     # libcpusim_tensor: the native tensor routines. Only recorded as
     # dependencies when used.
-    return [CLANG, "-shared", "-nostdlib", "-o", so, obj, "-Wl,--as-needed", "-lmvec", "-lm", "-L", LIBDIR,
+    return [CLANG, "-shared", "-nostdlib", "-o", so] + list(objs) + ["-Wl,--as-needed", "-lmvec", "-lm", "-L", LIBDIR,
             "-lcpusim_tensor", "-Wl,-rpath," + LIBDIR]
+
+
+def list_kernels(bc, o):
+    """The kernels of the device bitcode, and whether they must be compiled
+    in one module (device functions whose address is taken)."""
+    r = subprocess.run([DEVC, bc, "--list"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return [], True
+    kernels = [l.split(" ", 1)[1] for l in r.stdout.splitlines() if l.startswith("kernel ")]
+    return kernels, "together" in r.stdout.splitlines()
+
+
+def merge_manifests(parts, out):
+    """One manifest from the per-kernel ones: the first one's header and
+    symbol lines, every one's kernel lines."""
+    lines = []
+    for i, part in enumerate(parts):
+        for line in open(part).read().splitlines():
+            if i == 0 or line.startswith("kernel "):
+                lines.append(line)
+    open(out, "w").write("\n".join(lines) + "\n")
 
 
 def compile_cu(src, obj_out, o, tmp):
@@ -288,26 +293,63 @@ def compile_cu(src, obj_out, o, tmp):
     if o.keep:
         devc += ["--emit-ll", base + ".warp.ll", "--emit-scalar-ll", base + ".thread.ll", "--emit-raw-ll", base + ".raw.ll",
                  "--emit-asm", base + ".warp.s"]
-    # The generic module and one per constant block shape, all at once.
-    shapes = launch_shapes(src, common, o, base) if o.specialize and not os.environ.get("CPUSIM_SPECIALIZE") else {}
-    jobs = {None: [devc, link_kernels(base + ".dev.o", base + ".kernels.so", o)]}
-    for (x, y, z), kernels in shapes.items():
+    # The generic module and one per constant block shape. Each kernel of
+    # each module is compiled by a cpusim-devc of its own, all of them at
+    # once (as many as there are cores), and a module's objects are linked
+    # into its shared object: the code is the same as from one process per
+    # module, which built the kernels one after the other (minutes for files
+    # with many large kernels). One process per module when the kernels
+    # must stay together (function pointers) or the intermediate files are
+    # kept.
+    shapes = launch_shapes(src, common, o, base) if o.specialize and not os.environ.get("CPUSIM_SPECIALIZE") else []
+    kernels, together = list_kernels(base + ".dev.bc", o)
+    apart = len(kernels) > 1 and not together and not o.keep
+    # A shape of a class (shape_class) gets the class's module, shared with
+    # the other shapes of the class, for its kernels without barriers, and
+    # its own module for those with (their whole-block variants need it).
+    modules = {None: (base + ".dev.o", base + ".manifest", base + ".kernels.so", devc[6:])}
+    for x, y, z in shapes:
         stem = "%s.%dx%dx%d" % (base, x, y, z)
-        only = ["--kernels", ",".join(sorted(kernels))] if kernels else []
-        jobs[(x, y, z)] = [[DEVC, base + ".dev.bc", "-o", stem + ".o", "--manifest", stem + ".manifest", "--mcpu",
-                            o.mcpu, "--specialize", "%d,%d,%d" % (x, y, z)] + only,
-                           link_kernels(stem + ".o", stem + ".so", o)]
-    run_all = lambda cmds: all(run_quiet(c, o) for c in cmds)
+        c = shape_class(x, y, z) if warp_size() >= 32 else 0
+        modules[(x, y, z)] = (stem + ".o", stem + ".manifest", stem + ".so",
+                              ["--mcpu", o.mcpu, "--specialize", "%d,%d,%d" % (x, y, z)] + (["--barriers-only"] if c else []))
+        if c and (0, 0, 0, c) not in modules:
+            cstem = "%s.class%d" % (base, c)
+            modules[(0, 0, 0, c)] = (cstem + ".o", cstem + ".manifest", cstem + ".so",
+                                     ["--mcpu", o.mcpu, "--specialize-class", str(c), "--no-barriers"])
+    parts = {}
+    for shape, (obj, manifest, so, extra) in modules.items():
+        if apart:
+            parts[shape] = [("%s.k%d.o" % (obj, i), "%s.k%d" % (manifest, i), ["--kernels", k]) for i, k in enumerate(kernels)]
+        else:
+            parts[shape] = [(obj, manifest, [])]
+    # The cores shared out: each cpusim-devc also generates code in threads.
+    jobs = sum(len(p) for p in parts.values())
+    os.environ["CPUSIM_DEVC_THREADS"] = str(max(1, (os.cpu_count() or 4) // jobs))
     with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
-        done = {shape: pool.submit(run_all, cmds) for shape, cmds in jobs.items()}
+        compiled = {shape: [pool.submit(run_quiet, [DEVC, base + ".dev.bc", "-o", po, "--manifest", pm] + modules[shape][3] + pk, o)
+                            for po, pm, pk in parts[shape]]
+                    for shape in modules}
+
+        def link(shape):
+            if not all(f.result() for f in compiled[shape]):
+                return False
+            obj, manifest, so, _ = modules[shape]
+            if apart:
+                merge_manifests([pm for _, pm, _ in parts[shape]], manifest)
+            return run_quiet(link_kernels([po for po, _, _ in parts[shape]], so, o), o)
+
+        done = {shape: pool.submit(link, shape) for shape in modules}
     if not done[None].result():
         sys.exit(1)
     specialized = []
-    for shape in shapes:
+    for shape in modules:
+        if shape is None:
+            continue
         if done[shape].result():
-            specialized.append((shape, "%s.%dx%dx%d.so" % ((base,) + shape)))
+            specialized.append((shape, modules[shape][2]))
         else:  # the JIT will try again at run time
-            sys.stderr.write("cucc: warning: no ahead-of-time code for block (%d,%d,%d)\n" % shape)
+            sys.stderr.write("cucc: warning: no ahead-of-time code for block %s\n" % (shape,))
     build_fatbin(base + ".manifest", base + ".kernels.so", base + ".dev.bc", base + ".fatbin", specialized)
 
     # Host: the fatbin goes into .nv_fatbin and is registered at startup.

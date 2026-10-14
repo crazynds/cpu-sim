@@ -27,6 +27,7 @@
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/Program.h>
@@ -50,6 +51,7 @@
 
 #include "common/cpu_id.h"
 #include "compiler/simt.h"
+#include "compiler/uniformity.h"
 #include "device/kernel_abi.h"
 
 using namespace llvm;
@@ -71,9 +73,11 @@ struct Options {
     std::string features;
     uint64_t signature = 0;
     uint32_t specialize[3] = {0, 0, 0};
-    // With --specialize: only these kernels (the ones launched with that
-    // block shape); empty: all of them.
+    // Only these kernels (the JIT: the one being launched); empty: all.
     std::set<std::string> only;
+    bool list = false;  // --list: print the kernels (and whether they can be compiled apart), nothing else
+    uint32_t shape_class = 0;  // --specialize-class: a class of shapes (cpusim_shape_class) instead of one
+    int barriers = 0;          // --barriers-only (1) / --no-barriers (-1): only those kernels
 };
 
 Options parse_args(int argc, char** argv) {
@@ -97,6 +101,10 @@ Options parse_args(int argc, char** argv) {
             if (std::sscanf(v.c_str(), "%u,%u,%u", &o.specialize[0], &o.specialize[1], &o.specialize[2]) != 3)
                 die("--specialize expects X,Y,Z");
         }
+        else if (a == "--list") o.list = true;
+        else if (a == "--specialize-class") o.shape_class = uint32_t(std::stoul(value()));
+        else if (a == "--barriers-only") o.barriers = 1;
+        else if (a == "--no-barriers") o.barriers = -1;
         else if (a == "--kernels") {  // name,name,...
             std::string v = value();
             for (size_t b = 0, e; b <= v.size(); b = e + 1) {
@@ -108,6 +116,7 @@ Options parse_args(int argc, char** argv) {
         else if (!a.empty() && a[0] == '-') die("unknown option " + a);
         else o.input = a;
     }
+    if (o.list && !o.input.empty()) return o;
     if (o.input.empty() || o.output.empty() || o.manifest.empty())
         die("usage: cpusim-devc device.bc -o kernels.o --manifest kernels.manifest");
     if (o.cpu == "native") {
@@ -444,13 +453,15 @@ std::string lower_device_globals(Module& m) {
         Type* t = g->getValueType();
         const uint64_t size = dl.getTypeAllocSize(t);
         const uint64_t align = std::max<uint64_t>(g->getAlign().valueOrOne().value(), dl.getABITypeAlign(t).value());
-        auto* init = new GlobalVariable(m, t, true, GlobalValue::ExternalLinkage,
+        // Weak: the objects of one module compiled kernel by kernel (cucc)
+        // each define them; the link keeps one.
+        auto* init = new GlobalVariable(m, t, true, GlobalValue::WeakODRLinkage,
                                         g->hasInitializer() ? g->getInitializer() : Constant::getNullValue(t),
                                         "__cpusim_init_" + name);
         init->setVisibility(GlobalValue::ProtectedVisibility);
         init->setAlignment(Align(align));
         auto* pty = PointerType::get(ctx, g->getAddressSpace());
-        auto* slot = new GlobalVariable(m, pty, false, GlobalValue::ExternalLinkage, ConstantPointerNull::get(pty),
+        auto* slot = new GlobalVariable(m, pty, false, GlobalValue::WeakAnyLinkage, ConstantPointerNull::get(pty),
                                         "__cpusim_sym_" + name);
         slot->setVisibility(GlobalValue::ProtectedVisibility);
         convertUsersOfConstantsToInstructions({g});
@@ -722,24 +733,79 @@ bool mark_spin_loops(Function& f) {
     return any;
 }
 
-// Loops with a barrier stay loops: unrolled, every copy of the barrier is
-// one more place where a warp suspends and resumes, and a barrier costs the
-// same inside a loop as outside. (HeCBench sc: 32 copies of a prefix sum
-// with barriers in its loops, over ten minutes to compile.)
-void keep_barrier_loops_rolled(Function& f) {
+// What a kernel's per-thread code needs, for predicting the lane widths
+// worth building (CPUSIM_DEVC_FEATURES=1 prints it): the most 32-bit units of
+// varying values live at once (at W lanes they take units * W / 16 zmm
+// registers; uniform values live in general registers), the instructions,
+// and the long-latency operations.
+struct Features {
+    unsigned live_units = 0, instructions = 0, loads = 0, stores = 0, slow_ops = 0, loops = 0;
+};
+Features kernel_features(Function& f) {
+    Features r;
     DominatorTree dt(f);
+    PostDominatorTree pdt(f);
     LoopInfo li(dt);
-    for (Loop* l : li.getLoopsInPreorder()) {
-        bool barrier = false;
-        for (BasicBlock* bb : l->blocks())
-            for (Instruction& i : *bb)
-                if (auto* ii = dyn_cast<IntrinsicInst>(&i)) {
-                    const Intrinsic::ID id = ii->getIntrinsicID();
-                    barrier |= id == Intrinsic::nvvm_barrier0 || id == Intrinsic::nvvm_bar_sync ||
-                               id == Intrinsic::nvvm_barrier || id == Intrinsic::nvvm_barrier_n;
-                }
-        if (barrier) l->setLoopAlreadyUnrolled();
+    cpusim::Uniformity uni(f, dt, pdt, li);
+    const DataLayout& dl = f.getParent()->getDataLayout();
+    auto units = [&](const Value* v) -> unsigned {
+        if (!uni.is_varying(v) || v->getType()->isVoidTy() || !v->getType()->isSized()) return 0;
+        return unsigned((dl.getTypeSizeInBits(v->getType()).getFixedValue() + 31) / 32);
+    };
+    // Live-out sets by iteration over the blocks, then each block backwards.
+    DenseMap<const BasicBlock*, SmallPtrSet<const Value*, 32>> live_in, live_out;
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (BasicBlock& bb : reverse(f)) {
+            SmallPtrSet<const Value*, 32> out;
+            for (BasicBlock* s : successors(&bb)) {
+                for (const Value* v : live_in[s]) out.insert(v);
+                for (PHINode& phi : s->phis())
+                    if (auto* in = phi.getIncomingValueForBlock(&bb); in && (isa<Instruction>(in) || isa<Argument>(in)))
+                        out.insert(in);
+            }
+            SmallPtrSet<const Value*, 32> in = out;
+            for (Instruction& i : reverse(bb)) {
+                in.erase(&i);
+                if (isa<PHINode>(i)) continue;
+                for (const Use& u : i.operands())
+                    if (isa<Instruction>(u.get()) || isa<Argument>(u.get())) in.insert(u.get());
+            }
+            if (in.size() != live_in[&bb].size()) {
+                live_in[&bb] = in;
+                changed = true;
+            }
+            live_out[&bb] = std::move(out);
+        }
     }
+    for (BasicBlock& bb : f) {
+        SmallPtrSet<const Value*, 32> live = live_out[&bb];
+        unsigned now = 0;
+        for (const Value* v : live) now += units(v);
+        r.live_units = std::max(r.live_units, now);
+        for (Instruction& i : reverse(bb)) {
+            if (live.erase(&i)) now -= units(&i);
+            if (!isa<PHINode>(i))
+                for (const Use& u : i.operands())
+                    if ((isa<Instruction>(u.get()) || isa<Argument>(u.get())) && live.insert(u.get()).second)
+                        now += units(u.get());
+            r.live_units = std::max(r.live_units, now);
+            ++r.instructions;
+            if (isa<LoadInst>(i)) ++r.loads;
+            if (isa<StoreInst>(i)) ++r.stores;
+            if (i.getOpcode() == Instruction::FDiv || i.getOpcode() == Instruction::SDiv ||
+                i.getOpcode() == Instruction::UDiv || i.getOpcode() == Instruction::SRem || i.getOpcode() == Instruction::URem)
+                ++r.slow_ops;
+            if (auto* c = dyn_cast<CallInst>(&i); c && c->getCalledFunction() && !isa<IntrinsicInst>(c)) ++r.slow_ops;
+            if (auto* ii = dyn_cast<IntrinsicInst>(&i); ii && (ii->getIntrinsicID() == Intrinsic::sqrt ||
+                                                               ii->getIntrinsicID() == Intrinsic::exp ||
+                                                               ii->getIntrinsicID() == Intrinsic::log ||
+                                                               ii->getIntrinsicID() == Intrinsic::pow))
+                ++r.slow_ops;
+        }
+    }
+    r.loops = unsigned(li.getLoopsInPreorder().size());
+    return r;
 }
 
 bool has_alloca(const Function& f) {
@@ -906,10 +972,8 @@ int main(int argc, char** argv) {
     if (warp_size != 16 && warp_size != 32 && warp_size != 64) die("warp size must be 16, 32 or 64");
 
     std::vector<KernelInfo> kernels = find_kernels(*m);
-    // A specialized module holds only the kernels launched with its shape:
-    // building every kernel of the file once per shape made files with many
-    // kernels take kernels x shapes x widths builds (segsort, hadamard, sc:
-    // over ten minutes). The others run the generic module's code.
+    // --kernels: the run-time JIT compiles the kernel being launched, not
+    // every kernel of the file (the code of that kernel is the same).
     // Not with device functions whose address is taken (vtables, tables of
     // function pointers): a call through a pointer reaches the vector
     // versions built for the kernels that set the pointers up, so every
@@ -922,6 +986,13 @@ int main(int argc, char** argv) {
             if (!f.isDeclaration() && !entry_points.count(&f) && f.hasAddressTaken(nullptr, true, true, true, true))
                 addresses_taken = true;
     }
+    // --list: one line per kernel, and "together" when they must be
+    // compiled in one module (cucc otherwise runs one cpusim-devc each).
+    if (opt.list) {
+        for (const KernelInfo& k : kernels) std::printf("kernel %s\n", k.name.c_str());
+        if (addresses_taken) std::printf("together\n");
+        return 0;
+    }
     if (!opt.only.empty() && !addresses_taken) {
         for (KernelInfo& k : kernels)
             if (!opt.only.count(k.name) && k.scalar->use_empty()) k.scalar->deleteBody();
@@ -931,6 +1002,8 @@ int main(int argc, char** argv) {
     }
     for (auto& k : kernels) {
         for (int i = 0; i < 3; ++i) k.spec_block[i] = opt.specialize[i];
+        // (Classes assume groups of at least 32 lanes.)
+        if (warp_size >= 32) k.spec_class = opt.shape_class;
         k.warp_size = k.warp_lanes = warp_size;
     }
     retarget(*m, tm.get(), kernels);
@@ -976,7 +1049,6 @@ int main(int argc, char** argv) {
             run_function_pipeline(*f, tm.get(),
                                   "early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,lower-switch,lcssa");
         else if (has_alloca(*f)) {
-            keep_barrier_loops_rolled(*f);
             run_function_pipeline(*f, tm.get(),
                                   "loop-simplify,lcssa,loop(loop-rotate,indvars,loop-unroll-full),sroa<modify-cfg>,"
                                   "early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,gvn,"
@@ -1001,28 +1073,13 @@ int main(int argc, char** argv) {
         // grows faster than linearly with size (register allocation), and the
         // JIT builds the variant the launch's block shape needs anyway.
         constexpr size_t kGenericBudget = 12000;
-        // Any module: a wide variant whose size, estimated from the warp
-        // entry's (it grows about with the lanes), passes this is not built
-        // at all. A kernel already large at 32 lanes (HeCBench hadamard: a
-        // fully unrolled template) took minutes per wide variant, for code
-        // with no registers left to gain from width.
-        constexpr size_t kWideBudget = 24000;
-        size_t warp_entry_size = 0;
         bool dropped = false;
         auto build = [&](bool profile, unsigned lanes, bool suspending = false, bool cooperative = false) {
-            if (!profile && lanes > k.warp_lanes && warp_entry_size &&
-                warp_entry_size * lanes / k.warp_lanes > (k.spec_block[0] ? kWideBudget : kGenericBudget)) {
-                if (std::getenv("CPUSIM_DEVC_DEBUG"))
-                    std::fprintf(stderr, "cpusim-devc: %s: %u lanes not built (warp entry: %zu instructions)\n",
-                                 k.name.c_str(), lanes, warp_entry_size);
-                dropped = true;
-                return true;
-            }
             ValueToValueMapTy vmap;
             Function* copy = CloneFunction(k.scalar, vmap);
             bool ok = cpusim::build_warp_entry(*m, k, *copy, profile, lanes, suspending, &why, cooperative);
             copy->eraseFromParent();
-            if (ok && k.spec_block[0] == 0 && lanes > k.warp_size) {
+            if (ok && k.spec_block[0] == 0 && k.spec_class == 0 && lanes > k.warp_size) {
                 std::string name = "__cpusim_entry" + std::to_string(lanes) +
                                    (cooperative ? "c_" : suspending ? "s_" : "_") + k.name;
                 if (Function* f = m->getFunction(name); f && f->getInstructionCount() > kGenericBudget) {
@@ -1097,12 +1154,14 @@ int main(int argc, char** argv) {
         }
         // Spreading lanes over workers: only for the generic module (a module
         // specialized for a block shape has its entry masks built in).
-        bool lane_independent = collective_free && k.spec_block[0] == 0;
+        bool lane_independent = collective_free && k.spec_block[0] == 0 && k.spec_class == 0;
         // With a known block shape (JIT at launch) only the variants the
         // runtime can pick are built, and no instrumented one (profiling runs
         // the generic module).
-        const bool spec = k.spec_block[0] != 0;
-        const uint64_t threads = uint64_t(k.spec_block[0]) * k.spec_block[1] * k.spec_block[2];
+        const bool spec = k.spec_block[0] != 0 || k.spec_class != 0;
+        // (A class: the fewest threads of its shapes.)
+        const uint64_t threads = k.spec_class ? ((k.spec_class & 0xff) == 2 ? 32 : 128)
+                                              : uint64_t(k.spec_block[0]) * k.spec_block[1] * k.spec_block[2];
         auto wanted = [&](unsigned lanes, bool block_wide) {
             if (!spec) return true;
             if (block_wide) return k.has_barriers ? threads <= lanes && threads > lanes / 2 : lanes <= threads;
@@ -1115,6 +1174,16 @@ int main(int argc, char** argv) {
         // variant over the block-wide one (samples/tensor_gemm: 2x faster).
         const bool tensor = min_sm > 0;
         k.has_barriers |= k.spins;
+        static const bool print_features = std::getenv("CPUSIM_DEVC_FEATURES") != nullptr;
+        if (print_features && k.spec_block[0] == 0 && k.spec_class == 0) {
+            const Features ft = kernel_features(*k.scalar);
+            std::fprintf(stderr, "cpusim-features %s live=%u insts=%u loads=%u stores=%u slow=%u loops=%u barriers=%d\n",
+                         k.name.c_str(), ft.live_units, ft.instructions, ft.loads, ft.stores, ft.slow_ops, ft.loops,
+                         int(k.has_barriers));
+        }
+        // A module for a class of shapes holds the kernels without barriers,
+        // the one for an exact shape next to it those with (cucc).
+        if ((opt.barriers > 0 && !k.has_barriers) || (opt.barriers < 0 && k.has_barriers)) continue;
         // Spinning kernels: one warp per call, as on a GPU (wide variants put
         // the waiting warp and the one it waits for in the same vector).
         const bool narrow = tensor || k.spins;
@@ -1131,7 +1200,6 @@ int main(int argc, char** argv) {
         if (spec && !tensor)
             while (k.warp_lanes > 16 && threads <= k.warp_lanes / 2) k.warp_lanes /= 2;
         bool ok = build(false, k.warp_lanes) && (spec || build(true, k.warp_lanes));
-        if (Function* f = m->getFunction("__cpusim_entry_" + k.name)) warp_entry_size = f->getInstructionCount();
         // Wider variants (lanes 2L << i, L the warp size): with barriers, a
         // whole block per call makes them free (up to 512 lanes); without, 2
         // or 4 warps per call give the core more independent work. The
@@ -1228,6 +1296,7 @@ int main(int argc, char** argv) {
         if (min_sm) manifest += " sm=" + std::to_string(min_sm);
         if (k.shared_bytes) manifest += " smem=" + std::to_string(k.shared_bytes);
         if (k.traced) manifest += " trace";
+        if (k.has_barriers) manifest += " barriers";
         if (lane_independent) manifest += " indep";
         manifest += "\n";
     }
@@ -1261,7 +1330,7 @@ int main(int argc, char** argv) {
             f->eraseFromParent();
         }
     }
-    new GlobalVariable(*m, Type::getInt32Ty(ctx), true, GlobalValue::ExternalLinkage,
+    new GlobalVariable(*m, Type::getInt32Ty(ctx), true, GlobalValue::WeakODRLinkage,
                        ConstantInt::get(Type::getInt32Ty(ctx), CPUSIM_KERNEL_ABI), "__cpusim_abi_version");
 
     if (!opt.emit_raw_ll.empty()) write_ll(*m, opt.emit_raw_ll);
@@ -1278,7 +1347,10 @@ int main(int argc, char** argv) {
     // into an object in a thread of its own with its own context, the
     // objects joined into one. One file's kernels used to go one after the
     // other (HeCBench hadamard: 18 kernels, 90 s on one core).
-    const unsigned parts = std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()), 16);
+    // (CPUSIM_DEVC_THREADS: cucc's share of the cores for this process.)
+    const char* threads_env = std::getenv("CPUSIM_DEVC_THREADS");
+    const unsigned parts = threads_env ? unsigned(std::max(1, std::atoi(threads_env)))
+                                       : std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()), 16);
     size_t kernel_functions = 0;
     for (Function& f : *m)
         if (!f.isDeclaration() && f.getName().starts_with("__cpusim_")) ++kernel_functions;

@@ -312,6 +312,7 @@ private:
     Value* special_[17] = {};
     Value* spec_lane_mask_ = nullptr;
     void emit_specialized_tid();
+    void emit_class_tid();
     void emit_coop_barrier(Value* mask);
     Value* emit_libmvec(CallInst& call, const std::string& name, unsigned arity);
     Value* emit_shfl(Value* v, Value* src);
@@ -2380,6 +2381,29 @@ void WarpBuilder::emit_specialized_tid() {
     }
 }
 
+// threadIdx for a class of block shapes (cpusim_shape_class, 1D blocks):
+// lane l of the group starting at thread `base` (= warp_index * warp size)
+// is thread base + l; blockDim.x is a uniform read from the context.
+void WarpBuilder::emit_class_tid() {
+    const uint32_t kind = k_.spec_class & 0xff;
+    auto* i32 = b_.getInt32Ty();
+    SmallVector<Constant*, 64> lane;
+    for (unsigned l = 0; l < W; ++l) lane.push_back(b_.getInt32(l));
+    auto field = [&](unsigned offset) { return b_.CreateConstInBoundsGEP1_64(b_.getInt8Ty(), ctx_arg_, offset); };
+    Value* warp = b_.CreateAlignedLoad(i32, field(CPUSIM_CTX_WARP_INDEX), Align(4), "warp");
+    Value* base = b_.CreateMul(warp, b_.getInt32(k_.warp_size), "base", true, true);
+    Value* t = b_.CreateAdd(b_.CreateVectorSplat(W, base), ConstantVector::get(lane), "tid.x", true, true);
+    special_[(int)SpecialReg::TidX] = t;
+    special_[(int)SpecialReg::TidY] = special_[(int)SpecialReg::TidZ] = Constant::getNullValue(t->getType());
+    // A multiple of 128 (or of 32 with 32-lane groups): every lane a thread.
+    if (kind == 1 || W <= 32) {
+        spec_lane_mask_ = Constant::getAllOnesValue(mask_type_);
+    } else {
+        Value* bx = b_.CreateAlignedLoad(i32, field(CPUSIM_CTX_BLOCK_DIM), Align(4), "ntid.x");
+        spec_lane_mask_ = b_.CreateICmpULT(t, b_.CreateVectorSplat(W, bx));
+    }
+}
+
 // A varying math call as calls to its libmvec version, one per 16 floats or
 // 8 doubles: _ZGVeN16v_expf(<16 x float>), _ZGVeN8vv_pow(<8 x double>, ...).
 // Every lane is computed (inactive ones on whatever they hold; the functions
@@ -3114,6 +3138,8 @@ void WarpBuilder::emit_prologue() {
     auto* v32 = FixedVectorType::get(i32, W);
     if (k_.spec_block[0]) {
         emit_specialized_tid();
+    } else if (k_.spec_class) {
+        emit_class_tid();
     } else {
         special_[(int)SpecialReg::TidX] = b_.CreateAlignedLoad(v32, field(CPUSIM_CTX_TID(W, 0)), Align(64), "tid.x");
         special_[(int)SpecialReg::TidY] = b_.CreateAlignedLoad(v32, field(CPUSIM_CTX_TID(W, 1)), Align(64), "tid.y");
@@ -3134,6 +3160,10 @@ void WarpBuilder::emit_prologue() {
         special_[(int)SpecialReg::NtidX] = b_.getInt32(k_.spec_block[0]);
         special_[(int)SpecialReg::NtidY] = b_.getInt32(k_.spec_block[1]);
         special_[(int)SpecialReg::NtidZ] = b_.getInt32(k_.spec_block[2]);
+    } else if (k_.spec_class) {  // 1D, blockDim.x a uniform
+        special_[(int)SpecialReg::NtidX] = load_u32(CPUSIM_CTX_BLOCK_DIM, "ntid.x");
+        special_[(int)SpecialReg::NtidY] = b_.getInt32(1);
+        special_[(int)SpecialReg::NtidZ] = b_.getInt32(1);
     } else {
         special_[(int)SpecialReg::NtidX] = load_u32(CPUSIM_CTX_BLOCK_DIM, "ntid.x");
         special_[(int)SpecialReg::NtidY] = load_u32(CPUSIM_CTX_BLOCK_DIM + 4, "ntid.y");

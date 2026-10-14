@@ -231,9 +231,28 @@ typedef struct cpusim_fatbin_header {
 } cpusim_fatbin_header;
 
 // A shared object of the module specialized for one block shape, as the JIT
-// would build it; offset from the start of the fatbin.
+// would build it; offset from the start of the fatbin. With block {0, 0, 0},
+// specialized for a class of shapes instead (shape_class: its kernels
+// without barriers; the exact shapes' modules then hold the others).
 typedef struct cpusim_fatbin_specialized {
     uint32_t block[3];
-    uint32_t reserved;
+    uint32_t shape_class;
     uint64_t offset, size;
 } cpusim_fatbin_specialized;
+
+/* Classes of block shapes whose calls of up to 128 lanes look the same, so
+ * one specialized module serves every shape of the class (kernels without
+ * barriers; the whole-block variants of the others need the exact shape).
+ * The dimensions the class leaves open are read at run time, as uniforms.
+ *   1          1D, x a multiple of 128: threadIdx.x = group base + lane, every lane a thread
+ *   2          1D, x a multiple of 32: the same; groups wider than 32 may end past the block
+ *   0          none: the exact shape
+ * (2D blocks keep their exact shape: with blockDim.y a uniform instead of a
+ * constant, HeCBench iso2dfd's 16x16 kernel was 20-30% slower.) */
+static inline uint32_t cpusim_shape_class(uint32_t x, uint32_t y, uint32_t z) {
+    if (y == 1 && z == 1) {
+        if (x % 128 == 0) return 1;
+        if (x % 32 == 0) return 2;
+    }
+    return 0;
+}

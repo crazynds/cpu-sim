@@ -152,6 +152,7 @@ private:
             uint64_t block = 0;     // __cpusim_block_: whole block, 32-lane warps, barrier rounds inside
             uint64_t trace = 0;     // __cpusim_trace_: a wmma GEMM candidate (wmma_trace.h)
             uint64_t refill = 0;    // __cpusim_entryr_: warp entry whose lanes refill (CPUSIM_META_REFILL)
+            std::string name;       // the kernel's (mangled), for messages
             cpusim_kernel_meta meta{};
             std::map<uint64_t, Tuning> tuning;  // key: block shape
             // Launches of a wmma GEMM candidate, by grid, block and

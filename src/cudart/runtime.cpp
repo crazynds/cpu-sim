@@ -92,6 +92,7 @@ struct KernelDesc {
     uint64_t shared_bytes = 0;  // static __shared__
     int max_dynamic_shared = -1;  // cudaFuncAttributeMaxDynamicSharedMemorySize (-1: the default)
     bool lane_independent = false;  // its lanes never look at each other (CPUSIM_META_LANE_INDEPENDENT)
+    bool barriers = false;          // waits at barriers: specialized for exact shapes, never for classes
 };
 
 // A module recompiled for one block shape (JIT at launch).
@@ -167,6 +168,44 @@ Registry& registry() {
 // from the uninstrumented ones. Each launch still runs exactly once, so kernels
 // that accumulate into their outputs keep working. Counts of data-dependent
 // kernels are those of the first launch.
+
+// CPUSIM_KERNEL_TIMES=1: each kernel's launches and time on the device,
+// printed when the program ends ("cpusim-times <kernel> <launches> <ns>",
+// and a total). For tracking performance across compiler changes with one
+// measure for every program (bench/track).
+struct KernelTimes {
+    bool enabled = false;
+    std::mutex mutex;
+    std::map<std::string, std::pair<uint64_t, uint64_t>> by_kernel;  // launches, ns
+
+    KernelTimes() {
+        const char* v = std::getenv("CPUSIM_KERNEL_TIMES");
+        enabled = v && *v && std::strcmp(v, "0") != 0;
+        if (enabled) std::atexit([] { report(); });
+    }
+    void add(const std::string& kernel, uint64_t ns) {
+        std::lock_guard lock(mutex);
+        auto& e = by_kernel[kernel];
+        e.first += 1;
+        e.second += ns;
+    }
+    static void report();
+};
+KernelTimes& kernel_times() {
+    static KernelTimes* t = new KernelTimes;  // never destroyed: used from atexit
+    return *t;
+}
+void KernelTimes::report() {
+    KernelTimes& t = kernel_times();
+    std::lock_guard lock(t.mutex);
+    uint64_t total = 0;
+    for (const auto& [k, e] : t.by_kernel) {
+        std::fprintf(stderr, "cpusim-times %s %llu %llu\n", k.c_str(), (unsigned long long)e.first,
+                     (unsigned long long)e.second);
+        total += e.second;
+    }
+    std::fprintf(stderr, "cpusim-times-total %llu\n", (unsigned long long)total);
+}
 
 struct ProfileEntry {
     std::string kernel;
@@ -339,11 +378,13 @@ bool jit_object(const Module& m, const std::array<uint32_t, 3>& block, const std
         f.write(reinterpret_cast<const char*>(bc), std::streamsize(n));
         if (!f) return false;
     }
+    // block {0, 0, c}: the class of shapes c (cpusim_shape_class).
     char spec[48];
-    std::snprintf(spec, sizeof(spec), "%u,%u,%u", block[0], block[1], block[2]);
+    if (block[0]) std::snprintf(spec, sizeof(spec), "%u,%u,%u", block[0], block[1], block[2]);
+    else std::snprintf(spec, sizeof(spec), "%u", block[2]);
     auto start = std::chrono::steady_clock::now();
     bool ok = run_tool({CPUSIM_DEVC_PATH, tmp + ".bc", "-o", tmp + ".o", "--manifest", tmp + ".manifest",
-                        "--specialize", spec, "--kernels", kernel}) &&
+                        block[0] ? "--specialize" : "--specialize-class", spec, "--kernels", kernel}) &&
               run_tool({CPUSIM_CLANG_PATH, "-shared", "-nostdlib", "-o", tmp + ".so", tmp + ".o", "-Wl,--as-needed",
                         "-lmvec", "-lm", "-L" CPUSIM_LIB_DIR_PATH, "-lcpusim_tensor",
                         "-Wl,-rpath," CPUSIM_LIB_DIR_PATH}) &&
@@ -489,14 +530,22 @@ Error load_generic(Module& m, cpusim::Device* d) {
 const cpusim_fatbin_specialized* specialized_object(const Module& m, const std::array<uint32_t, 3>& block) {
     const auto* table = reinterpret_cast<const cpusim_fatbin_specialized*>(reinterpret_cast<const uint8_t*>(m.header) +
                                                                            m.header->specialized_offset);
-    for (uint64_t i = 0; i < m.header->specialized_count; ++i)
-        if (table[i].block[0] == block[0] && table[i].block[1] == block[1] && table[i].block[2] == block[2])
-            return &table[i];
+    // block {0, 0, c}: the module of the class of shapes c.
+    for (uint64_t i = 0; i < m.header->specialized_count; ++i) {
+        const auto& e = table[i];
+        if (block[0] ? e.block[0] == block[0] && e.block[1] == block[1] && e.block[2] == block[2]
+                     : e.block[0] == 0 && e.shape_class == block[2])
+            return &e;
+    }
     return nullptr;
 }
 
-uint64_t jit_function(Module& m, const KernelDesc& k, const std::array<uint32_t, 3>& block, cpusim::Device* d) {
+uint64_t jit_function(Module& m, const KernelDesc& k, const std::array<uint32_t, 3>& shape, cpusim::Device* d) {
     if (!specialization_enabled() || (!m.header->bitcode_size && !m.header->specialized_count)) return 0;
+    // A kernel without barriers runs its class's code when the shape has a
+    // class (one module for every shape of the class): key {0, 0, class}.
+    const uint32_t cls = k.barriers || warp_size() < 32 ? 0 : cpusim_shape_class(shape[0], shape[1], shape[2]);
+    const std::array<uint32_t, 3> block = cls ? std::array<uint32_t, 3>{0, 0, cls} : shape;
     auto lookup = [&](JitModule& jm) -> uint64_t {
         if (!jm.ok) return 0;
         auto it = jm.functions.find(k.name);
@@ -511,7 +560,7 @@ uint64_t jit_function(Module& m, const KernelDesc& k, const std::array<uint32_t,
     auto bind = [&](JitModule& jm) {
         if (jm.ok && !m.symbols.empty()) jm.ok = d->bind_symbols(jm.handle, m.symbol_table(), false) == Error::Success;
     };
-    // Compiled ahead of time for this shape: the kernels launched with it.
+    // Compiled ahead of time for this shape (or class).
     if (const cpusim_fatbin_specialized* s = specialized_object(m, block)) {
         JitModule& j = m.jit[block];
         if (!j.tried) {
@@ -600,6 +649,7 @@ bool parse_manifest(const char* text, size_t size, Module* m) {
             if (opt.rfind("sm=", 0) == 0) k.min_sm = std::atoi(opt.c_str() + 3);
             else if (opt.rfind("smem=", 0) == 0) k.shared_bytes = std::stoull(opt.substr(5));
             else if (opt == "indep") k.lane_independent = true;
+            else if (opt == "barriers") k.barriers = true;
         m->kernels[k.name] = k;
     }
     return true;
@@ -1470,6 +1520,7 @@ cudaError_t cudaLaunchKernel(const void* func, dim3 grid, dim3 block, void** arg
             for (const auto& r : copies) std::memcpy(r.shadow, r.host, r.size);
             cpusim::LaunchResult result;
             Error e = d->launch(function, cfg, buf->data(), buf->size(), &result);
+            if (kernel_times().enabled && e == Error::Success) kernel_times().add(name, result.kernel_ns);
             for (const auto& r : copies) std::memcpy(r.host, r.shadow, r.size);
             for (const Managed& v : managed) d->memcpy_dtoh(v.host, v.address, v.size);
             if (e != Error::Success && result.report[0])

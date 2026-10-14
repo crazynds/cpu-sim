@@ -1,0 +1,50 @@
+# HeCBench programs for tracking performance (bench/track/track.sh): name and
+# arguments (empty: the Makefile's run target). Each runs in seconds on the
+# CPU and checks its own result.
+adam
+asta
+backprop
+base64e
+colorwheel
+concurrentKernels
+fft
+fpdc
+groupnorm
+haccmk
+hellinger
+interleave
+is
+jenkins-hash
+knn
+laplace3d
+libor
+lombscargle
+lud
+matrix-rotate
+md5hash
+murmurhash3
+overlap
+perplexity
+pointerchase
+present
+quantAQLM
+quantBnB
+rainflow
+reverse
+ring
+rsbench
+rtm8
+simplemoc
+threadfence
+vote
+winograd
+zeropoint
+nbody 16000 10
+mandelbrot 100
+black-scholes 30
+heat2d 4096 4096 100
+iso2dfd 2048 2048 100
+bitonic-sort 24 2
+nqueen 15 7 10
+randomAccess 1
+softmax 100000 784 0 10

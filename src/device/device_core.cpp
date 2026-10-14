@@ -426,6 +426,7 @@ Error DeviceCore::get_function(uint32_t id, uint64_t module, const std::string& 
     if (!sym || !meta) return Error::InvalidDeviceFunction;
     *function = reinterpret_cast<uint64_t>(sym);
     Context::FunctionInfo info;
+    info.name = name;
     info.profiled = reinterpret_cast<uint64_t>(prof);
     info.meta = *meta;
     const uint32_t two_warps = 2 * meta->warp_size;  // the narrowest wide variant
@@ -783,8 +784,9 @@ void DeviceCore::choose_width(uint32_t id, uint64_t function, uint64_t key, cons
     size_t best = size_t(std::min_element(ns.begin(), ns.end()) - ns.begin());
     t.chosen = trials[best].lanes;
     if (std::getenv("CPUSIM_VERBOSE")) {
-        std::fprintf(stderr, "cpusim: width, in the first launch (us per 1000 blocks, best of %d slices of %llu)",
-                     kTrialRounds, (unsigned long long)trial_blocks());
+        std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, in the first launch (us per 1000 blocks, best of %d slices of %llu)",
+                     fn->second.name.c_str(), (unsigned long long)(key >> 40), (unsigned long long)((key >> 20) & 0xfffff),
+                     (unsigned long long)(key & 0xfffff), kTrialRounds, (unsigned long long)trial_blocks());
         for (size_t i = 0; i < trials.size(); ++i)
             std::fprintf(stderr, " %u%s:%.1f", trials[i].lanes & 0xffff, width_suffix(trials[i].lanes), ns[i] / 1e3);
         std::fprintf(stderr, " -> %u%s lanes\n", t.chosen & 0xffff, width_suffix(t.chosen));
@@ -827,7 +829,9 @@ void DeviceCore::record_timing(uint32_t id, uint64_t function, uint64_t key, uin
         }
         t.chosen = t.candidates[best];
         if (std::getenv("CPUSIM_VERBOSE")) {
-            std::fprintf(stderr, "cpusim: width, over launches (us of launch time per 1000 blocks, best run)");
+            std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, over launches (us of launch time per 1000 blocks, best run)",
+                         fn->second.name.c_str(), (unsigned long long)(key >> 40),
+                         (unsigned long long)((key >> 20) & 0xfffff), (unsigned long long)(key & 0xfffff));
             for (size_t i = 0; i < n; ++i)
                 std::fprintf(stderr, " %u%s:%.1f", t.candidates[i] & 0xffff, width_suffix(t.candidates[i]),
                              t.ns[i] / 1e3);
