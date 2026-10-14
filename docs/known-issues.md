@@ -6,7 +6,7 @@ Failures seen once or now and then, not reproduced on demand, kept here to look 
 
 - **Seen:** 2026-10-13, Xeon Gold 6548Y+ server, the first full stress run (`tests/stress/run.sh both`). `spinlock_block_critical` failed at `stress.cuh:136` (`Buffer::zero`, `cudaMemset(p, 0, n * sizeof(T))`), and the rest of the program did not run.
 - **Not reproduced:** 15 runs right after, the second full run, and a run of the 58 programs in parallel all passed.
-- **Known:** the error comes from the driver's address check (`DeviceCore::translate`): the pointer was not found among the context's allocations. Suspects: a context lookup or allocation map read while another program (the previous one in the suite) closes its context, or a reused process id.
+- **Found (2026-10-14):** not the driver: the client's own check. A client reserves the device's address range in its address space at connection (so a host pointer can never equal a device pointer); when the range was taken, it refused every device pointer in `cudaMemset` (and every call that checks `is_device_pointer`). The range was at 0x600000000000, inside the span where the kernel randomizes the load address of PIE executables (from 0x555555554000 up to 16 TiB above with `vm.mmap_rnd_bits = 32`): 8 of 400 runs of a minimal program had their own code there. The VRAM is now at 0x200000000000, below every randomized span: 0 of 400. A client that cannot reserve the range now says so. The same cause made HeCBench groupnorm fail once (`cudaMemset ... invalid argument`) in a tracking run.
 
 ## `j0` and `y0` (double) error on the Xeon server
 
@@ -42,3 +42,8 @@ Failures that are the programs' own bugs, which the GPU hides by its timing:
 
 - **Seen:** 2026-10-14, Xeon server, `bench/track/track.sh build2 base3`: one of the three runs of HeCBench base64e failed its check (the build before shape classes).
 - **Not reproduced:** 16 more runs, 8 with that build and 8 with the next, all passed. The run's log was not kept; `track.sh` should keep the log of a failing run.
+
+## concurrentKernels crashed once in a tracking run
+
+- **Seen:** 2026-10-14, Xeon server, a tracking run (`widesplit`, a build reverted since): one of three runs of HeCBench concurrentKernels died with a core dump and no output at all.
+- **Not known yet:** the program launches kernels of 1 thread into several streams with `cudaStreamWaitEvent` between them. No output at all suggests a crash early (the connection, the first launches) rather than in a kernel, whose fault would have been reported. The log is in that run's results (`widesplit.concurrentKernels.fail2.log`, on the server).

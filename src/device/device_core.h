@@ -25,7 +25,11 @@ namespace cpusim {
 // Where the driver tries to place the VRAM. Clients reserve the same range in
 // their own address space, so a device pointer can never equal a valid host
 // pointer (what UVA guarantees, and what cudaMemcpyDefault relies on).
-constexpr uint64_t kPreferredVramBase = 0x600000000000ull;
+// Below every range the kernel randomizes: a PIE executable lands anywhere
+// from 0x555555554000 up to 16 TiB above it (vm.mmap_rnd_bits = 32), so at
+// 0x600000000000 one program in fifty found its own code there, could not
+// reserve the range, and saw every device pointer refused.
+constexpr uint64_t kPreferredVramBase = 0x200000000000ull;
 
 // Monotonic counters. Busy times feed the utilization numbers in cpu-smi.
 struct DeviceCounters {

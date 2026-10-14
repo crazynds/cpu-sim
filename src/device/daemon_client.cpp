@@ -176,8 +176,12 @@ public:
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
         if (p == reinterpret_cast<void*>(vram_base_)) {
             reserved_ = true;
-        } else if (p != MAP_FAILED) {
-            munmap(p, vram_size_);
+        } else {
+            if (p != MAP_FAILED) munmap(p, vram_size_);
+            // Device pointers would be refused (they might be this process's own).
+            std::fprintf(stderr, "cpusim: the device's addresses (0x%llx, %llu GiB) are taken in this process; "
+                                 "device memory is not usable from it\n",
+                         (unsigned long long)vram_base_, (unsigned long long)(vram_size_ >> 30));
         }
         return Error::Success;
     }
