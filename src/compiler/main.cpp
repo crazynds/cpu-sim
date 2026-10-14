@@ -1196,6 +1196,15 @@ int main(int argc, char** argv) {
         // independent work, and the runtime's measurement picked the 32-lane
         // variant over the block-wide one (samples/tensor_gemm: 2x faster).
         const bool tensor = min_sm > 0;
+        // Variants of 128 lanes and more for a thread with many live values:
+        // every value is lanes / 16 vector registers, so they spill, and
+        // register allocation over them took minutes (HeCBench hadamard, 128+
+        // live values: 215 s for one kernel). They never won: past 47 live
+        // values the runtime picked 32 or 64 lanes in every measured kernel
+        // (the widest winner had 29), and hadamard's 256 and 128s ran 2-5x
+        // slower than 32.
+        constexpr unsigned kWideLiveLimit = 64;
+        const bool heavy = kernel_features(*k.scalar).live_units > kWideLiveLimit;
         k.has_barriers |= k.spins;
         static const bool print_features = std::getenv("CPUSIM_DEVC_FEATURES") != nullptr;
         if (print_features && k.spec_block[0] == 0 && k.spec_class == 0) {
@@ -1228,13 +1237,13 @@ int main(int argc, char** argv) {
         // or 4 warps per call give the core more independent work. The
         // runtime measures which one wins.
         for (unsigned i = 0; ok && (2 * L << i) <= CPUSIM_MAX_LANES && (k.has_barriers || i < 2); ++i) {
-            if (!wanted(2 * L << i, true) || narrow) continue;
+            if (!wanted(2 * L << i, true) || narrow || (heavy && (2 * L << i) >= 128)) continue;
             ok = build(false, 2 * L << i);
             if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_WIDE_SHIFT + i);
         }
         // Groups of 2 and 4 warps that still suspend at barriers: fewer switches.
         for (unsigned i = 0; ok && k.has_barriers && !narrow && i < 2; ++i) {
-            if (!wanted(2 * L << i, false)) continue;
+            if (!wanted(2 * L << i, false) || (heavy && (2 * L << i) >= 128)) continue;
             ok = build(false, 2 * L << i, true);
             if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_SUSP_SHIFT + i);
         }

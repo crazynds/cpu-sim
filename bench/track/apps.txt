@@ -49,3 +49,4 @@ nqueen 15 7 10
 randomAccess 1
 softmax 100000 784 0 10
 sc
+hadamard
