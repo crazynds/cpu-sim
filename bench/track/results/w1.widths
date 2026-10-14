@@ -1,0 +1,52 @@
+adam cpusim: width of _Z4adamIffEvPT_S1_S1_PKT0_fffffim10adamMode_tf, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:6742.2 64:7367.9 128:3319.4 32:66161.8 -> 128 lanes
+asta cpusim: width of _Z15PTTWAC_soa_astaiiiPfPiS0_, block 64x1x1, over launches (us of launch time per 1000 blocks, best run) 64:609824.6 32:737350.2 -> 64 lanes
+base64e cpusim: width of _Z10base64_encPKhPhcmj, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:66.5 64:49.0 128:61.0 -> 64 lanes
+colorwheel cpusim: width of _Z5colorPhiiff, block 16x16x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 32:5142.9 64:6779.7 128:8018.7 -> 32 lanes
+fft cpusim: width of _Z9fft1D_512P7double2, block 64x1x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 64:5381.2 32:23401.5 -> 64 lanes
+fft cpusim: width of _Z10ifft1D_512P7double2, block 64x1x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 64:5625.3 32:23048.9 -> 64 lanes
+fpdc cpusim: width of _Z17CompressionKerneliPKyPcPKiPi, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:40597.0 64:37109.5 128:37814.6 -> 64 lanes
+groupnorm cpusim: width of _Z24groupnorm_forward_kernelPKfS0_S0_PfS1_S1_iiiii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 256:238.0 128c:650.5 128s:197.5 64s:117.6 32:129.9 -> 64s lanes
+groupnorm cpusim: width of _Z25groupnorm_forward_kernel2PKfS0_S0_PfS1_S1_iiiii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 256:316.7 128c:315.5 128s:101.2 64s:85.8 32:922.8 -> 64s lanes
+groupnorm cpusim: width of _Z25groupnorm_backward_kernelPKfS0_S0_S0_S0_PfS1_S1_iiiii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 256:264.2 128c:357.7 128s:123.3 64s:109.8 32:103.6 -> 32 lanes
+haccmk cpusim: width of _Z13haccmk_kerneliiPKfS0_S0_S0_PfS1_S1_fff, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:128503.5 64:203983.2 128:401660.5 -> 32 lanes
+hellinger cpusim: width of _Z9hellingerPKfS0_Pfiii, block 16x16x1, over launches (us of launch time per 1000 blocks, best run) 32:1383.1 64:1383.9 128:1384.7 -> 32 lanes
+interleave cpusim: width of _Z26add_kernel_non_interleavedP17NON_INTERLEAVED_TPKS_j, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:64063.2 64:85689.8 128:136158.9 -> 32 lanes
+interleave cpusim: width of _Z22add_kernel_interleavedP13INTERLEAVED_TPKS_j, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:176395.8 64:322153.6 128:558564.8 -> 32 lanes
+is cpusim: width of _Z17rank_gpu_kernel_3PiPKiii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:1432.6 64:1496.3 128:693.0 -> 128 lanes
+is cpusim: width of _Z17rank_gpu_kernel_6PKiPiS0_ii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:8270.4 64:5017.4 128:2035.5 -> 128 lanes
+is cpusim: width of _Z17rank_gpu_kernel_2Piii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:8568.5 64:1783.6 128:1541.4 -> 128 lanes
+is cpusim: width of _Z17rank_gpu_kernel_4PKiPiS1_ii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 256:4082.1 128c:88544.1 128s:1566.8 64s:4173.2 32:1844.9 -> 128s lanes
+is cpusim: width of _Z17rank_gpu_kernel_5PKiPiii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 256:13293.0 128c:412774.0 128s:10048.0 64s:9690.0 32:10266.0 -> 64s lanes
+jenkins-hash cpusim: width of _Z15jk3_hash_kernelPKjS0_S0_Pji, block 256x1x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 32:7871.0 64:9648.0 128:9040.9 32:17019.1 -> 32 lanes
+knn cpusim: width of _Z15cuInsertionSortPfPiiii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:251513.3 64:299026.9 128:483854.9 -> 32 lanes
+knn cpusim: width of _Z14cuParallelSqrtPfii, block 16x16x1, over launches (us of launch time per 1000 blocks, best run) 32:888.2 64:332.0 128:394.6 -> 64 lanes
+knn cpusim: width of _Z23cuComputeDistanceGlobalPKfiS0_iiPf, block 16x16x1, over launches (us of launch time per 1000 blocks, best run) 256:38.0 128c:82.2 128s:36.3 64s:33.7 32:40.1 -> 64s lanes
+laplace3d cpusim: width of _Z9laplace3diiiiPKfPf, block 32x8x1, over launches (us of launch time per 1000 blocks, best run) 256:5796.7 128c:16521.8 128s:6785.0 64s:6642.9 32:6615.5 -> 256 lanes
+libor cpusim: width of _Z29Pathcalc_Portfolio_KernelGPU2PfPKfPKiS1_fiii, block 64x1x1, over launches (us of launch time per 1000 blocks, best run) 32:2359.0 32:2360.5 -> 32 lanes
+libor cpusim: width of _Z28Pathcalc_Portfolio_KernelGPUPfS_PKfPKiS1_fiii, block 64x1x1, over launches (us of launch time per 1000 blocks, best run) 32:3273.9 32:6462.1 -> 32 lanes
+lombscargle cpusim: width of _Z11lombscargleiiPKfS0_S0_Pff, block 256x1x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 32:1378.2 64:789.0 128:1546.9 32:2933.3 -> 64 lanes
+lud cpusim: width of _Z12lud_internalPfmi, block 16x16x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 256:1493.0 128c:6381.4 128s:1647.9 64s:2093.2 32:2403.8 -> 256 lanes
+matrix-rotate cpusim: width of _Z22rotate_matrix_parallelPfi, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:255899.3 64:313346.0 128:999005.5 32:401582.6 -> 32 lanes
+md5hash cpusim: width of _Z14md5hash_kernelPiPhPjiiijjjj, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:319.8 64:268.3 128:238.1 32:269.5 -> 128 lanes
+murmurhash3 cpusim: width of _Z26MurmurHash3_x64_128_kernelPKhPKjS2_Pmj, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:16460.9 64:20796.8 128:25969.6 32:14681.1 -> 32 lanes
+overlap cpusim: width of _Z9incKernelPiPKiii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:24.1 64:52.9 128:26.3 -> 32 lanes
+perplexity cpusim: width of _Z13sigmas_kernelIifEvPKT0_PS0_ffifT_i, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:233303.7 64:402749.0 128:496094.8 32:161783.2 -> 32 lanes
+present cpusim: width of _Z7presentiiPKhS0_PhS0_S0_S0_S0_S0_, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:2543.6 64:2343.8 128:2534.3 -> 64 lanes
+quantBnB cpusim: width of _Z9kQuantizeILi256ELi256EEvPKfS1_Phi, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 256:126.9 128c:99.6 128s:138.0 64s:136.3 32:77.2 -> 32 lanes
+rainflow cpusim: width of _Z14rainflow_countPKdPKiPdPiP7double3S4_i, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:49708.1 64:70363.5 128:84382.5 32:135134.9 -> 32 lanes
+reverse cpusim: width of _Z7reversePii, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 256:40965.0 128c:544276.0 128s:9593.0 64s:11792.0 32:12070.0 -> 128s lanes
+rtm8 cpusim: width of _Z4rtm8PKfS0_S0_PfS1_S1_S0_m, block 16x16x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 32:4059.2 64:6136.3 128:7318.7 -> 32 lanes
+simplemoc cpusim: width of _Z3attPKiS0_PfS1_S1_S1_S1_iii, block 128x1x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 32:4704899.0 64:2360343.9 128:1305028.9 -> 128 lanes
+threadfence cpusim: width of _Z3sumPKfiPjPVf, block 256x1x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 256:1711.0 128c:5591.5 128s:2336.2 64s:5012.4 32:2530.2 -> 256 lanes
+winograd cpusim: width of _Z15winograd_conv2dPKfS0_Pfii, block 32x8x1, over launches (us of launch time per 1000 blocks, best run) 32:351.1 64:394.2 128:343.0 -> 128 lanes
+zeropoint cpusim: width of _Z10zero_pointPKfS0_iiibPfPi, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:20.2 64:13.2 128:13.4 -> 64 lanes
+nbody cpusim: width of _Z20accelerate_particlesP8Particleiff, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:34570.6 64:36053.2 128:54269.0 -> 32 lanes
+nbody cpusim: width of _Z16update_particlesP8ParticlePfif, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:2406.5 64:1988.2 128:2111.3 -> 64 lanes
+mandelbrot cpusim: width of _Z6mandelPiPK16MandelParametersii, block 16x16x1, over launches (us of launch time per 1000 blocks, best run) 32:82.0 64:77.4 128:94.0 32:301.5 -> 64 lanes
+black-scholes cpusim: width of _Z15getOutValOptionPK17optionInputStructPfi, block 256x1x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 32:5193.4 64:5837.2 128:5475.5 -> 32 lanes
+heat2d cpusim: width of _Z13dev_lapl_iterPfPKfffii, block 256x1x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 32:1228.9 64:1521.1 128:2193.3 -> 32 lanes
+iso2dfd cpusim: width of _Z15iso_2dfd_kernelPfPKfS1_fmm, block 16x16x1, over launches (us of launch time per 1000 blocks, best run) 32:41.7 64:40.3 128:33.0 -> 128 lanes
+bitonic-sort cpusim: width of _Z12bitonic_sortiiPi, block 256x1x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 32:1477.9 64:1504.6 128:1525.2 -> 32 lanes
+nqueen cpusim: width of _Z18BP_queens_root_dfsijiPK10queen_rootPyS2_, block 128x1x1, over launches (us of launch time per 1000 blocks, best run) 32:55989.2 64:68237.1 128:90499.0 32:41523.0 -> 32 lanes
+randomAccess cpusim: width of _Z9initTablePyy, block 256x1x1, in the first launch (us per 1000 blocks, best of 2 slices of 3968) 32:964.0 64:1086.0 128:1237.0 -> 32 lanes
+softmax cpusim: width of _Z7softMaxiiPKfPf, block 256x1x1, over launches (us of launch time per 1000 blocks, best run) 32:11977.4 64:13432.1 128:18979.2 -> 32 lanes

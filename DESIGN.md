@@ -85,7 +85,7 @@ At the first launch of a block shape that the binary does not carry, the runtime
 
 - The device reserves physical cores (by default all but two, which stay with the programs and the system); each of their logical CPUs gets one **worker** thread pinned to it. A core is an "SM", so `multiProcessorCount` is the number of reserved cores.
 - **A worker runs whole blocks by itself.** The two SMT siblings of a core normally run different blocks, and the shared memory and warp frames of a block live in a worker-local buffer that stays in L1/L2.
-- The original plan was the opposite: every block on a whole core, its warps split between the two siblings. Measured, it loses whenever the kernel alternates memory phases and compute phases (tiled matmul): independent blocks on the siblings fall out of phase and SMT overlaps one's memory wait with the other's arithmetic, while a shared block aligns both on the same phase. Running one block across both siblings survives as the **cooperative variant**, one more candidate of the width selection, chosen only where it measures faster ([15](docs/optimization/iteration-2/15-smt-cooperative-variant.md)).
+- The original plan was the opposite: every block on a whole core, its warps split between the two siblings. Measured, it loses whenever the kernel alternates memory phases and compute phases (tiled matmul): independent blocks on the siblings fall out of phase and SMT overlaps one's memory wait with the other's arithmetic, while a shared block aligns both on the same phase. Running one block across both siblings was kept for a while as a **cooperative variant** of the width selection ([15](docs/optimization/iteration-2/15-smt-cooperative-variant.md)); measured over the tracked HeCBench kernels it never won, and was from 2 to 50 times slower than the best width, so it was removed.
 
 ### 4.3 Width variants
 
@@ -96,7 +96,6 @@ For each kernel the compiler generates several functions; the runtime picks one 
 | warp (`32`) | the warp size (fewer for a block smaller than a warp) | the warp saves its live values in a frame and returns; the executor runs the block's other warps up to the barrier, then resumes each one | every kernel |
 | suspending (`64s`, `128s`) | 2 or 4 warps | the same, for groups of 2 or 4 warps (fewer switches) | kernels with barriers, blocks larger than the group |
 | wide (`64` to `512`) | 2 warps up to 512 | nothing: the whole block is in one call, in lockstep | without barriers: any block of at least W threads; with barriers: the smallest W that covers the block |
-| cooperative (`64c` to `512c`) | half a block on each SMT sibling | an inline wait between the two halves (an epoch counter per half, `pause` in the loop); no frames | kernels with barriers, blocks of W+1 to 2W threads, cores with two siblings |
 
 (The names are those of warps of 32; with 16 or 64 the widths scale with the warp.)
 
@@ -108,8 +107,8 @@ The runtime measures the valid candidates and keeps the fastest, per kernel and 
 
 - **Large launches** measure inside the first launch: each candidate runs a slice of the launch's own blocks (32 per worker by default, `CPUSIM_TRIAL_BLOCKS`), in two rounds back to back keeping each candidate's best slice, and the rest of the launch runs with the winner. The measure is the workers' time per block, not the wall time of the slice.
 - **Small launches** measure one candidate per launch, by wall time per block. After the first round only candidates within 1.5x of the best are run again, so a program that launches a shape a few times does not spend them all measuring.
-- **Order of the candidates.** With barriers: wide, then cooperative, then suspending, and the 32-lane variant last, since a program that ends before the measurement does keeps the first ones, and the 32-lane variant, which suspends at every barrier, was the slowest on every barrier kernel measured.
-- `CPUSIM_LANES=<n>`, `<n>s` or `<n>c` forces a width; `CPUSIM_VERBOSE=1` prints the measurements and the choice.
+- **Order of the candidates.** With barriers: wide, then suspending, and the 32-lane variant last, since a program that ends before the measurement does keeps the first ones, and the 32-lane variant, which suspends at every barrier, was the slowest on every barrier kernel measured.
+- `CPUSIM_LANES=<n>`, `<n>s` or `<n>r` (lanes that refill) forces a width; `CPUSIM_VERBOSE=1` prints the measurements and the choice.
 
 Every width produces the same bits: a test suite checks it, with the selection switching widths in the middle of a program ([23](docs/optimization/iteration-3/23-reproducibility-and-stability.md)).
 
@@ -138,7 +137,7 @@ A loop whose exit depends on a volatile or atomic read (a spin lock, a flag set 
 - **Distribution** ([17](docs/optimization/iteration-2/17-block-distribution.md)): the grid is dealt in chunks of 64 blocks, chunk c to worker c mod n, so the same block lands on the same core launch after launch and finds its data in cache; a worker that runs out steals from the others. A grid too small for a chunk of 64 per worker gets one chunk per worker.
 - **Order** ([04](docs/optimization/iteration-1/04-block-order.md)): 2D grids are walked in bands of 8 columns, so blocks that run at the same time share their working set in L3 (`CPUSIM_BLOCK_ORDER=linear` turns it off).
 - **Few blocks** ([16](docs/optimization/iteration-2/16-splitting-blocks-into-warps.md)): when a launch has fewer than 8 blocks per worker and the kernel has no barrier and no shared memory, the executor hands out groups of lanes instead of blocks, as a GPU schedules warps.
-- **Concurrent kernels** ([20](docs/optimization/iteration-2/20-concurrent-kernels.md)): several launches (from different streams or programs) can be active; a worker takes blocks from the oldest one with blocks left, so the end of one kernel overlaps the start of the next. A cooperative launch runs alone, since every pair of siblings must take part.
+- **Concurrent kernels** ([20](docs/optimization/iteration-2/20-concurrent-kernels.md)): several launches (from different streams or programs) can be active; a worker takes blocks from the oldest one with blocks left, so the end of one kernel overlaps the start of the next. 
 - **Idle workers** ([30](docs/optimization/iteration-3/30-launches-and-hot-spots.md)): they spin for up to 200 us (on Zen, parked with `MONITORX`/`MWAITX`, which leaves the core to the sibling), then sleep. A launch posts how many workers it needs, `min(blocks, workers)`, so a one-block kernel wakes one worker, and workers join a launch without a lock. An empty launch costs about 2 us in-process and 5 to 7 us through the driver.
 
 ### 4.9 Faults
@@ -189,7 +188,7 @@ Specializing on the block shape is what made the wide variants viable: `blockDim
 
 - An atomic whose address is the same in every active lane is one reduction across lanes, **one** locked instruction, and an exclusive scan for the values returned.
 - Otherwise lanes are grouped by address: one locked instruction per distinct address, its operand reduced over the lanes that share it. CUDA leaves the order of a warp's atomics unspecified, so this is an order a GPU could choose ([30](docs/optimization/iteration-3/30-launches-and-hot-spots.md)).
-- Atomics in shared memory are locked too: the cooperative variant runs one block on two CPUs.
+- Atomics in shared memory are locked too.
 - x86 is TSO and its locked instructions are stronger than CUDA's relaxed atomics. The compiler keeps `volatile` accesses, fences and barriers in order with compiler barriers.
 
 ### 5.7 Math, types and warp operations

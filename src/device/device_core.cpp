@@ -298,12 +298,11 @@ Error DeviceCore::memcpy_dtod(uint32_t id, uint64_t dst, uint64_t src, uint64_t 
 namespace {
 
 // Widths are lane counts; kSuspend marks the 64/128-lane variants that still
-// suspend at barriers (several groups per block, like 32), kCoop the
-// cooperative ones (half a block on each SMT sibling of a core).
+// suspend at barriers (several groups per block, like 32), kRefill the warp
+// entry whose lanes refill.
 constexpr uint32_t kSuspend = 0x10000;
-constexpr uint32_t kCoop = 0x20000;
-constexpr uint32_t kRefill = 0x40000;  // the warp entry whose lanes refill
-const char* width_suffix(uint32_t w) { return w & kSuspend ? "s" : w & kCoop ? "c" : ""; }
+constexpr uint32_t kRefill = 0x40000;
+const char* width_suffix(uint32_t w) { return w & kSuspend ? "s" : w & kRefill ? "r" : ""; }
 
 // Kernel modules are loaded from a real file named after their content, so
 // profilers (perf report/annotate) can find the code and its symbols after
@@ -438,10 +437,6 @@ Error DeviceCore::get_function(uint32_t id, uint64_t module, const std::string& 
         if (meta->flags & (1u << (CPUSIM_META_SUSP_SHIFT + i)))
             info.susp[i] = reinterpret_cast<uint64_t>(
                 dlsym(handle, ("__cpusim_entry" + std::to_string(two_warps << i) + "s_" + name).c_str()));
-    for (int i = 0; i < 5; ++i)
-        if (meta->flags & (1u << (CPUSIM_META_COOP_SHIFT + i)))
-            info.coop[i] = reinterpret_cast<uint64_t>(
-                dlsym(handle, ("__cpusim_entry" + std::to_string(two_warps << i) + "c_" + name).c_str()));
     if (meta->flags & CPUSIM_META_BLOCK_FN)
         info.block = reinterpret_cast<uint64_t>(dlsym(handle, ("__cpusim_block_" + name).c_str()));
     info.trace = reinterpret_cast<uint64_t>(dlsym(handle, ("__cpusim_trace_" + name).c_str()));
@@ -614,7 +609,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
                 executor_->run(reinterpret_cast<cpusim_entry_fn>(fn_entry), w & 0xffff,
                                w == meta.warp_lanes || (w & kSuspend), meta, run_cfg, aligned,
                                cfg.profile ? result->counters : nullptr, reinterpret_cast<cpusim_block_fn>(block_fn),
-                               (w & kCoop) != 0, first, last, busy, &fault, id, (w & kRefill) != 0);
+                               first, last, busy, &fault, id, (w & kRefill) != 0);
             };
             // A fault ends the launch (and only it): an invalid address is
             // cudaErrorIllegalAddress, anything else an unspecified failure.
@@ -689,7 +684,7 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
         const char* v = std::getenv("CPUSIM_LANES");
         if (!v) return 0u;
         uint32_t w = uint32_t(std::atoi(v));
-        return std::strchr(v, 's') ? w | kSuspend : std::strchr(v, 'c') ? w | kCoop : std::strchr(v, 'r') ? w | kRefill : w;
+        return std::strchr(v, 's') ? w | kSuspend : std::strchr(v, 'r') ? w | kRefill : w;
     }();
     const uint64_t threads = uint64_t(cfg.block[0]) * cfg.block[1] * cfg.block[2];
     const bool barriers = fn.meta.flags & CPUSIM_META_HAS_BARRIERS;
@@ -700,8 +695,6 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
         if (w == (warp | kRefill)) return fn.refill;
         for (int i = 0; i < 2; ++i)
             if ((two << i | kSuspend) == w) return fn.susp[i];
-        for (int i = 0; i < 5; ++i)
-            if ((two << i | kCoop) == w) return fn.coop[i];
         for (int i = 0; i < 5; ++i)
             if (two << i == w) return fn.wide[i];
         return 0;
@@ -723,19 +716,15 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
     }
     // Lanes that refill: for warps whose lanes loop for different counts.
     if (fn.refill) valid.push_back(warp | kRefill);
-    // Half the block on each SMT sibling: blocks of w+1 to 2w threads.
-    if (barriers && executor_->pairs())
-        for (int i = 0; i < 5; ++i)
-            if (fn.coop[i] && threads > (two << i) && threads <= (2 * two << i)) valid.push_back(two << i | kCoop);
     // With barriers, the wide variants come first: the warp entry, which
     // suspends at every barrier, has been the slowest every time we measured
     // (matmul_tiled, scan, heat2d, fdtd3d), and a program too short for the
     // measurement to finish keeps running the first candidates.
     if (barriers) std::stable_sort(valid.begin(), valid.end(), [&](uint32_t a, uint32_t b) {
-        auto rank = [&](uint32_t w) { return w == warp ? 3 : (w & kSuspend) ? 2 : (w & kCoop) ? 1 : 0; };
+        auto rank = [&](uint32_t w) { return w == warp ? 3 : (w & kSuspend) ? 2 : 0; };
         return rank(a) < rank(b) || (rank(a) == rank(b) && (a & 0xffff) > (b & 0xffff));
     });
-    // CPUSIM_LANES=<n>, or <n>s for a suspending variant, <n>c for a cooperative one, <n>r for lanes that refill.
+    // CPUSIM_LANES=<n>, or <n>s for a suspending variant, <n>r for lanes that refill.
     if (forced) {
         for (uint32_t w : valid)
             if (w == forced) {

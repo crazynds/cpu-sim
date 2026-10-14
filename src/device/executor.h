@@ -56,12 +56,10 @@ struct LaunchResult {
 
 // The device's "SMs": one worker thread per reserved logical CPU, pinned to it.
 // A launch hands out whole blocks through an atomic counter; each worker runs
-// every warp of its block. With a cooperative entry, the two SMT siblings of a
-// core run one block together instead, half each (DESIGN.md 4.2).
+// every warp of its block.
 // Several launches (from different streams) can be active at once: a worker
 // takes blocks from the oldest one that still has some, so a kernel's last
-// blocks overlap with the next kernel's first ones. Cooperative launches run
-// alone (every pair of siblings has to take part).
+// blocks overlap with the next kernel's first ones.
 // A kernel that faulted (SIGSEGV, SIGBUS, SIGFPE or SIGILL on a worker): the
 // launch stops, and only it fails; the process (the driver, which serves
 // every program) goes on.
@@ -83,13 +81,11 @@ public:
     // `lanes`: threads per entry call (32, or a block-wide variant's width).
     // `suspending`: the entry may return CPUSIM_BARRIER (needs frames).
     // `block`: when given (32-lane path), runs each block's barrier rounds in one call.
-    // `cooperative`: a __cpusim_entry<lanes>c_ entry; the block is two calls of
-    // `lanes`, run by the two SMT siblings of a core at the same time.
     // [first, last): only these blocks, in hand-out order (the width tuning
     // runs slices of one launch with different entries).
     void run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const cpusim_kernel_meta& meta,
              const LaunchConfig& cfg, const uint8_t* params, uint64_t* counters = nullptr,
-             cpusim_block_fn block = nullptr, bool cooperative = false, uint64_t first = 0,
+             cpusim_block_fn block = nullptr, uint64_t first = 0,
              uint64_t last = UINT64_MAX, uint64_t* busy_ns = nullptr, KernelFault* fault = nullptr,
              uint32_t tag = 0, bool refill = false);
     // Stops the running launches tagged `tag` (0: all): their workers leave
@@ -113,8 +109,8 @@ public:
     static CtxArray slice_groups(const CtxArray& groups, uint32_t lanes, uint32_t slices);
 
     size_t workers() const { return threads_.size(); }
-    // Pairs of SMT siblings among the workers (0: no cooperative launches).
-    size_t pairs() const { return pairs_.size(); }
+    // Pairs of SMT siblings among the workers.
+    size_t pairs() const { return pair_count_; }
 
     static constexpr uint32_t kMaxSharedBytes = 100 * 1024;
     static constexpr size_t kWorkerStackBytes = size_t(512) << 20;  // virtual; see the constructor
@@ -129,7 +125,6 @@ private:
         uint64_t* counters = nullptr;
         uint32_t frame_stride = 0;  // bytes per warp frame, 0 without barriers
         cpusim_block_fn block = nullptr;
-        bool cooperative = false;
         // > 1: the unit handed out is one group of a block, not the block
         // (kernels without barriers or shared memory, small grids): `next`
         // and `blocks` count units, unit u = block u / split, group u % split.
@@ -138,8 +133,8 @@ private:
         // many blocks from refill_first (up to refill_last), all its threads
         // handed to one call.
         uint64_t refill_blocks = 0, refill_first = 0, refill_last = 0;
-        mutable std::atomic<uint64_t> next{0};  // cooperative jobs: next block to hand out
-        // Everything else: blocks (units) dealt out in chunks of kChunk, chunk
+        mutable std::atomic<uint64_t> next{0};  // the first block (the ranges below hand them out)
+        // Blocks (units) dealt out in chunks of kChunk, chunk
         // c to worker c % workers, each walking its chunks in order; a worker
         // done with its own takes from the others'. Every worker moves
         // through the grid in step with the rest (neighbouring blocks run at
@@ -169,14 +164,16 @@ private:
         bool has_work() const;  // some block not taken yet (reads every range: not on hot paths)
         // A worker found no block left: no one else needs to join.
         mutable std::atomic<bool> exhausted{false};
-        // Cooperative jobs, under mutex_: workers inside, and which have joined.
-        int inflight = 0;
-        // Other jobs, without the lock: workers inside, plus kClosed once the
+        // Without the lock: workers inside, plus kClosed once the
         // last one left with no block to hand out (then nobody can join).
         static constexpr int64_t kClosed = int64_t(1) << 62;
-        std::atomic<int64_t> state{0};
+        // Written by every worker joining and leaving, read by the claims of
+        // every block: on a line of its own (sharing one with the job's
+        // read-mostly fields made iso2dfd 7% and groupnorm 18% slower, kernels
+        // of many short launches).
+        alignas(64) std::atomic<int64_t> state{0};
         // At most this many workers inside at once (Executor::cap_for).
-        int64_t cap = INT64_MAX;
+        alignas(64) int64_t cap = INT64_MAX;
         uint64_t nodes = ~0ull;  // bit n: workers of node n may join
         const std::function<void(uint64_t, int)>* native = nullptr;  // run_native's function, if any
         bool one_per_core = false;                                   // only one SMT sibling of each core joins
@@ -193,40 +190,13 @@ private:
             int64_t zero = 0;
             return state.compare_exchange_strong(zero, kClosed, std::memory_order_acq_rel);
         }
-        int joins = 0;
-        std::atomic<uint64_t> busy_ns{0};
-        std::vector<char> joined;
-        std::atomic<bool> done{false};
+        alignas(64) std::atomic<uint64_t> busy_ns{0};  // added to by every worker leaving
+        alignas(64) std::atomic<bool> done{false};
         // A worker faulted: the others take no more blocks.
         mutable std::atomic<bool> aborted{false};
         KernelFault fault;  // under mutex_
         uint32_t tag = 0;   // the context that launched it
         uint32_t meta_flags = 0;  // CPUSIM_META_*
-    };
-
-    // Two SMT siblings running blocks together. Barrier epochs (see
-    // kernel_abi.h) are (round << 32) | barriers passed, one cache line each;
-    // round r's block goes from the first worker of the pair to the second
-    // through slot[r & 1].
-    struct alignas(64) Pair {
-        alignas(64) std::atomic<uint64_t> epoch0{0xffffffffu};
-        alignas(64) std::atomic<uint64_t> epoch1{0xffffffffu};
-        struct alignas(64) Slot {
-            std::atomic<uint64_t> round{0};
-            uint64_t block = 0;
-            uint8_t* shared = nullptr;
-        } slot[2];
-        std::atomic<uint64_t>& epoch(int half) { return half ? epoch1 : epoch0; }
-        // Blocks each half went through (equal between jobs; written only by
-        // that half's worker).
-        uint64_t round[2] = {0, 0};
-        // After a fault ended a job midway: both halves agree again.
-        void resync() {
-            const uint64_t r = std::max(round[0], round[1]);
-            round[0] = round[1] = r;
-            epoch0.store(r << 32 | 0xffffffffu);
-            epoch1.store(r << 32 | 0xffffffffu);
-        }
     };
 
     // Workers worth calling for a launch of `units` blocks (or groups) of a
@@ -246,16 +216,13 @@ private:
         return job.one_per_core && pair_of_[size_t(worker)] >= 0 && half_of_[size_t(worker)] == 1;
     }
     Job* pick(int worker);    // under mutex_: a job this worker should take part in, or null
-    void maybe_finish(Job* job);  // under mutex_
     void run_blocks(const Job& job, int worker, CtxArray& ctx, uint8_t* shared, uint64_t* counters, uint8_t* frames);
     static bool claim(const Job& job, int worker, uint64_t* b);
-    void run_pair(const Job& job, CtxArray& ctx, uint8_t* shared, uint64_t* counters, Pair& pair, int half,
-                  uint64_t& round);
     // blockIdx of the b-th block handed out (CUDA promises no order).
     void block_coords(const Job& job, uint64_t b, uint32_t* idx) const;
 
     std::vector<std::thread> threads_;
-    std::vector<std::unique_ptr<Pair>> pairs_;
+    size_t pair_count_ = 0;
     std::vector<int> pair_of_, half_of_;  // per worker; pair -1: no sibling among the workers
     // A plain mutex: the hot paths (joining and leaving a job) take no lock,
     // and a spin lock whose holder gets preempted (an unpinned thread on its
@@ -295,13 +262,12 @@ private:
     std::atomic<bool> stopping_{false};
     std::vector<Job*> active_;   // oldest first
     std::unique_ptr<std::atomic<Job*>[]> current_;  // the job each worker is in (for cancel)
-    // The latest job posted (not cooperative): a worker with a demand slot
+    // The latest job posted: a worker with a demand slot
     // joins it without the lock. `readers_` counts workers between reading it
     // and joining, so the job outlives their look at it.
     std::atomic<Job*> hot_{nullptr};
     std::atomic<int> readers_{0};
     void finish(Job* job);  // under mutex_: the job is over, run() may return
-    bool coop_active_ = false;   // a cooperative job runs alone
 };
 
 }  // namespace cpusim

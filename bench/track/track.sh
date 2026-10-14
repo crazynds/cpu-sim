@@ -34,7 +34,9 @@ grep -v '^#' "$APPS" | while read -r app args; do
   t2=$(date +%s.%N)
   for r in $(seq "${REPS:-3}"); do
     CPUSIM_KERNEL_TIMES=1 timeout 120 ./main $args > run.log 2>&1; rc=$?
-    { [ $rc -ne 0 ] || grep -qE "FAIL|INCORRECT|[Mm]ismatch" run.log; } && status=FAIL
+    if [ $rc -ne 0 ] || grep -qE "FAIL|INCORRECT|[Mm]ismatch" run.log; then
+      status=FAIL; cp run.log "$OUT/$LABEL.$app.fail$r.log"  # kept: failures may not come back
+    fi
     n=$(sed -n 's/^cpusim-times-total //p' run.log)
     [ -n "$n" ] && { [ -z "$ns" ] || [ "$n" -lt "$ns" ]; } && ns=$n
   done

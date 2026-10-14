@@ -10,10 +10,12 @@ SRC=${HECBENCH:-$HOME/fire/src}
 OUT=$(dirname "$(realpath "$0")")/results; mkdir -p "$OUT"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 FEAT=$OUT/$LABEL.features; WID=$OUT/$LABEL.widths; : > "$FEAT"; : > "$WID"
-LOG=$WORK/daemon.log
-pkill -x cpusimd; sleep 1
-(cd "$BUILD" && CPUSIM_VERBOSE=1 setsid nohup numactl --interleave=all ./cpusimd --daemon > "$LOG" 2>&1 < /dev/null &)
+# A daemon of its own (the daemon writes its messages to <socket>.log).
+export CPUSIM_SOCKET=$WORK/driver.sock
+LOG=$CPUSIM_SOCKET.log
+(cd "$BUILD" && CPUSIM_VERBOSE=1 setsid nohup numactl --interleave=all ./cpusimd --daemon >/dev/null 2>&1 < /dev/null &)
 sleep 2
+touch "$LOG"
 grep -v '^#' "$APPS" | while read -r app args; do
   [ -z "$app" ] && continue
   rm -rf "$WORK/$app"; cp -r "$SRC/$app-cuda" "$WORK/$app"; [ -d "$SRC/include" ] && cp -r "$SRC/include" "$WORK/include"
@@ -26,5 +28,5 @@ grep -v '^#' "$APPS" | while read -r app args; do
   timeout 120 ./main $args > /dev/null 2>&1
   tail -n +$((before + 1)) "$LOG" | grep 'cpusim: width of' | sed "s/^/$app /" >> "$WID"
 done
-pkill -x cpusimd
+CPUSIM_SOCKET=$CPUSIM_SOCKET "$BUILD/cpusimd" --stop >/dev/null 2>&1
 echo "features: $(wc -l < "$FEAT"), width measurements: $(wc -l < "$WID")"

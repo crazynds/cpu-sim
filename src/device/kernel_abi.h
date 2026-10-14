@@ -23,7 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CPUSIM_KERNEL_ABI 13
+#define CPUSIM_KERNEL_ABI 14
 #define CPUSIM_WARP_SIZE 32   // CUDA's warp, the default (cpusim_kernel_meta.warp_size has the module's)
 #define CPUSIM_MAX_LANES 512  // widest group of threads one entry call runs
 
@@ -38,14 +38,6 @@
 //     uint32_t __cpusim_entry<L>s_<mangled name>(const cpusim_warp_ctx*);
 // which behave like the 32-lane entry (save state, return at a barrier) for
 // groups of 2 or 4 warps: fewer switches per barrier. frame_bytes covers them.
-//
-// And "cooperative" variants of 64, 128, 256 and 512 lanes,
-//     uint32_t __cpusim_entry<L>c_<mangled name>(const cpusim_warp_ctx*);
-// for blocks of L+1 to 2L threads: the two SMT siblings of a core run the two
-// halves of one block at the same time (warp_index 0 and L/32), sharing its
-// shared memory. Each __syncthreads is inline code (no call: a call would
-// spill every vector register): bump this half's epoch, wait until the other
-// half's epoch is at least as high. No frames, no suspending.
 
 enum cpusim_exit_reason {
     CPUSIM_EXIT = 0,     // the group finished
@@ -74,12 +66,7 @@ typedef struct __attribute__((aligned(64))) cpusim_warp_ctx {
     uint8_t* shared;        // the block's shared memory
     uint64_t* counters;     // CPUSIM_COUNTERS slots, only used by the __cpusim_prof_ entry
     uint8_t* frame;         // this group's saved state across barriers (64-byte aligned)
-    // Cooperative variants: barrier epochs of this half and of the other one,
-    // each on its own cache line. The runtime sets both halves' epochs to the
-    // same value before a block, and a half that returns sets its epoch to
-    // that value | 0xffffffff, so the other one never waits for it again.
-    uint64_t* coop_epoch;
-    const uint64_t* coop_other;
+    uint64_t unused[2];     // (were the barrier epochs of the removed cooperative variants)
     // The span [huge_lo, huge_hi] of every object of 2 GiB or more the kernel
     // can reach (VRAM and shared pool allocations; device malloc refuses
     // them); huge_lo > huge_hi when there is none. An access p[i] stays inside
@@ -130,7 +117,6 @@ enum cpusim_counter {
 // Variant bits, with W = warp_size (32: the 64..512-lane variants):
 #define CPUSIM_META_WIDE_SHIFT 8   // bit (8 + i): block-wide variant with 2W << i lanes exists
 #define CPUSIM_META_SUSP_SHIFT 16  // bit (16 + i): suspending variant __cpusim_entry<2W << i>s_ exists (i < 2)
-#define CPUSIM_META_COOP_SHIFT 24  // bit (24 + i): cooperative variant __cpusim_entry<2W << i>c_ exists
 #define CPUSIM_META_BLOCK_FN 2u    // __cpusim_block_<name> exists (see below)
 #define CPUSIM_META_YIELDS 4u      // the 32-lane entry may return CPUSIM_YIELD (no barrier pass-through)
 // No lane ever sees another's state (no barrier, shared memory, shuffle,
@@ -179,8 +165,6 @@ static inline uint32_t cpusim_stagger(uint32_t bytes) {
 #define CPUSIM_CTX_SHARED 56
 #define CPUSIM_CTX_COUNTERS 64
 #define CPUSIM_CTX_FRAME 72
-#define CPUSIM_CTX_COOP_EPOCH 80
-#define CPUSIM_CTX_COOP_OTHER 88
 #define CPUSIM_CTX_HUGE_LO 96
 #define CPUSIM_CTX_HUGE_HI 104
 #define CPUSIM_CTX_REFILL_NEXT 112
@@ -197,8 +181,6 @@ static_assert(offsetof(cpusim_warp_ctx, params) == CPUSIM_CTX_PARAMS);
 static_assert(offsetof(cpusim_warp_ctx, shared) == CPUSIM_CTX_SHARED);
 static_assert(offsetof(cpusim_warp_ctx, counters) == CPUSIM_CTX_COUNTERS);
 static_assert(offsetof(cpusim_warp_ctx, frame) == CPUSIM_CTX_FRAME);
-static_assert(offsetof(cpusim_warp_ctx, coop_epoch) == CPUSIM_CTX_COOP_EPOCH);
-static_assert(offsetof(cpusim_warp_ctx, coop_other) == CPUSIM_CTX_COOP_OTHER);
 static_assert(offsetof(cpusim_warp_ctx, huge_lo) == CPUSIM_CTX_HUGE_LO);
 static_assert(offsetof(cpusim_warp_ctx, huge_hi) == CPUSIM_CTX_HUGE_HI);
 static_assert(offsetof(cpusim_warp_ctx, refill_next) == CPUSIM_CTX_REFILL_NEXT);

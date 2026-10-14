@@ -33,7 +33,7 @@ run() {
 run auto
 run auto2
 run auto3
-for lanes in 32 64 64s 128 128s 128c 256 256c 512; do run "lanes-$lanes" CPUSIM_LANES=$lanes; done
+for lanes in 32 64 64s 128 128s 256 512; do run "lanes-$lanes" CPUSIM_LANES=$lanes; done
 run no-jit CPUSIM_JIT=0
 run one-core CPUSIM_CORES=1
 run three-cores CPUSIM_CORES=3

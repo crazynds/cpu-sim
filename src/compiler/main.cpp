@@ -1074,14 +1074,14 @@ int main(int argc, char** argv) {
         // JIT builds the variant the launch's block shape needs anyway.
         constexpr size_t kGenericBudget = 12000;
         bool dropped = false;
-        auto build = [&](bool profile, unsigned lanes, bool suspending = false, bool cooperative = false) {
+        auto build = [&](bool profile, unsigned lanes, bool suspending = false) {
             ValueToValueMapTy vmap;
             Function* copy = CloneFunction(k.scalar, vmap);
-            bool ok = cpusim::build_warp_entry(*m, k, *copy, profile, lanes, suspending, &why, cooperative);
+            bool ok = cpusim::build_warp_entry(*m, k, *copy, profile, lanes, suspending, &why);
             copy->eraseFromParent();
             if (ok && k.spec_block[0] == 0 && k.spec_class == 0 && lanes > k.warp_size) {
                 std::string name = "__cpusim_entry" + std::to_string(lanes) +
-                                   (cooperative ? "c_" : suspending ? "s_" : "_") + k.name;
+                                   (suspending ? "s_" : "_") + k.name;
                 if (Function* f = m->getFunction(name); f && f->getInstructionCount() > kGenericBudget) {
                     if (std::getenv("CPUSIM_DEVC_DEBUG"))
                         std::fprintf(stderr, "cpusim-devc: %s: %u instructions, left to the JIT\n", name.c_str(),
@@ -1215,14 +1215,6 @@ int main(int argc, char** argv) {
             ok = build(false, 2 * L << i, true);
             if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_SUSP_SHIFT + i);
         }
-        // Half a block per call, the two SMT siblings of a core together: for
-        // blocks of L+1 to 2L threads.
-        for (unsigned i = 0; ok && k.has_barriers && !narrow && (2 * L << i) <= CPUSIM_MAX_LANES; ++i) {
-            const unsigned lanes = 2 * L << i;
-            if (spec && !(threads > lanes && threads <= 2 * lanes)) continue;
-            ok = build(false, lanes, false, true);
-            if (ok && kept()) k.wide_variants |= 1u << (CPUSIM_META_COOP_SHIFT + i);
-        }
         if (!ok) {
             std::fprintf(stderr, "cpusim-devc: kernel %s: %s\n", k.name.c_str(), why.c_str());
             ++failures;
@@ -1245,7 +1237,7 @@ int main(int argc, char** argv) {
             std::string rwhy;
             bool built = cpusim::make_refill_kernel(*copy, k, &rwhy);
             if (built && std::getenv("CPUSIM_DEVC_REFILL_LL")) copy->print(errs());  // the rewritten per-thread code
-            built = built && cpusim::build_warp_entry(*m, k, *copy, false, k.warp_lanes, false, &rwhy, false, true);
+            built = built && cpusim::build_warp_entry(*m, k, *copy, false, k.warp_lanes, false, &rwhy, true);
             copy->eraseFromParent();
             if (built) {
                 k.wide_variants |= CPUSIM_META_REFILL;

@@ -37,3 +37,8 @@ Failures that are the programs' own bugs, which the GPU hides by its timing:
 
 - **histogram (float4 test), bin 0 sometimes off.** `histogram_gmem_accum` tests `i > ACTIVE_CHANNELS * NUM_BINS` instead of `>=`: thread 768 writes one element past `d_hist`, and our allocator places the next allocation (the partial histograms) right there, so bin 0's partial can be overwritten before it is read. With `>=` it passed 10 of 10.
 - **layernorm, kernel 0 with blocks of 64 and 32-lane calls.** `BlockReduce` is called twice with the same `__shared__` buffer and no barrier between the first call's `return smem[0]` and the second call's write of `smem[0]`. A 32-lane call runs warp 0 up to its next barrier before warp 1 reads the first result. The block-wide variant (the one the measurement picks) passes.
+
+## base64e failed once in a tracking run
+
+- **Seen:** 2026-10-14, Xeon server, `bench/track/track.sh build2 base3`: one of the three runs of HeCBench base64e failed its check (the build before shape classes).
+- **Not reproduced:** 16 more runs, 8 with that build and 8 with the next, all passed. The run's log was not kept; `track.sh` should keep the log of a failing run.

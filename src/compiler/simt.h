@@ -103,10 +103,10 @@ void lower_shared_memory(llvm::Module& m, KernelInfo& kernel);
 // The scalar function is modified, so build each variant from its own copy.
 // `suspending` (only meaningful with lanes > 32): barriers save state and
 // return, as in the 32-lane entry, instead of being no-ops.
-// `cooperative`: half of a block per call (the SMT sibling runs the other
-// half), barriers call ctx->coop_barrier: `__cpusim_entry<lanes>c_<name>`.
+// `refill`: the warp entry of a kernel rewritten by make_refill_kernel,
+// `__cpusim_entryr_<name>`.
 bool build_warp_entry(llvm::Module& m, KernelInfo& kernel, llvm::Function& scalar, bool profile, unsigned lanes,
-                      bool suspending, std::string* error, bool cooperative = false, bool refill = false);
+                      bool suspending, std::string* error, bool refill = false);
 
 // Rewrites a kernel whose lanes never look at each other (no barrier, shared
 // memory or warp collective) so that its lanes refill: the main loop (its

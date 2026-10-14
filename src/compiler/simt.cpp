@@ -68,13 +68,11 @@ class WarpBuilder {
 public:
     // `lanes`: threads per call (32: one warp). `block_wide`: the caller
     // guarantees a whole block fits in one call, so barriers are no-ops.
-    // `cooperative`: half of a block per call, the other half runs on the SMT
-    // sibling; barriers are an inline 2-party barrier on epochs (no suspending).
     // `target`: build the body of this declaration (from vector_fn) instead
     // of a kernel entry: `scalar` is a device function called per lane.
     WarpBuilder(Module& m, KernelInfo& k, Function& scalar, bool profile, unsigned lanes, bool block_wide,
-                bool cooperative = false, Function* target = nullptr)
-        : W(lanes), block_wide_(block_wide || cooperative), coop_(cooperative), m_(m), k_(k), f_(scalar),
+                Function* target = nullptr)
+        : W(lanes), block_wide_(block_wide), m_(m), k_(k), f_(scalar),
           profile_(profile), ctx_(m.getContext()), b_(ctx_), fn_(target) {}
 
     bool run(std::string* error);
@@ -282,7 +280,6 @@ private:
 
     const unsigned W;
     const bool block_wide_;
-    const bool coop_;
     Module& m_;
     KernelInfo& k_;
     Function& f_;
@@ -313,7 +310,6 @@ private:
     Value* spec_lane_mask_ = nullptr;
     void emit_specialized_tid();
     void emit_class_tid();
-    void emit_coop_barrier(Value* mask);
     Value* emit_libmvec(CallInst& call, const std::string& name, unsigned arity);
     Value* emit_shfl(Value* v, Value* src);
     Value* emit_uniform_division(BinaryOperator* bin);
@@ -2980,45 +2976,6 @@ Value* WarpBuilder::emit_mmav(CallInst* call) {
     return out[j];
 }
 
-// Cooperative variant: wait for the other half of the block, inline.
-//     e = *epoch + 1; atomic store-release *epoch = e;
-//     while (atomic load-acquire *other < e) pause;
-// Only when some lane of this half is here, so the two halves count the same
-// barriers (a half that already returned stops counting, see kernel_abi.h).
-void WarpBuilder::emit_coop_barrier(Value* mask) {
-    auto* ptr = PointerType::get(ctx_, 0);
-    auto* i64 = b_.getInt64Ty();
-    BasicBlock* arrive = BasicBlock::Create(ctx_, "coop.arrive", w_);
-    BasicBlock* wait = BasicBlock::Create(ctx_, "coop.wait", w_);
-    BasicBlock* spin = BasicBlock::Create(ctx_, "coop.spin", w_);
-    BasicBlock* after = BasicBlock::Create(ctx_, "coop.after", w_);
-    b_.CreateCondBr(any_lane(mask), arrive, after);
-
-    b_.SetInsertPoint(arrive);
-    auto field = [&](unsigned offset, const char* name) {
-        return b_.CreateAlignedLoad(ptr, b_.CreateConstInBoundsGEP1_64(b_.getInt8Ty(), ctx_arg_, offset), Align(8), name);
-    };
-    Value* epoch = field(CPUSIM_CTX_COOP_EPOCH, "coop.epoch");
-    Value* other = field(CPUSIM_CTX_COOP_OTHER, "coop.other");
-    LoadInst* cur = b_.CreateAlignedLoad(i64, epoch, Align(8), "coop.cur");
-    cur->setAtomic(AtomicOrdering::Monotonic);
-    Value* next = b_.CreateAdd(cur, ConstantInt::get(i64, 1), "coop.next");
-    sfence_if_streaming();
-    b_.CreateAlignedStore(next, epoch, Align(8))->setAtomic(AtomicOrdering::Release);
-    b_.CreateBr(wait);
-
-    b_.SetInsertPoint(wait);
-    LoadInst* seen = b_.CreateAlignedLoad(i64, other, Align(8), "coop.seen");
-    seen->setAtomic(AtomicOrdering::Acquire);
-    b_.CreateCondBr(b_.CreateICmpUGE(seen, next), after, spin);
-
-    b_.SetInsertPoint(spin);
-    b_.CreateCall(Intrinsic::getDeclaration(&m_, Intrinsic::x86_sse2_pause));
-    b_.CreateBr(wait);
-
-    b_.SetInsertPoint(after);
-}
-
 // ---------------------------------------------------------------- structure
 
 Node WarpBuilder::node_of(BasicBlock* bb, Loop* level) {
@@ -3083,7 +3040,7 @@ void WarpBuilder::emit_prologue() {
                                  : profile_ ? std::string("__cpusim_prof_")
                                  : W <= k_.warp_size ? std::string("__cpusim_entry_")
                                                          : "__cpusim_entry" + std::to_string(W) +
-                                                               (coop_ ? "c_" : block_wide_ ? "_" : "s_")) +
+                                                               (block_wide_ ? "_" : "s_")) +
                                     k_.name,
                                 m_);
     w_->addFnAttr(Attribute::NoUnwind);
@@ -3743,10 +3700,7 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
     if (auto* call = dyn_cast<CallInst>(&inst)) {
         SpecialReg r = special_reg(call);
         if (r != SpecialReg::None) return set(special_[(int)r]);
-        if (is_barrier(*call)) {
-            if (coop_) emit_coop_barrier(mask);
-            return true;
-        }
+        if (is_barrier(*call)) return true;  // suspending variants: the block's end does it (emit_barrier)
         if (is_yield(*call)) return true;  // the block's end does it (emit_barrier)
         Intrinsic::ID id = call->getIntrinsicID();
         switch (id) {
@@ -4027,12 +3981,11 @@ bool WarpBuilder::run(std::string* error) {
 }  // namespace
 
 bool build_warp_entry(Module& m, KernelInfo& kernel, Function& scalar, bool profile, unsigned lanes, bool suspending,
-                      std::string* error, bool cooperative, bool refill) {
+                      std::string* error, bool refill) {
     // Barriers are no-ops in a wide variant: the runtime only uses those when
     // the whole block fits in one call. (Kernels without barriers are free to
     // run any number of warps per call.)
-    WarpBuilder builder(m, kernel, scalar, profile, lanes, lanes > kernel.warp_size && !suspending && !cooperative,
-                        cooperative);
+    WarpBuilder builder(m, kernel, scalar, profile, lanes, lanes > kernel.warp_size && !suspending);
     if (refill) builder.set_refill();
     if (!builder.run(error)) return false;
     // The functions it calls without inlining, and the ones those call.
@@ -4042,7 +3995,7 @@ bool build_warp_entry(Module& m, KernelInfo& kernel, Function& scalar, bool prof
         pending.pop_back();
         ValueToValueMapTy vmap;
         Function* copy = CloneFunction(p.scalar, vmap);
-        WarpBuilder fb(m, kernel, *copy, false, p.lanes, true, false, p.decl);
+        WarpBuilder fb(m, kernel, *copy, false, p.lanes, true, p.decl);
         bool ok = fb.run(error);
         copy->eraseFromParent();
         if (!ok) {

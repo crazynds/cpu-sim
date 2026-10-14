@@ -247,10 +247,10 @@ Executor::Executor(const std::vector<int>& cpus) {
                 if (cpus[i] == cpu) found[n++] = int(i);
         if (n < 2) continue;
         for (int h = 0; h < 2; ++h) {
-            pair_of_[found[h]] = int(pairs_.size());
+            pair_of_[found[h]] = int(pair_count_);
             half_of_[found[h]] = h;
         }
-        pairs_.push_back(std::make_unique<Pair>());
+        ++pair_count_;
     }
     // NUMA nodes of the workers' CPUs (/sys; one node if it says nothing).
     {
@@ -390,12 +390,6 @@ void Executor::worker(int index, int cpu) {
                     lock.unlock();
                 }
             }
-            if (job->cooperative) {
-                std::lock_guard jl(mutex_);
-                ++job->inflight;
-                job->joined[size_t(index)] = 1;
-                ++job->joins;
-            }
         }
         alignas(64) uint64_t counters[CPUSIM_COUNTERS] = {};
         if (job->warps) frames.resize(size_t(job->frame_stride) * job->warps->count);
@@ -408,22 +402,17 @@ void Executor::worker(int index, int cpu) {
             t_recovery = &recovery;
             if (job->native) {
                 for (uint64_t u; claim(*job, index, &u);) (*job->native)(u, index);
-            } else if (!job->cooperative) {
+            } else {
                 run_blocks(*job, index, ctx, shared, counters, frames.data());
             }
-            else
-                run_pair(*job, ctx, shared, counters, *pairs_[pair_of_[index]], half_of_[index],
-                         pairs_[pair_of_[index]]->round[half_of_[index]]);
             t_recovery = nullptr;
         } else {
-            // The kernel faulted, or its program is gone: the job stops. The
-            // sibling of a pair must not wait for this half again.
+            // The kernel faulted, or its program is gone: the job stops.
             t_in_kernel = 0;
             job->aborted.store(true, std::memory_order_relaxed);
             // No block will be run any more: say so, or this worker, if it
             // is the last to leave, never closes the job (leave() needs it).
             job->exhausted.store(true, std::memory_order_release);
-            if (job->cooperative) pairs_[pair_of_[index]]->epoch(half_of_[index]).store(UINT64_MAX);
             std::lock_guard lock(mutex_);
             if (!job->fault.signal) job->fault = recovery.fault;
         }
@@ -435,11 +424,7 @@ void Executor::worker(int index, int cpu) {
             std::lock_guard lock(mutex_);
             for (int i = 0; i < CPUSIM_COUNTERS; ++i) job->counters[i] += counters[i];
         }
-        if (job->cooperative) {
-            std::lock_guard lock(mutex_);
-            --job->inflight;
-            maybe_finish(job);
-        } else if (job->leave()) {
+        if (job->leave()) {
             std::lock_guard lock(mutex_);
             finish(job);
         }
@@ -602,59 +587,6 @@ void Executor::block_coords(const Job& job, uint64_t b, uint32_t* idx) const {
     }
 }
 
-// One worker of a pair. Per block (round r), the first worker takes the next
-// block and hands it over in slot[r & 1]; each runs its half (warp_index 0 or
-// lanes / 32) in the first worker's shared memory. Epochs order everything:
-//   - a half sets its epoch to r << 32 when it starts block r, and the code's
-//     barriers count from there (kernel_abi.h);
-//   - when it returns, it sets (r << 32) | 0xffffffff: the other half's
-//     barriers no longer wait for it, and the first worker knows the shared
-//     memory is free for the next block.
-// The second worker starts block r only after the first one published it,
-// which it does only after finishing block r - 1 itself.
-void Executor::run_pair(const Job& job, CtxArray& ctx, uint8_t* shared, uint64_t* counters, Pair& pair, int half,
-                        uint64_t& round) {
-    ctx = *job.warps;
-    cpusim_warp_ctx* c = ctx.at(size_t(half));
-    c->params = job.params;
-    c->counters = counters;
-    c->frame = nullptr;
-    c->coop_epoch = reinterpret_cast<uint64_t*>(&pair.epoch(half));
-    c->coop_other = reinterpret_cast<const uint64_t*>(&pair.epoch(1 - half));
-    std::atomic<uint64_t>& mine = pair.epoch(half);
-    std::atomic<uint64_t>& other = pair.epoch(1 - half);
-    while (true) {
-        const uint64_t r = ++round;
-        Pair::Slot& slot = pair.slot[r & 1];
-        uint64_t b;
-        if (half == 0) {
-            // The other half left block r - 1 (and the slot's last reader is done).
-            while (other.load(std::memory_order_acquire) < ((r - 1) << 32 | 0xffffffffu)) _mm_pause();
-            b = job.aborted.load(std::memory_order_relaxed) ? job.blocks : job.next.fetch_add(1, std::memory_order_relaxed);
-            slot.block = b;
-            slot.shared = shared;
-            slot.round.store(r, std::memory_order_release);
-        } else {
-            while (slot.round.load(std::memory_order_acquire) != r) {
-                if (job.aborted.load(std::memory_order_relaxed)) {  // the first half faulted
-                    mine.store(UINT64_MAX, std::memory_order_release);
-                    return;
-                }
-                _mm_pause();
-            }
-            b = slot.block;
-        }
-        if (b >= job.blocks) {
-            mine.store(r << 32 | 0xffffffffu, std::memory_order_release);
-            return;
-        }
-        c->shared = slot.shared;
-        block_coords(job, b, c->block_idx);
-        mine.store(r << 32, std::memory_order_release);
-        in_kernel(job.entry, c);
-        mine.store(r << 32 | 0xffffffffu, std::memory_order_release);
-    }
-}
 
 namespace {
 
@@ -693,12 +625,6 @@ void Executor::learn_cost(uint64_t key, uint64_t units, uint64_t busy_ns) {
 
 Executor::Job* Executor::pick(int worker) {
     for (Job* j : active_) {
-        if (j->cooperative) {
-            // Every worker with a sibling takes part exactly once (the pair
-            // hands blocks over and counts rounds together).
-            if (pair_of_[size_t(worker)] >= 0 && !j->joined[size_t(worker)]) return j;
-            continue;
-        }
         if ((j->nodes & (1ull << node_of_[size_t(worker)])) && !excluded(*j, worker) &&
             !j->exhausted.load(std::memory_order_relaxed) &&
             !j->aborted.load(std::memory_order_relaxed) && j->try_join())
@@ -719,17 +645,6 @@ void Executor::cancel(uint32_t tag) {
 }
 
 void Executor::finish(Job* j) {
-    active_.erase(std::find(active_.begin(), active_.end(), j));
-    j->done.store(true, std::memory_order_release);  // last: the waiting run() may return at once
-    done_cv_.notify_all();
-}
-
-// Cooperative jobs: over when every paired worker joined and left.
-void Executor::maybe_finish(Job* j) {
-    if (j->done || j->inflight > 0) return;
-    if (j->joins < int(2 * pairs_.size())) return;
-    if (j->cooperative && j->aborted.load(std::memory_order_relaxed))
-        for (auto& p : pairs_) p->resync();
     active_.erase(std::find(active_.begin(), active_.end(), j));
     j->done.store(true, std::memory_order_release);  // last: the waiting run() may return at once
     done_cv_.notify_all();
@@ -798,7 +713,7 @@ CtxArray Executor::slice_groups(const CtxArray& groups, uint32_t lanes, uint32_t
 
 void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const cpusim_kernel_meta& meta,
                    const LaunchConfig& cfg, const uint8_t* params, uint64_t* counters, cpusim_block_fn block,
-                   bool cooperative, uint64_t first, uint64_t last, uint64_t* busy_ns, KernelFault* fault,
+                   uint64_t first, uint64_t last, uint64_t* busy_ns, KernelFault* fault,
                    uint32_t tag, bool refill) {
     CtxArray warps = make_groups(cfg, lanes, meta.warp_size);
     // Block-wide entries never suspend: no frames.
@@ -816,7 +731,6 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     job.counters = counters;
     job.frame_stride = frame_bytes ? cpusim_stagger(frame_bytes) : 0;
     job.block = block;
-    job.cooperative = cooperative && !pairs_.empty();
     job.tag = tag;
     job.meta_flags = meta.flags;
     // Lanes that never look at each other, and too few groups for the
@@ -834,7 +748,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
         job.blocks = (blocks + job.refill_blocks - 1) / job.refill_blocks;
         first = 0;
     }
-    if (!refill && !job.cooperative && !block && (meta.flags & CPUSIM_META_LANE_INDEPENDENT) && cfg.shared_bytes == 0 &&
+    if (!refill && !block && (meta.flags & CPUSIM_META_LANE_INDEPENDENT) && cfg.shared_bytes == 0 &&
         total * warps.count < workers) {
         uint32_t slices = 1;
         while (slices < lanes && total * warps.count * slices < 2 * workers) slices *= 2;
@@ -844,7 +758,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     // talk to each other: with few blocks, hand out its groups one by one
     // (as a GPU schedules warps), so the work spreads over every worker
     // instead of one worker per block. matrix-rotate launches 10 blocks.
-    if (!refill && !job.cooperative && !block && !(meta.flags & CPUSIM_META_HAS_BARRIERS) && cfg.shared_bytes == 0 &&
+    if (!refill && !block && !(meta.flags & CPUSIM_META_HAS_BARRIERS) && cfg.shared_bytes == 0 &&
         warps.count > 1 && total < 8 * threads_.size()) {
         job.split = warps.count;
         job.blocks *= job.split;
@@ -857,7 +771,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     // What the kernel costs per unit, learned from its previous launches.
     const uint64_t cost_key = reinterpret_cast<uintptr_t>(entry) ^ (uint64_t(lanes) << 48) ^ (uint64_t(job.split) << 40) ^
                               (block ? 1ull << 39 : 0) ^ (refill ? 1ull << 38 : 0);
-    if (!job.cooperative) {
+    {
         // The workers it is worth calling, and their sequences: worker w's is
         // chunks w, w + n, w + 2n... of `chunk` blocks, n = the workers called
         // (any other worker that joins only takes from theirs).
@@ -878,7 +792,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     post_and_wait(job, first);
     if (busy_ns) *busy_ns = job.busy_ns;
     if (fault) *fault = job.fault;
-    if (!job.cooperative && !job.fault.signal) learn_cost(cost_key, job.blocks - first, job.busy_ns);
+    if (!job.fault.signal) learn_cost(cost_key, job.blocks - first, job.busy_ns);
 }
 
 // Makes the job visible to the workers, wakes the ones it needs and waits
@@ -886,15 +800,8 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
 // caller's stack).
 void Executor::post_and_wait(Job& job, uint64_t first) {
     std::unique_lock lock(mutex_);
-    if (job.cooperative) {
-        done_cv_.wait(lock, [&] { return active_.empty() && !coop_active_; });
-        coop_active_ = true;
-        job.joined.assign(threads_.size(), 0);
-    } else {
-        done_cv_.wait(lock, [&] { return !coop_active_; });
-    }
     const int workers = int(threads_.size());
-    const uint64_t units = job.cooperative ? uint64_t(workers) : job.blocks - first;
+    const uint64_t units = job.blocks - first;
     const int want = int(std::min<uint64_t>({units, uint64_t(workers), uint64_t(job.cap)}));
     // One node when the job fits in it, else all of them, each asked for
     // its share. The node with the most workers awake (spinning), the first
@@ -904,7 +811,7 @@ void Executor::post_and_wait(Job& job, uint64_t first) {
     size_t one = node_count_;
     // One worker per core: every node, every sleeper woken (a sibling left
     // out would swallow a wake-up of the tree and not pass it on).
-    if (!job.cooperative && !job.one_per_core && node_count_ > 1) {
+    if (!job.one_per_core && node_count_ > 1) {
         int awake = -1;
         for (size_t n = 0; n < node_count_; ++n) {
             const int s = nodes_[n].spinners.load(std::memory_order_relaxed);
@@ -913,14 +820,14 @@ void Executor::post_and_wait(Job& job, uint64_t first) {
     }
     if (one < node_count_) job.nodes = 1ull << one;
     active_.push_back(&job);
-    if (!job.cooperative) hot_.store(&job, std::memory_order_release);
+    hot_.store(&job, std::memory_order_release);
     posted_.fetch_add(1, std::memory_order_release);
     {
         auto post = [&](size_t n, int share) {
             Node& nd = nodes_[n];
             if (nd.demand.fetch_add(share, std::memory_order_release) + share > nd.workers)
                 nd.demand.store(nd.workers, std::memory_order_relaxed);  // stale demand of finished jobs
-            if (job.cooperative || job.one_per_core) {
+            if (job.one_per_core) {
                 nd.cv.notify_all();
             } else {
                 // The first ones of a tree (see worker()): each sleeper woken
@@ -958,10 +865,6 @@ void Executor::post_and_wait(Job& job, uint64_t first) {
     hot_.compare_exchange_strong(expected, nullptr, std::memory_order_seq_cst);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     while (readers_.load(std::memory_order_seq_cst)) _mm_pause();
-    if (job.cooperative) {
-        coop_active_ = false;
-        done_cv_.notify_all();
-    }
 }
 
 // A function run on the workers instead of a kernel: fn(unit, worker) for
@@ -973,7 +876,7 @@ KernelFault Executor::run_native(uint64_t units, const std::function<void(uint64
     if (!units) return fault;
     Job job;
     job.native = &fn;
-    job.one_per_core = one_per_core && !pairs_.empty();
+    job.one_per_core = one_per_core && pair_count_ > 0;
     job.blocks = units;
     int eligible = 0;
     for (size_t w = 0; w < threads_.size(); ++w) eligible += !(job.one_per_core && excluded(job, int(w)));

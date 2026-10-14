@@ -16,7 +16,7 @@ trap '"$CPUSIMD" --stop >/dev/null 2>&1 || true; rm -rf "$DIR"' EXIT
 
 "$CUCC" -std=c++20 -I "$(dirname "$SRC")" "$@" "$SRC" -o "$DIR/$NAME"
 
-for lanes in auto 32 32r 64 64s 128 128s 128c 256 256c 512; do
+for lanes in auto 32 32r 64 64s 128 128s 256 512; do
     echo "== in-process, lanes $lanes"
     if [ "$lanes" = auto ]; then
         CPUSIM_BACKEND=inprocess "$DIR/$NAME"

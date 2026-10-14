@@ -148,7 +148,6 @@ private:
             // With W the warp size (cpusim_kernel_meta.warp_size):
             uint64_t wide[5] = {};  // variants with 2W << i lanes (64..512 for warps of 32)
             uint64_t susp[2] = {};  // suspending variants with 2W and 4W lanes
-            uint64_t coop[5] = {};  // cooperative variants with 2W << i lanes (half a block each)
             uint64_t block = 0;     // __cpusim_block_: whole block, 32-lane warps, barrier rounds inside
             uint64_t trace = 0;     // __cpusim_trace_: a wmma GEMM candidate (wmma_trace.h)
             uint64_t refill = 0;    // __cpusim_entryr_: warp entry whose lanes refill (CPUSIM_META_REFILL)
