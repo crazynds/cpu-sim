@@ -808,6 +808,28 @@ Features kernel_features(Function& f) {
     return r;
 }
 
+// Loops with a barrier stay loops. Unrolled, every copy of the barrier is
+// one more place where a warp suspends and resumes, and the function grows
+// with each: HeCBench sc (a loop of 32 prefix sums with barriers) took 8
+// minutes to compile, nearly all of it in register allocation, and then
+// hung; kept rolled it compiles in 3 s and runs. A barrier costs the same
+// inside a loop as outside.
+void keep_barrier_loops_rolled(Function& f) {
+    DominatorTree dt(f);
+    LoopInfo li(dt);
+    for (Loop* l : li.getLoopsInPreorder()) {
+        bool barrier = false;
+        for (BasicBlock* bb : l->blocks())
+            for (Instruction& i : *bb)
+                if (auto* ii = dyn_cast<IntrinsicInst>(&i)) {
+                    const Intrinsic::ID id = ii->getIntrinsicID();
+                    barrier |= id == Intrinsic::nvvm_barrier0 || id == Intrinsic::nvvm_bar_sync ||
+                               id == Intrinsic::nvvm_barrier || id == Intrinsic::nvvm_barrier_n;
+                }
+        if (barrier) l->setLoopAlreadyUnrolled();
+    }
+}
+
 bool has_alloca(const Function& f) {
     for (const BasicBlock& bb : f)
         for (const Instruction& i : bb)
@@ -1049,6 +1071,7 @@ int main(int argc, char** argv) {
             run_function_pipeline(*f, tm.get(),
                                   "early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,lower-switch,lcssa");
         else if (has_alloca(*f)) {
+            keep_barrier_loops_rolled(*f);
             run_function_pipeline(*f, tm.get(),
                                   "loop-simplify,lcssa,loop(loop-rotate,indvars,loop-unroll-full),sroa<modify-cfg>,"
                                   "early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,gvn,"
