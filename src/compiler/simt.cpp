@@ -690,17 +690,23 @@ bool WarpBuilder::check_supported() {
                 if (escapes(a)) {
                     // Each lane needs a real address for it: lane-major
                     // layout will not do. Lives in this call's stack.
+                    // (In the warp's frame when the variant suspends at barriers.)
                     if (!a->isStaticAlloca()) fail("per-thread arrays of variable size are not supported", a);
-                    else if (!barrier_blocks_.empty() && !block_wide_)
-                        fail("a per-thread array passed to a function, in a kernel that waits at barriers", a);
                     escaping_.insert(a);
                 } else if (!check_private_array(a)) {
                     return false;
                 }
             } else if (auto* cx = dyn_cast<AtomicCmpXchgInst>(&inst)) {
-                for (User* u : cx->users())
-                    if (!isa<ExtractValueInst>(u) || cast<Instruction>(u)->getParent() != cx->getParent())
-                        fail("compare-and-swap result used other than by its fields", u);
+                // Its fields are read where it is (a { T, i1 } is not a value
+                // a lane can carry): a field read in another block is moved
+                // next to it.
+                SmallVector<ExtractValueInst*, 4> far;
+                for (User* u : cx->users()) {
+                    auto* ev = dyn_cast<ExtractValueInst>(u);
+                    if (!ev) fail("compare-and-swap result used other than by its fields", u);
+                    else if (ev->getParent() != cx->getParent()) far.push_back(ev);
+                }
+                for (ExtractValueInst* ev : far) ev->moveAfter(cx);
             }
         }
     }
@@ -1456,8 +1462,15 @@ bool WarpBuilder::check_private_array(AllocaInst* a) {
         if (t->isIntegerTy() || t->isFloatingPointTy() || t->isPointerTy()) return dl.getTypeStoreSize(t);
         return 0;
     };
+    // An array the lane-major layout cannot hold (mixed element sizes, or
+    // read with another size: bytes of a long, a struct copied field by
+    // field) gets a real copy per lane instead, as one passed to a function.
+    auto per_lane = [&]() {
+        escaping_.insert(a);
+        return true;
+    };
     const uint64_t size = elem(a->getAllocatedType());
-    if (!size) return fail("per-thread array of mixed element sizes is not supported", a), false;
+    if (!size) return per_lane();
     SmallVector<Value*, 8> work{a};
     while (!work.empty()) {
         Value* v = work.pop_back_val();
@@ -1466,14 +1479,14 @@ bool WarpBuilder::check_private_array(AllocaInst* a) {
                 work.push_back(gep);
             } else if (auto* ld = dyn_cast<LoadInst>(u)) {
                 if (dl.getTypeStoreSize(ld->getType()) != size)
-                    return fail("per-thread array accessed with another element size", ld), false;
+                    return per_lane();
             } else if (auto* st = dyn_cast<StoreInst>(u); st && st->getPointerOperand() == v) {
                 if (dl.getTypeStoreSize(st->getValueOperand()->getType()) != size)
-                    return fail("per-thread array accessed with another element size", st), false;
+                    return per_lane();
             } else if (auto* ii = dyn_cast<IntrinsicInst>(u); ii && ii->isLifetimeStartOrEnd()) {
             } else if (is_mma(u) || is_mmav(u)) {  // a tensor core fragment, handed over whole (emit_mma)
             } else {
-                return fail("per-thread array used other than by element loads and stores", u), false;
+                return per_lane();
             }
         }
     }
@@ -3051,6 +3064,10 @@ void WarpBuilder::emit_prologue() {
                                 m_);
     w_->addFnAttr(Attribute::NoUnwind);
     w_->addFnAttr("prefer-vector-width", "512");
+    // Frames holding every lane's per-thread arrays can be megabytes: touch
+    // each page on the way down, so an overflow hits the guard page and
+    // faults instead of writing past it.
+    w_->addFnAttr("probe-stack", "inline-asm");
     w_->addFnAttr("min-legal-vector-width", "512");
     ctx_arg_ = w_->getArg(0);
     ctx_arg_->setName("ctx");
@@ -3613,8 +3630,24 @@ bool WarpBuilder::emit_instruction(Instruction& inst, Value* mask, bool divergen
         }
     }
     if (auto* a = dyn_cast<AllocaInst>(&inst); a && escaping_.contains(a)) {
-        IRBuilder<> ab(alloca_block_->getTerminator());
         auto* copies = ArrayType::get(a->getAllocatedType(), W);
+        SmallVector<Constant*, 64> lane_idx;
+        for (unsigned l = 0; l < W; ++l) lane_idx.push_back(b_.getInt32(l));
+        if (frame_) {
+            // A variant that suspends at barriers: the copies live in the
+            // warp's frame (the stack is gone on resume), at a fixed offset;
+            // the pointers are made where the frame is loaded, every call.
+            auto [it, fresh] = private_frame_offset_.try_emplace(a, 0);
+            if (fresh) {
+                it->second = alignTo(cache_end_, 64);
+                cache_end_ = it->second + m_.getDataLayout().getTypeAllocSize(copies);
+                note_frame_size();
+            }
+            IRBuilder<> fb(cast<Instruction>(frame_)->getNextNode());
+            Value* base = fb.CreateConstInBoundsGEP1_64(fb.getInt8Ty(), frame_, it->second);
+            return set(fb.CreateGEP(copies, base, {fb.getInt32(0), ConstantVector::get(lane_idx)}, a->getName()));
+        }
+        IRBuilder<> ab(alloca_block_->getTerminator());
         AllocaInst* base = ab.CreateAlloca(copies, nullptr, a->getName() + ".lanes");
         base->setAlignment(std::max(a->getAlign(), Align(16)));
         SmallVector<Constant*, 64> lanes;

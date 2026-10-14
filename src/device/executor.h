@@ -117,6 +117,7 @@ public:
     size_t pairs() const { return pairs_.size(); }
 
     static constexpr uint32_t kMaxSharedBytes = 100 * 1024;
+    static constexpr size_t kWorkerStackBytes = size_t(512) << 20;  // virtual; see the constructor
 
 private:
     struct Job {

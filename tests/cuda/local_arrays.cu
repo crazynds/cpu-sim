@@ -2,6 +2,7 @@
 // per-thread index (gather/scatter), live across __syncthreads (the frame of
 // the variants that suspend), of doubles, and struct copies (memcpy into a
 // local). Each has a host reference.
+#include <cstring>
 #include <vector>
 
 #include "check.cuh"
@@ -44,8 +45,64 @@ __global__ void structs(Particle* p, int n) {
     p[i] = me;  // and back
 }
 
+// A per-thread struct of mixed field sizes, written as fields and read back
+// as bytes (each lane gets a real copy), alive across a barrier.
+struct Mixed {
+    int a;
+    char tag[3];
+    double d;
+    short s;
+};
+__global__ void mixed_bytes(const int* in, unsigned* out) {
+    __shared__ int sh[128];
+    const int t = threadIdx.x, i = blockIdx.x * blockDim.x + t;
+    Mixed m;
+    m.a = in[i];
+    for (int k = 0; k < 3; ++k) m.tag[k] = char(in[i] + k);
+    m.d = in[i] * 0.5;
+    m.s = short(in[i] * 3);
+    sh[t] = in[i];
+    __syncthreads();  // m lives across the barrier
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&m);
+    unsigned h = unsigned(sh[(t + 1) % blockDim.x]);
+    for (int k = 0; k < 4; ++k) h = h * 31 + b[k];        // a
+    for (int k = 4; k < 7; ++k) h = h * 31 + b[k];        // tag
+    for (int k = 8; k < 16; ++k) h = h * 31 + b[k];       // d
+    for (int k = 16; k < 18; ++k) h = h * 31 + b[k];      // s
+    out[i] = h;
+}
+
 int main() {
     Checker c("local_arrays");
+    {
+        const int nb = 4, nt = 128, nm = nb * nt;
+        std::vector<int> in(nm);
+        for (int i = 0; i < nm; ++i) in[i] = (i * 7919) % 100003 - 50000;
+        int* din;
+        unsigned* dout;
+        CHECK_CUDA(cudaMalloc(&din, nm * 4));
+        CHECK_CUDA(cudaMalloc(&dout, nm * 4));
+        CHECK_CUDA(cudaMemcpy(din, in.data(), nm * 4, cudaMemcpyHostToDevice));
+        mixed_bytes<<<nb, nt>>>(din, dout);
+        std::vector<unsigned> out(nm);
+        CHECK_CUDA(cudaMemcpy(out.data(), dout, nm * 4, cudaMemcpyDeviceToHost));
+        for (int i = 0; i < nm; ++i) {
+            Mixed m;
+            std::memset(&m, 0, sizeof(m));
+            m.a = in[i];
+            for (int k = 0; k < 3; ++k) m.tag[k] = char(in[i] + k);
+            m.d = in[i] * 0.5;
+            m.s = short(in[i] * 3);
+            const int t = i % nt;
+            const unsigned char* b = reinterpret_cast<const unsigned char*>(&m);
+            unsigned h = unsigned(in[(i / nt) * nt + (t + 1) % nt]);
+            for (int k = 0; k < 7; ++k) h = h * 31 + b[k];
+            for (int k = 8; k < 18; ++k) h = h * 31 + b[k];
+            c.expect(out[i] == h, "per-thread struct read as bytes across a barrier", i, out[i], h);
+        }
+        CHECK_CUDA(cudaFree(din));
+        CHECK_CUDA(cudaFree(dout));
+    }
     const int threads = 256, blocks = 16, n = threads * blocks, reps = 37;
     std::vector<float> in(n);
     for (int i = 0; i < n; ++i) in[i] = float(i % 97) * 0.25f;

@@ -276,7 +276,21 @@ Executor::Executor(const std::vector<int>& cpus) {
     install_fault_handlers();
     current_.reset(new std::atomic<Job*>[cpus.size()]);
     for (size_t i = 0; i < cpus.size(); ++i) current_[i] = nullptr;
+    // Big stacks: a call keeps every lane's per-thread arrays on its stack
+    // (CUDA allows 512 KiB of local memory per thread; a block-wide call has
+    // up to 512 lanes). Only the pages a kernel touches are ever committed.
+    // (HeCBench fsm: 32 KiB per thread overflowed the default 8 MiB.)
+    pthread_attr_t old_attr, big;
+    const bool restore = pthread_getattr_default_np(&old_attr) == 0;
+    pthread_attr_init(&big);
+    pthread_attr_setstacksize(&big, kWorkerStackBytes);
+    pthread_setattr_default_np(&big);
     for (size_t i = 0; i < cpus.size(); ++i) threads_.emplace_back([this, i, cpu = cpus[i]] { worker(int(i), cpu); });
+    if (restore) {
+        pthread_setattr_default_np(&old_attr);
+        pthread_attr_destroy(&old_attr);
+    }
+    pthread_attr_destroy(&big);
 }
 
 Executor::~Executor() {

@@ -126,11 +126,20 @@ def parse(argv):
             o.host += [f for f in v.split(",") if f]
         elif a in ("-lineinfo", "-g", "-G", "--use_fast_math", "-use_fast_math", "-Wno-deprecated-gpu-targets"):
             pass
+        elif a in ("--expt-relaxed-constexpr", "-expt-relaxed-constexpr", "--extended-lambda", "-extended-lambda",
+                   "--expt-extended-lambda", "-expt-extended-lambda"):
+            pass  # clang's CUDA mode does both by default (constexpr and lambdas take their callers' side)
+        elif a in ("--default-stream", "-default-stream") or a.startswith(("--default-stream=", "-default-stream=")):
+            # per-thread or legacy: one host thread per program in practice; the
+            # runtime's default stream already behaves as both for it.
+            v = a.split("=", 1)[1] if "=" in a else value()
+            if v not in ("per-thread", "legacy", "null"):
+                die("--default-stream takes per-thread, legacy or null")
         elif a in ("-x",):
             value()
         elif a.startswith("-"):
             die("unsupported option " + a)
-        elif a.endswith((".cu", ".cpp", ".cc", ".cxx")):
+        elif a.endswith((".cu", ".cpp", ".cc", ".cxx", ".c")):
             o.sources.append(a)
         elif a.endswith((".o", ".a", ".so")):
             o.inputs.append(a)
@@ -287,6 +296,8 @@ def main():
                 obj = os.path.join(tmp, os.path.basename(src) + ".o")
             if src.endswith(".cu"):
                 compile_cu(src, obj, o, tmp)
+            elif src.endswith(".c"):  # C, as nvcc hands it to the host compiler
+                run([CLANG, "-x", "c", "-c", o.opt, "-I", INCLUDE] + o.cpp + o.host + [src, "-o", obj], o)
             else:
                 run([CLANG, "-c", o.std, o.opt, "-I", INCLUDE] + o.cpp + o.host + [src, "-o", obj], o)
             objects.append(obj)

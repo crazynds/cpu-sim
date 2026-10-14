@@ -1709,6 +1709,88 @@ cudaError_t cudaFreeAsync(void* ptr, cudaStream_t stream) {
     return cudaFree(ptr);
 }
 
+// Memory pools: the device's allocator is its one pool (a handle to tell it
+// apart from null); attributes set are kept, the amounts are the device's.
+namespace {
+struct MemPool {
+    uint64_t threshold = 0, reuse[3] = {1, 1, 1};
+    uint64_t used_high = 0;
+};
+MemPool& default_pool() {
+    static MemPool p;
+    return p;
+}
+}  // namespace
+
+cudaError_t cudaDeviceGetDefaultMemPool(cudaMemPool_t* memPool, int device) {
+    if (!memPool) return record(Error::InvalidValue);
+    if (device != 0) return record(Error::InvalidDevice);
+    *memPool = reinterpret_cast<cudaMemPool_t>(&default_pool());
+    return cudaSuccess;
+}
+cudaError_t cudaDeviceGetMemPool(cudaMemPool_t* memPool, int device) { return cudaDeviceGetDefaultMemPool(memPool, device); }
+cudaError_t cudaDeviceSetMemPool(int device, cudaMemPool_t memPool) {
+    if (device != 0) return record(Error::InvalidDevice);
+    return memPool == reinterpret_cast<cudaMemPool_t>(&default_pool()) ? cudaSuccess : record(Error::InvalidValue);
+}
+cudaError_t cudaMemPoolSetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void* value) {
+    auto* p = reinterpret_cast<MemPool*>(memPool);
+    if (p != &default_pool() || !value) return record(Error::InvalidValue);
+    switch (attr) {
+        case cudaMemPoolAttrReleaseThreshold: p->threshold = *static_cast<uint64_t*>(value); return cudaSuccess;
+        case cudaMemPoolReuseFollowEventDependencies:
+        case cudaMemPoolReuseAllowOpportunistic:
+        case cudaMemPoolReuseAllowInternalDependencies:
+            p->reuse[attr - 1] = *static_cast<int*>(value);
+            return cudaSuccess;
+        case cudaMemPoolAttrReservedMemHigh:
+        case cudaMemPoolAttrUsedMemHigh:
+            p->used_high = 0;  // only resetting to 0 is allowed
+            return cudaSuccess;
+        default: return record(Error::InvalidValue);
+    }
+}
+cudaError_t cudaMemPoolGetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void* value) {
+    auto* p = reinterpret_cast<MemPool*>(memPool);
+    if (p != &default_pool() || !value) return record(Error::InvalidValue);
+    size_t free = 0, total = 0;
+    switch (attr) {
+        case cudaMemPoolAttrReleaseThreshold: *static_cast<uint64_t*>(value) = p->threshold; return cudaSuccess;
+        case cudaMemPoolReuseFollowEventDependencies:
+        case cudaMemPoolReuseAllowOpportunistic:
+        case cudaMemPoolReuseAllowInternalDependencies:
+            *static_cast<int*>(value) = int(p->reuse[attr - 1]);
+            return cudaSuccess;
+        default:
+            if (cudaError_t e = cudaMemGetInfo(&free, &total); e != cudaSuccess) return e;
+            p->used_high = std::max<uint64_t>(p->used_high, total - free);
+            *static_cast<uint64_t*>(value) =
+                attr == cudaMemPoolAttrUsedMemHigh || attr == cudaMemPoolAttrReservedMemHigh ? p->used_high : total - free;
+            return cudaSuccess;
+    }
+}
+cudaError_t cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t) {
+    return reinterpret_cast<MemPool*>(memPool) == &default_pool() ? cudaSuccess : record(Error::InvalidValue);
+}
+cudaError_t cudaMallocFromPoolAsync(void** ptr, size_t size, cudaMemPool_t memPool, cudaStream_t stream) {
+    if (reinterpret_cast<MemPool*>(memPool) != &default_pool()) return record(Error::InvalidValue);
+    return cudaMallocAsync(ptr, size, stream);
+}
+
+// Peer access: one device, so no peer to reach.
+cudaError_t cudaDeviceCanAccessPeer(int* canAccessPeer, int device, int peerDevice) {
+    if (!canAccessPeer) return record(Error::InvalidValue);
+    if (device != 0 || peerDevice != 0) return record(Error::InvalidDevice);
+    *canAccessPeer = 0;
+    return cudaSuccess;
+}
+cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int) {
+    return record(peerDevice == 0 ? Error::InvalidValue : Error::InvalidDevice);
+}
+cudaError_t cudaDeviceDisablePeerAccess(int peerDevice) {
+    return record(peerDevice == 0 ? Error::InvalidValue : Error::InvalidDevice);
+}
+
 // ---- pointers, flags and settings
 
 // Managed memory is visible everywhere at all times: nothing to attach.

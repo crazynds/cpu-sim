@@ -4,6 +4,12 @@
 #define CPUSIM_CUDA_RUNTIME_H
 
 #include "cuda_runtime_api.h"
+/* What nvcc's runtime headers bring along (crt/common_functions.h): programs
+ * call memcpy, malloc, printf and clock without including them. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #ifdef __CUDA__
 #include "__cpusim_device.h"
@@ -12,31 +18,42 @@
 #ifdef __cplusplus
 template <class T>
 static inline cudaError_t cudaMalloc(T** devPtr, size_t size) {
-    return cudaMalloc(reinterpret_cast<void**>(devPtr), size);
+    return cudaMalloc((void**)(void*)(devPtr), size);
 }
 template <class T>
 static inline cudaError_t cudaMallocManaged(T** devPtr, size_t size, unsigned int flags = 1) {
-    return cudaMallocManaged(reinterpret_cast<void**>(devPtr), size, flags);
+    return cudaMallocManaged((void**)(void*)(devPtr), size, flags);
 }
 template <class T>
 static inline cudaError_t cudaMallocHost(T** ptr, size_t size) {
-    return cudaMallocHost(reinterpret_cast<void**>(ptr), size);
+    return cudaMallocHost((void**)(void*)(ptr), size);
 }
 template <class T>
 static inline cudaError_t cudaHostAlloc(T** ptr, size_t size, unsigned int flags) {
-    return cudaHostAlloc(reinterpret_cast<void**>(ptr), size, flags);
+    return cudaHostAlloc((void**)(void*)(ptr), size, flags);
 }
 template <class T>
 static inline cudaError_t cudaHostGetDevicePointer(T** pDevice, void* pHost, unsigned int flags) {
-    return cudaHostGetDevicePointer(reinterpret_cast<void**>(pDevice), pHost, flags);
+    return cudaHostGetDevicePointer((void**)(void*)(pDevice), pHost, flags);
 }
 template <class T>
 static inline cudaError_t cudaMallocPitch(T** devPtr, size_t* pitch, size_t width, size_t height) {
-    return cudaMallocPitch(reinterpret_cast<void**>(devPtr), pitch, width, height);
+    return cudaMallocPitch((void**)(void*)(devPtr), pitch, width, height);
 }
 template <class T>
 static inline cudaError_t cudaMallocAsync(T** devPtr, size_t size, cudaStream_t stream) {
-    return cudaMallocAsync(reinterpret_cast<void**>(devPtr), size, stream);
+    return cudaMallocAsync((void**)(void*)(devPtr), size, stream);
+}
+template <class T>
+static inline cudaError_t cudaMallocFromPoolAsync(T** ptr, size_t size, cudaMemPool_t memPool, cudaStream_t stream) {
+    return cudaMallocFromPoolAsync((void**)(void*)(ptr), size, memPool, stream);
+}
+/* CUDA 11's form: the failing node and a log buffer (nothing ever fails). */
+static inline cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph, cudaGraphNode_t* errorNode,
+                                               char* logBuffer, size_t bufferSize) {
+    if (errorNode) *errorNode = nullptr;
+    if (logBuffer && bufferSize) logBuffer[0] = 0;
+    return cudaGraphInstantiate(exec, graph, 0ull);
 }
 /* Kernels by function: cudaFuncGetAttributes(&a, kernel). */
 template <class T>

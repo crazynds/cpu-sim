@@ -369,6 +369,39 @@ cudaError_t cudaMemcpyPeerAsync(void* dst, int dstDevice, const void* src, int s
 cudaError_t cudaMallocAsync(void** devPtr, size_t size, cudaStream_t stream);
 cudaError_t cudaFreeAsync(void* devPtr, cudaStream_t stream);
 
+/* Memory pools: one per device, the device's own allocator. Attributes are
+ * kept; the used and reserved amounts are the device's. */
+typedef struct CUmemPoolHandle_st* cudaMemPool_t;
+enum cudaMemPoolAttr {
+    cudaMemPoolReuseFollowEventDependencies = 1,
+    cudaMemPoolReuseAllowOpportunistic = 2,
+    cudaMemPoolReuseAllowInternalDependencies = 3,
+    cudaMemPoolAttrReleaseThreshold = 4,
+    cudaMemPoolAttrReservedMemCurrent = 5,
+    cudaMemPoolAttrReservedMemHigh = 6,
+    cudaMemPoolAttrUsedMemCurrent = 7,
+    cudaMemPoolAttrUsedMemHigh = 8
+};
+cudaError_t cudaDeviceGetDefaultMemPool(cudaMemPool_t* memPool, int device);
+cudaError_t cudaDeviceGetMemPool(cudaMemPool_t* memPool, int device);
+cudaError_t cudaDeviceSetMemPool(int device, cudaMemPool_t memPool);
+cudaError_t cudaMemPoolSetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void* value);
+cudaError_t cudaMemPoolGetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void* value);
+cudaError_t cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t minBytesToKeep);
+cudaError_t cudaMallocFromPoolAsync(void** ptr, size_t size, cudaMemPool_t memPool, cudaStream_t stream);
+
+/* Peer access: there is one device, with no peer. */
+cudaError_t cudaDeviceCanAccessPeer(int* canAccessPeer, int device, int peerDevice);
+cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int flags);
+cudaError_t cudaDeviceDisablePeerAccess(int peerDevice);
+
+enum cudaComputeMode {
+    cudaComputeModeDefault = 0,
+    cudaComputeModeExclusive = 1,
+    cudaComputeModeProhibited = 2,
+    cudaComputeModeExclusiveProcess = 3
+};
+
 /* Pointers. */
 enum cudaMemoryType {
     cudaMemoryTypeUnregistered = 0,

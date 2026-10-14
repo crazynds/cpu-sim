@@ -93,10 +93,24 @@ __CPUSIM_MINMAX(unsigned long)
 __CPUSIM_MINMAX(long long)
 __CPUSIM_MINMAX(unsigned long long)
 #undef __CPUSIM_MINMAX
+/* Mixed signedness, as CUDA declares them: compared as the unsigned type. */
+#define __CPUSIM_MINMAX_MIXED(S, U)                                                                     \
+    static inline __host__ __device__ U min(S a, U b) { return (U)a < b ? (U)a : b; }                    \
+    static inline __host__ __device__ U min(U a, S b) { return a < (U)b ? a : (U)b; }                    \
+    static inline __host__ __device__ U max(S a, U b) { return (U)a > b ? (U)a : b; }                    \
+    static inline __host__ __device__ U max(U a, S b) { return a > (U)b ? a : (U)b; }
+__CPUSIM_MINMAX_MIXED(int, unsigned int)
+__CPUSIM_MINMAX_MIXED(long, unsigned long)
+__CPUSIM_MINMAX_MIXED(long long, unsigned long long)
+#undef __CPUSIM_MINMAX_MIXED
 static inline __host__ __device__ float min(float a, float b) { return __builtin_fminf(a, b); }
 static inline __host__ __device__ float max(float a, float b) { return __builtin_fmaxf(a, b); }
 static inline __host__ __device__ double min(double a, double b) { return __builtin_fmin(a, b); }
 static inline __host__ __device__ double max(double a, double b) { return __builtin_fmax(a, b); }
+static inline __host__ __device__ double min(float a, double b) { return __builtin_fmin(a, b); }
+static inline __host__ __device__ double min(double a, float b) { return __builtin_fmin(a, b); }
+static inline __host__ __device__ double max(float a, double b) { return __builtin_fmax(a, b); }
+static inline __host__ __device__ double max(double a, float b) { return __builtin_fmax(a, b); }
 
 /* Math library, device side. Each function maps to a Clang builtin: the
  * ones with an x86 instruction (sqrt, fabs, floor, fma...) become LLVM
@@ -106,6 +120,8 @@ static inline __host__ __device__ double max(double a, double b) { return __buil
  * next to the host declarations from <math.h> as __device__ overloads, as in
  * Clang's own CUDA headers. */
 #define __CPUSIM_DEV static __device__ __forceinline__
+/* CUDA's own math functions (no C library has them) work on the host too. */
+#define __CPUSIM_HDM static __host__ __device__ __forceinline__
 #define __CPUSIM_MATH1(NAME)                                                   \
     __CPUSIM_DEV float NAME##f(float x) { return __builtin_##NAME##f(x); }     \
     __CPUSIM_DEV double NAME(double x) { return __builtin_##NAME(x); }         \
@@ -151,10 +167,11 @@ __CPUSIM_DEV float abs(float x) { return __builtin_fabsf(x); }
 __CPUSIM_DEV double abs(double x) { return __builtin_fabs(x); }
 __CPUSIM_DEV float powf(float x, int n) { return (float)__builtin_pow((double)x, (double)n); }
 __CPUSIM_DEV double pow(double x, int n) { return __builtin_pow(x, (double)n); }
-__CPUSIM_DEV float rsqrtf(float x) { return 1.0f / __builtin_sqrtf(x); }
+__CPUSIM_DEV float pow(float x, int n) { return powf(x, n); }
+__CPUSIM_HDM float rsqrtf(float x) { return 1.0f / __builtin_sqrtf(x); }
 /* 1/sqrt rounded twice errs by more than an ulp; one Newton step on the
  * residual of y^2 x brings it within one. */
-__CPUSIM_DEV double rsqrt(double x) {
+__CPUSIM_HDM double rsqrt(double x) {
     double y = 1.0 / __builtin_sqrt(x);
     if (!(x > 0) || __builtin_isinf(x)) return y;
     double r = __builtin_fma(-x * y, y, 1.0);
@@ -175,8 +192,8 @@ __CPUSIM_DEV double cbrt(double x) {
 }
 __CPUSIM_DEV float cbrtf(float x) { return (float)__builtin_cbrt((double)x); }
 __CPUSIM_DEV float cbrt(float x) { return (float)__builtin_cbrt((double)x); }
-__CPUSIM_DEV float rcbrtf(float x) { return (float)(1.0 / __builtin_cbrt((double)x)); }
-__CPUSIM_DEV double rcbrt(double x) {
+__CPUSIM_HDM float rcbrtf(float x) { return (float)(1.0 / __builtin_cbrt((double)x)); }
+__CPUSIM_HDM double rcbrt(double x) {
     double y = 1.0 / cbrt(x);  /* Newton on x y^3 = 1 */
     if (y == 0 || __builtin_isinf(y) || y != y) return y;
     double y2 = y * y, e2 = __builtin_fma(y, y, -y2);
@@ -197,7 +214,7 @@ __CPUSIM_DEV double __cpusim_sin_pi_reduced(double r) {  /* |r| <= 1/2 */
     double hi = r * pi_hi, lo = __builtin_fma(r, pi_hi, -hi) + r * pi_lo;
     return __builtin_sin(hi) + __builtin_cos(hi) * lo;
 }
-__CPUSIM_DEV double sinpi(double x) {
+__CPUSIM_HDM double sinpi(double x) {
     if (__builtin_isinf(x)) return __builtin_nan("");
     double r = x - 2.0 * __builtin_rint(x * 0.5);
     if (r == __builtin_trunc(r)) return __builtin_copysign(0.0, x);
@@ -205,16 +222,16 @@ __CPUSIM_DEV double sinpi(double x) {
     else if (r < -0.5) r = -1.0 - r;
     return __cpusim_sin_pi_reduced(r);
 }
-__CPUSIM_DEV double cospi(double x) {
+__CPUSIM_HDM double cospi(double x) {
     if (__builtin_isinf(x)) return __builtin_nan("");
     double r = __builtin_fabs(x - 2.0 * __builtin_rint(x * 0.5));  /* [0, 1] */
     if (r == 0.5) return 0.0;
     return __cpusim_sin_pi_reduced(0.5 - r);
 }
-__CPUSIM_DEV float sinpif(float x) { return (float)sinpi((double)x); }
-__CPUSIM_DEV float cospif(float x) { return (float)cospi((double)x); }
-__CPUSIM_DEV void sincospif(float x, float* s, float* c) { *s = sinpif(x); *c = cospif(x); }
-__CPUSIM_DEV void sincospi(double x, double* s, double* c) { *s = sinpi(x); *c = cospi(x); }
+__CPUSIM_HDM float sinpif(float x) { return (float)sinpi((double)x); }
+__CPUSIM_HDM float cospif(float x) { return (float)cospi((double)x); }
+__CPUSIM_HDM void sincospif(float x, float* s, float* c) { *s = sinpif(x); *c = cospif(x); }
+__CPUSIM_HDM void sincospi(double x, double* s, double* c) { *s = sinpi(x); *c = cospi(x); }
 __CPUSIM_DEV float fdividef(float x, float y) { return x / y; }
 __CPUSIM_DEV int isnan(float x) { return __builtin_isnan(x); }
 __CPUSIM_DEV int isnan(double x) { return __builtin_isnan(x); }
@@ -770,7 +787,7 @@ __CPUSIM_DEV void __cpusim_sum_squares(double a, double b, double c, double* hi,
     *hi = s + err;
     *lo = err - (*hi - s);
 }
-__CPUSIM_DEV double norm3d(double a, double b, double c) {
+__CPUSIM_HDM double norm3d(double a, double b, double c) {
     if (__builtin_isinf(a) || __builtin_isinf(b) || __builtin_isinf(c)) return __builtin_inf();
     if (a != a || b != b || c != c) return a + b + c;
     double hi, lo;
@@ -781,10 +798,10 @@ __CPUSIM_DEV double norm3d(double a, double b, double c) {
     r += (__builtin_fma(-r, r, hi) + lo) / (2.0 * r);
     return __builtin_ldexp(r, e);
 }
-__CPUSIM_DEV float norm3df(float a, float b, float c) {
+__CPUSIM_HDM float norm3df(float a, float b, float c) {
     return (float)__builtin_sqrt((double)a * a + (double)b * b + (double)c * c);
 }
-__CPUSIM_DEV double rnorm3d(double a, double b, double c) {
+__CPUSIM_HDM double rnorm3d(double a, double b, double c) {
     if (__builtin_isinf(a) || __builtin_isinf(b) || __builtin_isinf(c)) return 0.0;
     if (a != a || b != b || c != c) return a + b + c;
     double hi, lo;
@@ -798,20 +815,20 @@ __CPUSIM_DEV double rnorm3d(double a, double b, double c) {
     y += 0.5 * y * ((1.0 - sy2) - es);
     return __builtin_ldexp(y, -e);
 }
-__CPUSIM_DEV float rnorm3df(float a, float b, float c) {
+__CPUSIM_HDM float rnorm3df(float a, float b, float c) {
     return (float)(1.0 / __builtin_sqrt((double)a * a + (double)b * b + (double)c * c));
 }
-__CPUSIM_DEV double norm4d(double a, double b, double c, double d) { return __builtin_hypot(__builtin_hypot(a, b), __builtin_hypot(c, d)); }
-__CPUSIM_DEV float norm4df(float a, float b, float c, float d) {
+__CPUSIM_HDM double norm4d(double a, double b, double c, double d) { return __builtin_hypot(__builtin_hypot(a, b), __builtin_hypot(c, d)); }
+__CPUSIM_HDM float norm4df(float a, float b, float c, float d) {
     return (float)__builtin_sqrt((double)a * a + (double)b * b + (double)c * c + (double)d * d);
 }
-__CPUSIM_DEV double rnorm4d(double a, double b, double c, double d) { return 1.0 / norm4d(a, b, c, d); }
-__CPUSIM_DEV float rnorm4df(float a, float b, float c, float d) { return (float)(1.0 / (double)norm4df(a, b, c, d)); }
-__CPUSIM_DEV double rhypot(double a, double b) { return 1.0 / __builtin_hypot(a, b); }
-__CPUSIM_DEV float rhypotf(float a, float b) { return (float)(1.0 / __builtin_hypot((double)a, (double)b)); }
+__CPUSIM_HDM double rnorm4d(double a, double b, double c, double d) { return 1.0 / norm4d(a, b, c, d); }
+__CPUSIM_HDM float rnorm4df(float a, float b, float c, float d) { return (float)(1.0 / (double)norm4df(a, b, c, d)); }
+__CPUSIM_HDM double rhypot(double a, double b) { return 1.0 / __builtin_hypot(a, b); }
+__CPUSIM_HDM float rhypotf(float a, float b) { return (float)(1.0 / __builtin_hypot((double)a, (double)b)); }
 /* The inverse error functions: Giles' approximation, then two Newton steps
  * on erf in double. */
-__CPUSIM_DEV double erfinv(double y) {
+__CPUSIM_HDM double erfinv(double y) {
     if (y <= -1.0) return y == -1.0 ? -__builtin_inf() : __builtin_nan("");
     if (y >= 1.0) return y == 1.0 ? __builtin_inf() : __builtin_nan("");
     double w = -__builtin_log((1.0 - y) * (1.0 + y)), x;
@@ -858,9 +875,9 @@ __CPUSIM_DEV double erfinv(double y) {
         x -= (__builtin_erf(x) - y) / (1.1283791670955126 * __builtin_exp(-x * x));
     return x;
 }
-__CPUSIM_DEV float erfinvf(float y) { return (float)erfinv((double)y); }
-__CPUSIM_DEV double erfcx(double x);
-__CPUSIM_DEV double erfcinv(double y) {
+__CPUSIM_HDM float erfinvf(float y) { return (float)erfinv((double)y); }
+__CPUSIM_HDM double erfcx(double x);
+__CPUSIM_HDM double erfcinv(double y) {
     if (y <= 0.0) return y == 0.0 ? __builtin_inf() : __builtin_nan("");
     if (y >= 2.0) return y == 2.0 ? -__builtin_inf() : __builtin_nan("");
     if (y > 0.0625 && y < 1.9375) return erfinv(1.0 - y);
@@ -877,10 +894,10 @@ __CPUSIM_DEV double erfcinv(double y) {
     }
     return y < 1.0 ? x : -x;
 }
-__CPUSIM_DEV float erfcinvf(float y) { return (float)erfcinv((double)y); }
+__CPUSIM_HDM float erfcinvf(float y) { return (float)erfcinv((double)y); }
 /* exp(x^2) erfc(x): directly where that does not overflow, else the
  * asymptotic series. */
-__CPUSIM_DEV double erfcx(double x) {
+__CPUSIM_HDM double erfcx(double x) {
     if (x < 25.0) return __builtin_exp(x * x) * __builtin_erfc(x);
     /* sum (-1)^n (2n-1)!! / (2x^2)^n, while its terms decrease */
     double u = 0.5 / (x * x), term = 1.0, sum = 1.0;
@@ -892,18 +909,18 @@ __CPUSIM_DEV double erfcx(double x) {
     }
     return sum / (x * 1.772453850905516);
 }
-__CPUSIM_DEV float erfcxf(float x) { return (float)erfcx((double)x); }
+__CPUSIM_HDM float erfcxf(float x) { return (float)erfcx((double)x); }
 /* erfc(-x / sqrt 2) with the argument as a sum of two doubles: in the tail
  * its rounding error is amplified by about x^2. */
-__CPUSIM_DEV double normcdf(double x) {
+__CPUSIM_HDM double normcdf(double x) {
     const double h = 0.70710678118654757, l = -4.8336466567264567e-17;
     if (__builtin_isinf(x)) return x > 0 ? 1.0 : 0.0;
     double t = -x * h, tl = __builtin_fma(-x, h, -t) - x * l;
     return 0.5 * (__builtin_erfc(t) - tl * 1.1283791670955126 * __builtin_exp(-t * t));
 }
-__CPUSIM_DEV float normcdff(float x) { return (float)normcdf((double)x); }
-__CPUSIM_DEV double normcdfinv(double p) { return 0.0 - 1.41421356237309504880 * erfcinv(2.0 * p); }
-__CPUSIM_DEV float normcdfinvf(float p) { return (float)normcdfinv((double)p); }
+__CPUSIM_HDM float normcdff(float x) { return (float)normcdf((double)x); }
+__CPUSIM_HDM double normcdfinv(double p) { return 0.0 - 1.41421356237309504880 * erfcinv(2.0 * p); }
+__CPUSIM_HDM float normcdfinvf(float p) { return (float)normcdfinv((double)p); }
 /* Modified Bessel functions of order 0 and 1: their power series converge
  * for every x; in double, its terms stay finite as far as the result does. */
 __CPUSIM_DEV double cyl_bessel_i0(double x) {
@@ -1043,11 +1060,87 @@ __device__ static __inline__ void __assert_fail(const char* expr, const char* fi
 }
 }
 
+/* CUDA 12.4's generic atomics, __nv_atomic_<op>(ptr, ..., order[, scope]):
+ * the orders have the compiler's __ATOMIC_* values; every scope is the same
+ * on a CPU. The operation itself is relaxed (as atomicAdd and the others),
+ * with a fence where the order asks for more: on x86 a relaxed load is
+ * already an acquire and a relaxed store a release. */
+#define __NV_ATOMIC_RELAXED __ATOMIC_RELAXED
+#define __NV_ATOMIC_CONSUME __ATOMIC_CONSUME
+#define __NV_ATOMIC_ACQUIRE __ATOMIC_ACQUIRE
+#define __NV_ATOMIC_RELEASE __ATOMIC_RELEASE
+#define __NV_ATOMIC_ACQ_REL __ATOMIC_ACQ_REL
+#define __NV_ATOMIC_SEQ_CST __ATOMIC_SEQ_CST
+#define __NV_THREAD_SCOPE_THREAD 0
+#define __NV_THREAD_SCOPE_BLOCK 1
+#define __NV_THREAD_SCOPE_CLUSTER 2
+#define __NV_THREAD_SCOPE_DEVICE 3
+#define __NV_THREAD_SCOPE_SYSTEM 4
+__CPUSIM_DEV void __cpusim_order_fence(int order) {
+    if (order == __ATOMIC_SEQ_CST) __nvvm_membar_gl();
+}
+__CPUSIM_DEV void __nv_atomic_thread_fence(int order, int = __NV_THREAD_SCOPE_SYSTEM) {
+    if (order != __ATOMIC_RELAXED) __nvvm_membar_gl();
+}
+template <typename T>
+__CPUSIM_DEV T __nv_atomic_load_n(const T* p, int order, int = __NV_THREAD_SCOPE_SYSTEM) {
+    __cpusim_order_fence(order);
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+}
+template <typename T>
+__CPUSIM_DEV void __nv_atomic_load(const T* p, T* ret, int order, int scope = __NV_THREAD_SCOPE_SYSTEM) {
+    *ret = __nv_atomic_load_n(p, order, scope);
+}
+template <typename T>
+__CPUSIM_DEV void __nv_atomic_store_n(T* p, T v, int order, int = __NV_THREAD_SCOPE_SYSTEM) {
+    __atomic_store_n(p, v, __ATOMIC_RELAXED);
+    __cpusim_order_fence(order);
+}
+template <typename T>
+__CPUSIM_DEV void __nv_atomic_store(T* p, T* v, int order, int scope = __NV_THREAD_SCOPE_SYSTEM) {
+    __nv_atomic_store_n(p, *v, order, scope);
+}
+template <typename T>
+__CPUSIM_DEV T __nv_atomic_exchange_n(T* p, T v, int, int = __NV_THREAD_SCOPE_SYSTEM) {
+    return __atomic_exchange_n(p, v, __ATOMIC_RELAXED);
+}
+template <typename T>
+__CPUSIM_DEV void __nv_atomic_exchange(T* p, T* v, T* ret, int order, int scope = __NV_THREAD_SCOPE_SYSTEM) {
+    *ret = __nv_atomic_exchange_n(p, *v, order, scope);
+}
+template <typename T>
+__CPUSIM_DEV bool __nv_atomic_compare_exchange_n(T* p, T* expected, T desired, bool, int, int,
+                                                 int = __NV_THREAD_SCOPE_SYSTEM) {
+    T old = *expected;
+    const bool ok = __atomic_compare_exchange_n(p, &old, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    *expected = old;
+    return ok;
+}
+template <typename T>
+__CPUSIM_DEV bool __nv_atomic_compare_exchange(T* p, T* expected, T* desired, bool weak, int so, int fo,
+                                               int scope = __NV_THREAD_SCOPE_SYSTEM) {
+    return __nv_atomic_compare_exchange_n(p, expected, *desired, weak, so, fo, scope);
+}
+#define __CPUSIM_NV_FETCH(OP, BUILTIN)                                                        \
+    template <typename T>                                                                    \
+    __CPUSIM_DEV T __nv_atomic_fetch_##OP(T* p, T v, int, int = __NV_THREAD_SCOPE_SYSTEM) {  \
+        return BUILTIN(p, v, __ATOMIC_RELAXED);                                              \
+    }
+__CPUSIM_NV_FETCH(add, __atomic_fetch_add)
+__CPUSIM_NV_FETCH(sub, __atomic_fetch_sub)
+__CPUSIM_NV_FETCH(and, __atomic_fetch_and)
+__CPUSIM_NV_FETCH(or, __atomic_fetch_or)
+__CPUSIM_NV_FETCH(xor, __atomic_fetch_xor)
+__CPUSIM_NV_FETCH(min, __atomic_fetch_min)
+__CPUSIM_NV_FETCH(max, __atomic_fetch_max)
+#undef __CPUSIM_NV_FETCH
+
 /* Memory fences: a full fence (mfence) for all three scopes. */
 __CPUSIM_DEV void __threadfence(void) { __nvvm_membar_gl(); }
 __CPUSIM_DEV void __threadfence_block(void) { __nvvm_membar_cta(); }
 __CPUSIM_DEV void __threadfence_system(void) { __nvvm_membar_sys(); }
 #undef __CPUSIM_DEV
+#undef __CPUSIM_HDM
 
 /* new and delete in device code: Clang's own wrapper of <new> defines them
  * on the device malloc and free declared above. */

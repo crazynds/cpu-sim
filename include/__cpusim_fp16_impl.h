@@ -67,7 +67,10 @@ struct __attribute__((aligned(4))) __CPUSIM_T2 {
     __CPUSIM_T2() = default;
     __host__ __device__ constexpr __CPUSIM_T2(const __CPUSIM_T& a, const __CPUSIM_T& b) : x(a), y(b) {}
     __host__ __device__ constexpr __CPUSIM_T2(const __CPUSIM_RAW2& r) : x(__CPUSIM_RAW{r.x}), y(__CPUSIM_RAW{r.y}) {}
-    __host__ __device__ __CPUSIM_T2& operator=(const __CPUSIM_RAW2& r) { return *this = __CPUSIM_T2(r); }
+    // A template (exactly the raw type), so that "= {}" is the plain copy
+    // assignment instead of a tie between the two.
+    template <typename R, int = sizeof(char[__is_same(R, __CPUSIM_RAW2) ? 1 : -1])>
+    __host__ __device__ __CPUSIM_T2& operator=(const R& r) { return *this = __CPUSIM_T2(r); }
     __host__ __device__ constexpr operator __CPUSIM_RAW2() const { return __CPUSIM_RAW2{x.__x, y.__x}; }
 };
 
@@ -148,6 +151,7 @@ __CPUSIM_HD float __low2float(__CPUSIM_T2 a) { return __CPUSIM_F(a.x); }
 __CPUSIM_HD float __high2float(__CPUSIM_T2 a) { return __CPUSIM_F(a.y); }
 __CPUSIM_HD __CPUSIM_T2 __CPUSIM_NAME3(__float2, __CPUSIM_N2, _rn)(float f) { return __CPUSIM_T2(__CPUSIM_RN(f), __CPUSIM_RN(f)); }
 __CPUSIM_HD __CPUSIM_T2 __CPUSIM_NAME3(__floats2, __CPUSIM_N2, _rn)(float a, float b) { return __CPUSIM_T2(__CPUSIM_RN(a), __CPUSIM_RN(b)); }
+__CPUSIM_HD __CPUSIM_T2 __CPUSIM_NAME3(__float22, __CPUSIM_N2, _rn)(float2 a) { return __CPUSIM_T2(__CPUSIM_RN(a.x), __CPUSIM_RN(a.y)); }
 __CPUSIM_HD float2 __CPUSIM_NAME3(__, __CPUSIM_N2, 2float2)(__CPUSIM_T2 a) { return float2{__CPUSIM_F(a.x), __CPUSIM_F(a.y)}; }
 
 /* --------------------------------------------------------------- arithmetic */
