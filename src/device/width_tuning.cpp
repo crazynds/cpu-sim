@@ -1,6 +1,7 @@
 #include "device/width_tuning.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -43,50 +44,98 @@ std::vector<uint32_t> valid_widths(const KernelVariants& v, uint64_t threads) {
 }
 
 void WidthTuning::start(const std::vector<uint32_t>& valid) {
-    // Every candidate once per round, keeping each one's best: warm-up and
-    // clock changes hit all of them alike.
-    for (int r = 0; r < kRounds; ++r) candidates_.insert(candidates_.end(), valid.begin(), valid.end());
+    cands_ = valid;
+    samples_.assign(cands_.size(), {});
+    schedule_.clear();
+    for (size_t i = 0; i < cands_.size(); ++i) schedule_.push_back(i);
+    pos_ = 0;
+    round_ = 1;
+}
+
+namespace {
+uint64_t median(std::vector<uint64_t> v) {
+    std::sort(v.begin(), v.end());
+    return v[(v.size() - 1) / 2];  // the lower middle of an even count
+}
+}  // namespace
+
+size_t WidthTuning::decide(const std::vector<std::vector<uint64_t>>& times) {
+    std::vector<uint64_t> med(times.size(), UINT64_MAX);
+    uint64_t best = UINT64_MAX;
+    for (size_t i = 0; i < times.size(); ++i)
+        if (!times[i].empty()) best = std::min(best, med[i] = median(times[i]));
+    for (size_t i = 0; i < times.size(); ++i)
+        if (med[i] != UINT64_MAX && double(med[i]) <= double(best) * (1.0 + kTie)) return i;
+    return 0;
 }
 
 bool WidthTuning::record(uint32_t lanes, uint64_t ns) {
-    if (chosen_ || ns_.size() >= candidates_.size() || candidates_[ns_.size()] != lanes) return false;
+    if (chosen_ || pos_ >= schedule_.size() || cands_[schedule_[pos_]] != lanes) return false;
     if (!warm_) {
         warm_ = true;
         return false;
     }
-    ns_.push_back(ns);
-    const size_t n = first_round_ ? first_round_ : candidates_.size() / kRounds;
-    if (!first_round_ && ns_.size() == n) {
-        // First round done. The second one only separates candidates within
-        // 1.5x of the best; the others cannot win and are not run again
-        // (each run is a whole launch with that width, and a program that
-        // launches a shape a few times would spend them all measuring).
-        first_round_ = n;
-        const uint64_t best = *std::min_element(ns_.begin(), ns_.end());
-        candidates_.resize(n);
-        for (int r = 1; r < kRounds; ++r)
-            for (size_t i = 0; i < n; ++i)
-                if (ns_[i] <= best + best / 2) candidates_.push_back(candidates_[i]);
-        if (candidates_.size() == n + kRounds - 1) candidates_.resize(n);  // only one left: no need
+    samples_[schedule_[pos_]].push_back(ns);
+    if (++pos_ < schedule_.size()) return false;
+    // A round is done.
+    if (round_ == 1) {
+        uint64_t best = UINT64_MAX;
+        for (const auto& s : samples_) best = std::min(best, s.front());
+        for (auto& s : samples_)
+            if (double(s.front()) > double(best) * kDrop) s.clear();  // dropped
     }
-    if (ns_.size() != candidates_.size()) return false;
-    // Each candidate's best over its runs.
-    std::vector<uint64_t> best_ns(ns_.begin(), ns_.begin() + n);
-    for (size_t k = n; k < ns_.size(); ++k)
-        for (size_t i = 0; i < n; ++i)
-            if (candidates_[i] == candidates_[k]) best_ns[i] = std::min(best_ns[i], ns_[k]);
-    size_t best = 0;
-    for (size_t i = 0; i < n; ++i) {
-        ns_[i] = best_ns[i];
-        if (ns_[i] < ns_[best]) best = i;
-    }
-    chosen_ = candidates_[best];
+    schedule_.clear();
+    for (size_t i = 0; i < cands_.size(); ++i)
+        if (!samples_[i].empty()) schedule_.push_back(i);
+    pos_ = 0;
+    if (++round_ <= kRounds && schedule_.size() > 1) return false;
+    chosen_ = cands_[decide(samples_)];
     return true;
 }
 
-void WidthTuning::choose(const std::vector<uint32_t>& lanes, const std::vector<uint64_t>& ns) {
-    const size_t best = size_t(std::min_element(ns.begin(), ns.end()) - ns.begin());
-    chosen_ = lanes[best];
+void WidthTuning::choose(const std::vector<uint32_t>& lanes, const std::vector<std::vector<uint64_t>>& slices) {
+    cands_ = lanes;
+    samples_ = slices;
+    chosen_ = cands_[decide(samples_)];
+}
+
+std::vector<uint64_t> WidthTuning::medians() const {
+    std::vector<uint64_t> m;
+    for (const auto& s : samples_) m.push_back(s.empty() ? 0 : median(s));
+    return m;
+}
+
+std::string WidthTuning::describe() const {
+    std::string out;
+    char buf[96];
+    for (size_t i = 0; i < cands_.size(); ++i) {
+        const auto& s = samples_[i];
+        if (s.empty()) {
+            std::snprintf(buf, sizeof(buf), " %u%s:-", cands_[i] & 0xffff, width_suffix(cands_[i]));
+        } else {
+            const auto [lo, hi] = std::minmax_element(s.begin(), s.end());
+            std::snprintf(buf, sizeof(buf), " %u%s:%.1f[%.1f-%.1f]", cands_[i] & 0xffff, width_suffix(cands_[i]),
+                          median(s) / 1e3, *lo / 1e3, *hi / 1e3);
+        }
+        out += buf;
+    }
+    return out;
+}
+
+uint32_t WidthDecisions::find(const Key& k) const {
+    std::lock_guard lock(mutex_);
+    auto it = map_.find(k);
+    return it == map_.end() ? 0 : it->second;
+}
+
+void WidthDecisions::store(const Key& k, uint32_t lanes) {
+    std::lock_guard lock(mutex_);
+    if (map_.size() < kMaxEntries || map_.count(k)) map_[k] = lanes;
+}
+
+size_t WidthDecisions::size() const {
+    std::lock_guard lock(mutex_);
+    return map_.size();
 }
 
 }  // namespace cpusim

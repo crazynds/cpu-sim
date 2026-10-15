@@ -420,6 +420,9 @@ void Executor::worker(int index, int cpu) {
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
         current_[size_t(index)].store(nullptr, std::memory_order_release);
         job->busy_ns.fetch_add(ns, std::memory_order_relaxed);
+        for (uint64_t s = job->span_ns.load(std::memory_order_relaxed);
+             s < ns && !job->span_ns.compare_exchange_weak(s, ns, std::memory_order_relaxed);) {
+        }
         if (job->counters) {  // profiling runs only
             std::lock_guard lock(mutex_);
             for (int i = 0; i < CPUSIM_COUNTERS; ++i) job->counters[i] += counters[i];
@@ -714,7 +717,7 @@ CtxArray Executor::slice_groups(const CtxArray& groups, uint32_t lanes, uint32_t
 void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const cpusim_kernel_meta& meta,
                    const LaunchConfig& cfg, const uint8_t* params, uint64_t* counters, cpusim_block_fn block,
                    uint64_t first, uint64_t last, uint64_t* busy_ns, KernelFault* fault,
-                   uint32_t tag, bool refill) {
+                   uint32_t tag, bool refill, uint64_t* span_ns) {
     CtxArray warps = make_groups(cfg, lanes, meta.warp_size);
     // Block-wide entries never suspend: no frames.
     uint32_t frame_bytes = 0;
@@ -767,6 +770,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
     job.next.store(first, std::memory_order_relaxed);
     if (counters) std::memset(counters, 0, sizeof(uint64_t) * CPUSIM_COUNTERS);
     if (busy_ns) *busy_ns = 0;
+    if (span_ns) *span_ns = 0;
     if (first >= job.blocks) return;
     // What the kernel costs per unit, learned from its previous launches.
     const uint64_t cost_key = reinterpret_cast<uintptr_t>(entry) ^ (uint64_t(lanes) << 48) ^ (uint64_t(job.split) << 40) ^
@@ -791,6 +795,7 @@ void Executor::run(cpusim_entry_fn entry, uint32_t lanes, bool suspending, const
 
     post_and_wait(job, first);
     if (busy_ns) *busy_ns = job.busy_ns;
+    if (span_ns) *span_ns = job.span_ns;
     if (fault) *fault = job.fault;
     if (!job.fault.signal) learn_cost(cost_key, job.blocks - first, job.busy_ns);
 }

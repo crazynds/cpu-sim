@@ -144,6 +144,7 @@ private:
         ContextInfo info;
         std::map<uint64_t, uint64_t> allocations;  // device pointer -> size
         std::vector<void*> modules;                // dlopen handles
+        std::map<void*, uint64_t> module_code;     // handle -> hash of the module's content
         int running = 0;                           // launches in flight
         int output_fd = 1;                         // device printf (owned unless 1)
         struct FunctionInfo {
@@ -155,6 +156,7 @@ private:
             uint64_t trace = 0;     // __cpusim_trace_: a wmma GEMM candidate (wmma_trace.h)
             uint64_t refill = 0;    // __cpusim_entryr_: warp entry whose lanes refill (CPUSIM_META_REFILL)
             std::string name;       // the kernel's (mangled), for messages
+            uint64_t code = 0;      // its code: a hash of its module and its name (WidthDecisions)
             cpusim_kernel_meta meta{};
             std::map<uint64_t, WidthTuning> tuning;  // key: block shape; which width runs fastest
             // Launches of a wmma GEMM candidate, by grid, block and
@@ -184,9 +186,12 @@ private:
     };
     uint32_t pick_width(Context::FunctionInfo& fn, const LaunchConfig& cfg, uint64_t* entry, uint64_t* tuning_key,
                         std::vector<Trial>* trials);
-    void choose_width(uint32_t ctx, uint64_t function, uint64_t key, const std::vector<Trial>& trials,
-                      const std::vector<uint64_t>& ns);
+    // The width the in-launch trials decide (and keeps it); `slices`: each
+    // candidate's slice times, one per round.
+    uint32_t choose_width(uint32_t ctx, uint64_t function, uint64_t key, const std::vector<Trial>& trials,
+                          const std::vector<std::vector<uint64_t>>& slices);
     void record_timing(uint32_t ctx, uint64_t function, uint64_t key, uint32_t lanes, uint64_t ns);
+    WidthDecisions decisions_;  // widths decided while the daemon runs, for the same code
 
     Config cfg_;
     Topology topo_;

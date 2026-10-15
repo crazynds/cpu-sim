@@ -301,7 +301,7 @@ namespace {
 // Kernel modules are loaded from a real file named after their content, so
 // profilers (perf report/annotate) can find the code and its symbols after
 // the run. Same build, same file: nothing accumulates across runs.
-std::string module_file(int fd) {
+std::string module_file(int fd, uint64_t* hash) {
     std::string data;
     char buf[1 << 16];
     ssize_t n;
@@ -312,6 +312,7 @@ std::string module_file(int fd) {
     }
     uint64_t h = 1469598103934665603ull;  // FNV-1a
     for (unsigned char c : data) h = (h ^ c) * 1099511628211ull;
+    *hash = h;
 
     const char* rt = std::getenv("XDG_RUNTIME_DIR");
     std::string dir = std::string(rt && *rt ? rt : "/tmp") + "/cpusim";
@@ -340,7 +341,8 @@ std::string module_file(int fd) {
 }  // namespace
 
 Error DeviceCore::load_module(uint32_t id, int fd, uint64_t* module) {
-    std::string path = module_file(fd);
+    uint64_t hash = 0;
+    std::string path = module_file(fd, &hash);
     void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         std::fprintf(stderr, "cpusim: cannot load kernel module: %s\n", dlerror());
@@ -359,6 +361,7 @@ Error DeviceCore::load_module(uint32_t id, int fd, uint64_t* module) {
         return Error::InitializationError;
     }
     it->second.modules.push_back(handle);
+    it->second.module_code[handle] = hash;
     *module = reinterpret_cast<uint64_t>(handle);
     return Error::Success;
 }
@@ -420,6 +423,9 @@ Error DeviceCore::get_function(uint32_t id, uint64_t module, const std::string& 
     *function = reinterpret_cast<uint64_t>(sym);
     Context::FunctionInfo info;
     info.name = name;
+    // The code it runs: its module's content and its name.
+    info.code = it->second.module_code[handle];
+    for (unsigned char c : name) info.code = (info.code ^ c) * 1099511628211ull;
     info.profiled = reinterpret_cast<uint64_t>(prof);
     info.meta = *meta;
     const uint32_t two_warps = 2 * meta->warp_size;  // the narrowest wide variant
@@ -571,6 +577,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     LaunchResult local;
     if (!result) result = &local;
     uint64_t launch_busy = 0;  // workers' time on this launch's blocks
+    uint64_t launch_span = 0;  // the longest of them (Executor::run's span_ns)
     {
         // Busy time = time with at least one kernel running (launches from
         // several streams overlap). `since` lets the monitor count a long
@@ -598,12 +605,13 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
             }
         } else {
             KernelFault fault;
-            auto run = [&](uint64_t fn_entry, uint32_t w, uint64_t first, uint64_t last, uint64_t* busy) {
+            auto run = [&](uint64_t fn_entry, uint32_t w, uint64_t first, uint64_t last, uint64_t* busy,
+                           uint64_t* span = nullptr) {
                 if (fault.signal) return;
                 executor_->run(reinterpret_cast<cpusim_entry_fn>(fn_entry), w & 0xffff,
                                w == meta.warp_lanes || (w & kSuspend), meta, run_cfg, aligned,
                                cfg.profile ? result->counters : nullptr, reinterpret_cast<cpusim_block_fn>(block_fn),
-                               first, last, busy, &fault, id, (w & kRefill) != 0);
+                               first, last, busy, &fault, id, (w & kRefill) != 0, span);
             };
             // A fault ends the launch (and only it): an invalid address is
             // cudaErrorIllegalAddress, anything else an unspecified failure.
@@ -625,20 +633,17 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
                     ns.push_back(busy * 1000 / slice);
                     first += slice;
                 }
-                // Best slice of each candidate (trials are the rounds back to back).
+                // Each candidate's slices (trials are the rounds back to back).
                 const size_t n = trials.size() / kTrialRounds;
-                size_t best = 0;
-                for (size_t i = 0; i < n; ++i) {
-                    for (size_t r = 1; r < kTrialRounds; ++r) ns[i] = std::min(ns[i], ns[r * n + i]);
-                    if (ns[i] < ns[best]) best = i;
-                }
+                std::vector<std::vector<uint64_t>> slices(n);
+                for (size_t k = 0; k < trials.size(); ++k) slices[k % n].push_back(ns[k]);
                 if (failed()) return fault_error(fault.signal);
-                choose_width(id, function, tuning_key, std::vector<Trial>(trials.begin(), trials.begin() + n),
-                             std::vector<uint64_t>(ns.begin(), ns.begin() + n));
-                entry = trials[best].entry;
-                lanes = trials[best].lanes;
+                lanes = choose_width(id, function, tuning_key, std::vector<Trial>(trials.begin(), trials.begin() + n),
+                                     slices);
+                for (size_t i = 0; i < n; ++i)
+                    if (trials[i].lanes == lanes) entry = trials[i].entry;
             }
-            run(entry, lanes, first, UINT64_MAX, &launch_busy);
+            run(entry, lanes, first, UINT64_MAX, &launch_busy, &launch_span);
             if (failed()) return fault_error(fault.signal);
         }
         result->kernel_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -655,14 +660,16 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
                      width_suffix(lanes), result->kernel_ns / 1e6,
                      100.0 * double(launch_busy) / (double(result->kernel_ns) * double(executor_->workers())));
     // One candidate per launch (launches too small for in-launch trials):
-    // whole launches of one shape compared with each other, so the wall time
-    // is the right measure, and the one that matters: with few blocks it also
-    // counts how well the width spreads over the workers (matrix-rotate: 128
-    // lanes does less work in all but leaves cores idle). The launch overhead
-    // is the same for every candidate. Per block, for grids that vary.
+    // whole launches of one shape compared with each other, by their
+    // critical path, the longest a worker spent on them. Like the wall time
+    // it counts how well the width spreads over the workers (matrix-rotate:
+    // 128 lanes does less work in all but leaves cores idle); unlike it, it
+    // leaves out the round trip and the workers' wake-up, whose noise made the
+    // same width measure 2-4x apart from one launch to the next. Per block,
+    // for grids that vary.
     const uint64_t launch_blocks = uint64_t(cfg.grid[0]) * cfg.grid[1] * cfg.grid[2];
-    if (tuning_key && trials.empty() && launch_busy)
-        record_timing(id, function, tuning_key, lanes, result->kernel_ns * 1000 / std::max<uint64_t>(launch_blocks, 1));
+    if (tuning_key && trials.empty() && launch_span)
+        record_timing(id, function, tuning_key, lanes, launch_span * 1000 / std::max<uint64_t>(launch_blocks, 1));
     counters_.kernels_launched.fetch_add(1, std::memory_order_relaxed);
     if (cfg.profile) counters_.kernels_profiled.fetch_add(1, std::memory_order_relaxed);
     return Error::Success;
@@ -706,6 +713,11 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
 
     uint64_t key = (uint64_t(cfg.block[0]) << 40) ^ (uint64_t(cfg.block[1]) << 20) ^ cfg.block[2];
     WidthTuning& t = fn.tuning[key];
+    // Decided for this code before, in this program or an earlier one.
+    if (!t.started())
+        if (const uint32_t w = decisions_.find({fn.code, key, uint32_t(executor_->workers())});
+            w && std::find(valid.begin(), valid.end(), w) != valid.end())
+            t.adopt(w);
     if (!t.started()) {
         // The measure is the workers' time per block (Executor::run), so it
         // holds for small slices and small launches alike.
@@ -729,25 +741,27 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
     return w;
 }
 
-void DeviceCore::choose_width(uint32_t id, uint64_t function, uint64_t key, const std::vector<Trial>& trials,
-                              const std::vector<uint64_t>& ns) {
-    std::lock_guard lock(mutex_);
-    auto it = contexts_.find(id);
-    if (it == contexts_.end()) return;
-    auto fn = it->second.functions.find(function);
-    if (fn == it->second.functions.end()) return;
-    WidthTuning& t = fn->second.tuning[key];
+uint32_t DeviceCore::choose_width(uint32_t id, uint64_t function, uint64_t key, const std::vector<Trial>& trials,
+                                  const std::vector<std::vector<uint64_t>>& slices) {
     std::vector<uint32_t> lanes;
     for (const Trial& tr : trials) lanes.push_back(tr.lanes);
-    t.choose(lanes, ns);
+    WidthTuning chosen;
+    chosen.choose(lanes, slices);
+    std::lock_guard lock(mutex_);
+    auto it = contexts_.find(id);
+    if (it == contexts_.end()) return chosen.chosen();
+    auto fn = it->second.functions.find(function);
+    if (fn == it->second.functions.end()) return chosen.chosen();
+    WidthTuning& t = fn->second.tuning[key];
+    t = chosen;
+    decisions_.store({fn->second.code, key, uint32_t(executor_->workers())}, t.chosen());
     if (std::getenv("CPUSIM_VERBOSE")) {
-        std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, in the first launch (us per 1000 blocks, best of %d slices of %llu)",
+        std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, in the first launch (us per 1000 blocks, median [range] of %d slices of %llu)",
                      fn->second.name.c_str(), (unsigned long long)(key >> 40), (unsigned long long)((key >> 20) & 0xfffff),
                      (unsigned long long)(key & 0xfffff), kTrialRounds, (unsigned long long)trial_blocks());
-        for (size_t i = 0; i < trials.size(); ++i)
-            std::fprintf(stderr, " %u%s:%.1f", trials[i].lanes & 0xffff, width_suffix(trials[i].lanes), ns[i] / 1e3);
-        std::fprintf(stderr, " -> %u%s lanes\n", t.chosen() & 0xffff, width_suffix(t.chosen()));
+        std::fprintf(stderr, "%s -> %u%s lanes\n", t.describe().c_str(), t.chosen() & 0xffff, width_suffix(t.chosen()));
     }
+    return t.chosen();
 }
 
 void DeviceCore::record_timing(uint32_t id, uint64_t function, uint64_t key, uint32_t lanes, uint64_t ns) {
@@ -758,14 +772,12 @@ void DeviceCore::record_timing(uint32_t id, uint64_t function, uint64_t key, uin
     if (fn == it->second.functions.end()) return;
     WidthTuning& t = fn->second.tuning[key];
     if (!t.record(lanes, ns)) return;
+    decisions_.store({fn->second.code, key, uint32_t(executor_->workers())}, t.chosen());
     if (std::getenv("CPUSIM_VERBOSE")) {
-        std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, over launches (us of launch time per 1000 blocks, best run)",
+        std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, over launches (us of critical path per 1000 blocks, median [range] of the runs; -: dropped)",
                      fn->second.name.c_str(), (unsigned long long)(key >> 40),
                      (unsigned long long)((key >> 20) & 0xfffff), (unsigned long long)(key & 0xfffff));
-        for (size_t i = 0; i < t.first_round(); ++i)
-            std::fprintf(stderr, " %u%s:%.1f", t.candidates()[i] & 0xffff, width_suffix(t.candidates()[i]),
-                         t.times()[i] / 1e3);
-        std::fprintf(stderr, " -> %u%s lanes\n", t.chosen() & 0xffff, width_suffix(t.chosen()));
+        std::fprintf(stderr, "%s -> %u%s lanes\n", t.describe().c_str(), t.chosen() & 0xffff, width_suffix(t.chosen()));
     }
 }
 

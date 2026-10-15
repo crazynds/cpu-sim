@@ -70,40 +70,60 @@ int main() {
     EXPECT(valid_widths(w16, 64) == (W{16, 32, 64}));
 
     // --- which one the measurement keeps
-    // The fastest wins, and a candidate more than 1.5x slower than the best
-    // of the first round is not measured again.
+    // Launches: the warm-up, then 5 rounds; a candidate more than 3x slower
+    // than the best after the first round is not run again.
     int launches = 0;
-    EXPECT(measure(W{32, 64, 128}, [](uint32_t w) { return w == 64 ? 300 : w == 128 ? 90 : 100; }, &launches) == 128);
-    EXPECT(launches == 6);  // the warm-up, 3, and the two within 1.5x
-    // Only one within 1.5x: chosen after the first round.
+    EXPECT(measure(W{32, 64, 128}, [](uint32_t w) { return w == 64 ? 300 : w == 128 ? 70 : 100; }, &launches) == 128);
+    EXPECT(launches == 1 + 3 + 4 * 2);  // 64 dropped after the first round
+    // Only one left after the first round: chosen there.
     EXPECT(measure(W{32, 64, 128}, [](uint32_t w) { return w == 32 ? 100 : 1000; }, &launches) == 32);
-    EXPECT(launches == 4);
+    EXPECT(launches == 1 + 3);
     // The first launch is cold (first touch of the data, caches): its time
     // does not count, so the width it runs is not dropped for it (HeCBench
     // adam: 32 lanes measured 2.9x slower than 128 in the first launch, and
     // was the fastest).
     {
-        WidthTuning t;
-        t.start(W{32, 64, 128});
         int launch = 0;
-        while (!t.chosen()) {
-            const uint32_t w = t.next();
-            t.record(w, launch++ == 0 ? 300 : w == 32 ? 80 : 100);  // cold first launch
-        }
-        EXPECT(t.chosen() == 32);
+        EXPECT(measure(W{32, 64, 128}, [&](uint32_t w) { return launch++ == 0 ? 300 : w == 32 ? 70 : 100; }) == 32);
     }
-    // Each candidate keeps its best run: a slow first run (warm-up) does
-    // not lose a width that is faster afterwards.
+    // A candidate 2x off in its first run is not dropped (outliers that
+    // large happen; 3x drops it), and wins if it is the faster one.
+    EXPECT(measure(W{32, 64}, [n = 0](uint32_t w) mutable { return w == 64 && n++ == 0 ? 190 : 90 + (w == 32) * 10; }) ==
+           64);
+    // The median of each candidate's runs: two slow (or lucky) launches do
+    // not decide.
     {
         WidthTuning t;
         t.start(W{32, 64});
-        t.record(32, 1000);  // the warm-up launch
-        t.record(32, 100);
-        t.record(64, 140);  // still warming up
-        t.record(32, 100);
-        t.record(64, 80);
-        EXPECT(t.chosen() == 64);
+        const uint64_t times[] = {999,        // warm-up
+                                  100, 95,    // round 1
+                                  100, 40,    // round 2: 64 lucky
+                                  100, 96,    // round 3
+                                  100, 41,    // round 4: lucky again
+                                  100, 97};   // round 5
+        for (uint64_t ns : times) t.record(t.next(), ns);
+        EXPECT(t.chosen() == 32);  // medians: 32 -> 100, 64 -> 95, a tie: the first
     }
+    // Within 10% of the best is a tie, decided by the order of valid_widths
+    // (the same way in every run); a clear difference decides by the times.
+    EXPECT(WidthTuning::decide({{105}, {100}}) == 0);
+    EXPECT(WidthTuning::decide({{100}, {105}}) == 0);
+    EXPECT(WidthTuning::decide({{120}, {100}}) == 1);
+    EXPECT(WidthTuning::decide({{}, {300}, {100}}) == 2);  // dropped candidates do not count
+    // The same program decides the same way however its times wobble: the
+    // times of two widths 5% apart, each launch off by up to +-2%, never decide
+    // differently from one run to the next (the tie rule), and two widths 40%
+    // apart always go to the faster one.
+    unsigned seed = 7;
+    auto rnd = [&] { return (seed = seed * 1103515245u + 12345u) >> 16; };
+    auto noisy = [&](uint64_t base) { return base * (980 + rnd() % 41) / 1000; };
+    bool same = true, fast = true;
+    for (int run = 0; run < 1000; ++run) {
+        same &= measure(W{32, 64}, [&](uint32_t w) { return noisy(w == 32 ? 105 : 100); }) == 32;
+        fast &= measure(W{32, 64}, [&](uint32_t w) { return noisy(w == 32 ? 140 : 100); }) == 64;
+    }
+    EXPECT(same);
+    EXPECT(fast);
     // A time for a width other than the one asked for is ignored.
     {
         WidthTuning t;
@@ -113,27 +133,35 @@ int main() {
         EXPECT(t.next() == 32);
         EXPECT(!t.chosen());
     }
-    // In-launch trials: the best slice wins.
+    // In-launch trials: the median of each candidate's slices, the same tie rule.
     {
         WidthTuning t;
-        t.start(W{256, 128 | kSuspend, 32});
-        t.choose(W{256, 128 | kSuspend, 32}, {50, 40, 60});
+        t.choose(W{256, 128 | kSuspend, 32}, {{50, 52, 51}, {40, 41, 39}, {60, 61, 62}});
         EXPECT(t.chosen() == (128 | kSuspend));
         EXPECT(!t.record(32, 1));  // nothing more once chosen
+        t.choose(W{256, 128 | kSuspend, 32}, {{42, 43, 41}, {40, 41, 39}, {60, 61, 62}});
+        EXPECT(t.chosen() == 256);  // within 10% of the best: the first
     }
-    // Whatever the times, the choice is the fastest candidate within noise
-    // of nothing: the one with the least time, over many made-up cases.
-    unsigned seed = 1;
-    auto rnd = [&] { return (seed = seed * 1103515245u + 12345u) >> 16; };
-    for (int c = 0; c < 1000; ++c) {
-        const W valid{32, 64, 128, 256};
-        uint64_t cost[4];
-        for (uint64_t& x : cost) x = 100 + rnd() % 1000;
-        const uint32_t got = measure(valid, [&](uint32_t w) { return cost[w == 32 ? 0 : w == 64 ? 1 : w == 128 ? 2 : 3]; });
-        uint64_t best = cost[0];
-        for (uint64_t x : cost) best = std::min(best, x);
-        const uint64_t mine = cost[got == 32 ? 0 : got == 64 ? 1 : got == 128 ? 2 : 3];
-        EXPECT(mine == best);
+
+    // --- decisions kept while the daemon runs
+    {
+        const WidthDecisions::Key a{0x1234, (uint64_t(256) << 40) | (1 << 20) | 1, 62};
+        const WidthDecisions::Key b{0x1234, (uint64_t(128) << 40) | (1 << 20) | 1, 62};  // another shape
+        const WidthDecisions::Key c{0x1234, a.shape, 30};                                // other workers
+        const WidthDecisions::Key d{0x5678, a.shape, 62};                                // other code
+        WidthDecisions m;
+        EXPECT(m.find(a) == 0);
+        m.store(a, 64 | kSuspend);
+        m.store(b, 128);
+        EXPECT(m.find(a) == (64 | kSuspend));
+        EXPECT(m.find(b) == 128);
+        EXPECT(m.find(c) == 0 && m.find(d) == 0);
+        EXPECT(m.size() == 2);
+        // A decision adopted by the tuning: chosen, nothing to measure.
+        WidthTuning t;
+        t.adopt(64);
+        EXPECT(t.started() && t.chosen() == 64);
+        EXPECT(!t.record(64, 1));
     }
     TEST_MAIN_END();
 }
