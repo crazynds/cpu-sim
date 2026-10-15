@@ -6,6 +6,7 @@
 #   cuda_feature_test.sh <cucc> <cpusimd> <test.cu> [cucc flags...]
 # The program prints "<name>: PASS" or "<name>: FAIL" and exits non-zero on failure.
 # FEATURE_ENVS="VAR=value ...": one more in-process run with each setting.
+# COMPILE_BUDGET=<seconds>: fail if compiling takes longer.
 set -eu
 CUCC=$1 CPUSIMD=$2 SRC=$3
 shift 3
@@ -14,7 +15,18 @@ NAME=$(basename "$SRC" .cu)
 export CPUSIM_SOCKET="$DIR/driver.sock" CPUSIM_VRAM=2GiB CPUSIM_CONFIG="$DIR/none.toml"
 trap '"$CPUSIMD" --stop >/dev/null 2>&1 || true; rm -rf "$DIR"' EXIT
 
+# COMPILE_BUDGET=<seconds>: the compilation must not take longer (kernels
+# whose code once took minutes to compile).
+start=$(date +%s)
 "$CUCC" -std=c++20 -I "$(dirname "$SRC")" "$@" "$SRC" -o "$DIR/$NAME"
+if [ -n "${COMPILE_BUDGET:-}" ]; then
+    took=$(( $(date +%s) - start ))
+    echo "== compiled in $took s (budget $COMPILE_BUDGET s)"
+    if [ "$took" -gt "$COMPILE_BUDGET" ]; then
+        echo "$NAME: FAIL (compile time)"
+        exit 1
+    fi
+fi
 
 for lanes in auto 32 32r 64 64s 128 128s 256 512; do
     echo "== in-process, lanes $lanes"

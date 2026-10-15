@@ -19,6 +19,7 @@
 #include "device/executor.h"
 #include "device/properties.h"
 #include "device/vram.h"
+#include "device/width_tuning.h"
 
 namespace cpusim {
 
@@ -30,6 +31,11 @@ namespace cpusim {
 // 0x600000000000 one program in fifty found its own code there, could not
 // reserve the range, and saw every device pointer refused.
 constexpr uint64_t kPreferredVramBase = 0x200000000000ull;
+// The lowest address the kernel may load a PIE executable at; up to 16 TiB of
+// VRAM must end below it.
+constexpr uint64_t kLowestPieBase = 0x555555554000ull;
+static_assert(kPreferredVramBase + (16ull << 40) <= kLowestPieBase,
+              "the VRAM range would overlap where PIE executables are loaded");
 
 // Monotonic counters. Busy times feed the utilization numbers in cpu-smi.
 struct DeviceCounters {
@@ -140,13 +146,6 @@ private:
         std::vector<void*> modules;                // dlopen handles
         int running = 0;                           // launches in flight
         int output_fd = 1;                         // device printf (owned unless 1)
-        // Per block shape: which width runs fastest, measured on the first launches.
-        struct Tuning {
-            std::vector<uint32_t> candidates;  // lane widths still to try, then the winner
-            std::vector<uint64_t> ns;
-            size_t first_round = 0;  // candidates in the first round, once it is done
-            uint32_t chosen = 0;
-        };
         struct FunctionInfo {
             uint64_t profiled = 0;  // instrumented twin
             // With W the warp size (cpusim_kernel_meta.warp_size):
@@ -157,7 +156,7 @@ private:
             uint64_t refill = 0;    // __cpusim_entryr_: warp entry whose lanes refill (CPUSIM_META_REFILL)
             std::string name;       // the kernel's (mangled), for messages
             cpusim_kernel_meta meta{};
-            std::map<uint64_t, Tuning> tuning;  // key: block shape
+            std::map<uint64_t, WidthTuning> tuning;  // key: block shape; which width runs fastest
             // Launches of a wmma GEMM candidate, by grid, block and
             // parameters: the GEMM they compute (type 0: not one).
             std::map<std::string, GemmArgs> gemm_plans;
@@ -177,7 +176,7 @@ private:
         }();
         return per_worker * executor_->workers();
     }
-    static constexpr int kTrialRounds = 2;
+    static constexpr int kTrialRounds = WidthTuning::kRounds;
     // A width to try, with its entry point.
     struct Trial {
         uint32_t lanes;

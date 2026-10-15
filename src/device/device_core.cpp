@@ -297,12 +297,6 @@ Error DeviceCore::memcpy_dtod(uint32_t id, uint64_t dst, uint64_t src, uint64_t 
 
 namespace {
 
-// Widths are lane counts; kSuspend marks the 64/128-lane variants that still
-// suspend at barriers (several groups per block, like 32), kRefill the warp
-// entry whose lanes refill.
-constexpr uint32_t kSuspend = 0x10000;
-constexpr uint32_t kRefill = 0x40000;
-const char* width_suffix(uint32_t w) { return w & kSuspend ? "s" : w & kRefill ? "r" : ""; }
 
 // Kernel modules are loaded from a real file named after their content, so
 // profilers (perf report/annotate) can find the code and its symbols after
@@ -674,20 +668,13 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     return Error::Success;
 }
 
-// Candidate widths for a launch: 32 (warp by warp), and the wider variants
-// that are valid for it. A kernel with barriers may only use a variant whose
-// width covers the whole block; one without barriers can use any.
-// CPUSIM_LANES=<n> forces a width when it is valid.
+// The width of a launch: forced (CPUSIM_LANES=<n>, <n>s or <n>r, when valid),
+// the one measured fastest for this kernel and block shape, or the next one
+// to measure (valid_widths, WidthTuning).
 uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& cfg, uint64_t* entry,
                                 uint64_t* tuning_key, std::vector<Trial>* trials) {
-    static const uint32_t forced = [] {
-        const char* v = std::getenv("CPUSIM_LANES");
-        if (!v) return 0u;
-        uint32_t w = uint32_t(std::atoi(v));
-        return std::strchr(v, 's') ? w | kSuspend : std::strchr(v, 'r') ? w | kRefill : w;
-    }();
+    static const uint32_t forced = parse_width(std::getenv("CPUSIM_LANES"));
     const uint64_t threads = uint64_t(cfg.block[0]) * cfg.block[1] * cfg.block[2];
-    const bool barriers = fn.meta.flags & CPUSIM_META_HAS_BARRIERS;
     const uint32_t warp = fn.meta.warp_lanes;     // the warp entry
     const uint32_t two = 2 * fn.meta.warp_size;   // the narrowest wide variant
     auto entry_for = [&](uint32_t w) -> uint64_t {
@@ -699,32 +686,14 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
             if (two << i == w) return fn.wide[i];
         return 0;
     };
-    std::vector<uint32_t> valid{warp};
-    for (int i = 0; i < 2; ++i)
-        if (fn.susp[i] && (two << i) < threads) valid.push_back(two << i | kSuspend);
-    for (int i = 0; i < 5; ++i) {
-        uint32_t w = two << i;
-        if (!fn.wide[i]) continue;
-        if (barriers) {
-            if (threads <= w) {
-                valid.push_back(w);
-                break;  // the smallest covering width is enough
-            }
-        } else if (w <= threads) {
-            valid.push_back(w);
-        }
-    }
-    // Lanes that refill: for warps whose lanes loop for different counts.
-    if (fn.refill) valid.push_back(warp | kRefill);
-    // With barriers, the wide variants come first: the warp entry, which
-    // suspends at every barrier, has been the slowest every time we measured
-    // (matmul_tiled, scan, heat2d, fdtd3d), and a program too short for the
-    // measurement to finish keeps running the first candidates.
-    if (barriers) std::stable_sort(valid.begin(), valid.end(), [&](uint32_t a, uint32_t b) {
-        auto rank = [&](uint32_t w) { return w == warp ? 3 : (w & kSuspend) ? 2 : 0; };
-        return rank(a) < rank(b) || (rank(a) == rank(b) && (a & 0xffff) > (b & 0xffff));
-    });
-    // CPUSIM_LANES=<n>, or <n>s for a suspending variant, <n>r for lanes that refill.
+    KernelVariants v;
+    v.warp_lanes = warp;
+    v.warp_size = fn.meta.warp_size;
+    v.barriers = fn.meta.flags & CPUSIM_META_HAS_BARRIERS;
+    for (int i = 0; i < 2; ++i) v.susp[i] = fn.susp[i] != 0;
+    for (int i = 0; i < 5; ++i) v.wide[i] = fn.wide[i] != 0;
+    v.refill = fn.refill != 0;
+    const std::vector<uint32_t> valid = valid_widths(v, threads);
     if (forced) {
         for (uint32_t w : valid)
             if (w == forced) {
@@ -736,13 +705,11 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
     if (valid.size() == 1) return warp;
 
     uint64_t key = (uint64_t(cfg.block[0]) << 40) ^ (uint64_t(cfg.block[1]) << 20) ^ cfg.block[2];
-    Context::Tuning& t = fn.tuning[key];
-    if (t.candidates.empty() && !t.chosen) {
+    WidthTuning& t = fn.tuning[key];
+    if (!t.started()) {
         // The measure is the workers' time per block (Executor::run), so it
-        // holds for small slices and small launches alike. Two rounds, every
-        // candidate once per round, keeping each one's best: warm-up and clock
-        // changes hit all of them alike.
-        for (int r = 0; r < kTrialRounds; ++r) t.candidates.insert(t.candidates.end(), valid.begin(), valid.end());
+        // holds for small slices and small launches alike.
+        t.start(valid);
         // A launch with enough blocks measures every candidate on slices of
         // its own blocks and runs the rest with the winner: the choice is made
         // in the first launch. Smaller launches measure one candidate per
@@ -756,8 +723,8 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
             return trials->front().lanes;
         }
     }
-    uint32_t w = t.chosen ? t.chosen : t.candidates[t.ns.size()];
-    if (!t.chosen) *tuning_key = key;
+    uint32_t w = t.chosen() ? t.chosen() : t.next();
+    if (!t.chosen()) *tuning_key = key;
     *entry = entry_for(w);
     return w;
 }
@@ -769,16 +736,17 @@ void DeviceCore::choose_width(uint32_t id, uint64_t function, uint64_t key, cons
     if (it == contexts_.end()) return;
     auto fn = it->second.functions.find(function);
     if (fn == it->second.functions.end()) return;
-    Context::Tuning& t = fn->second.tuning[key];
-    size_t best = size_t(std::min_element(ns.begin(), ns.end()) - ns.begin());
-    t.chosen = trials[best].lanes;
+    WidthTuning& t = fn->second.tuning[key];
+    std::vector<uint32_t> lanes;
+    for (const Trial& tr : trials) lanes.push_back(tr.lanes);
+    t.choose(lanes, ns);
     if (std::getenv("CPUSIM_VERBOSE")) {
         std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, in the first launch (us per 1000 blocks, best of %d slices of %llu)",
                      fn->second.name.c_str(), (unsigned long long)(key >> 40), (unsigned long long)((key >> 20) & 0xfffff),
                      (unsigned long long)(key & 0xfffff), kTrialRounds, (unsigned long long)trial_blocks());
         for (size_t i = 0; i < trials.size(); ++i)
             std::fprintf(stderr, " %u%s:%.1f", trials[i].lanes & 0xffff, width_suffix(trials[i].lanes), ns[i] / 1e3);
-        std::fprintf(stderr, " -> %u%s lanes\n", t.chosen & 0xffff, width_suffix(t.chosen));
+        std::fprintf(stderr, " -> %u%s lanes\n", t.chosen() & 0xffff, width_suffix(t.chosen()));
     }
 }
 
@@ -788,44 +756,16 @@ void DeviceCore::record_timing(uint32_t id, uint64_t function, uint64_t key, uin
     if (it == contexts_.end()) return;
     auto fn = it->second.functions.find(function);
     if (fn == it->second.functions.end()) return;
-    Context::Tuning& t = fn->second.tuning[key];
-    if (t.chosen || t.ns.size() >= t.candidates.size() || t.candidates[t.ns.size()] != lanes) return;
-    t.ns.push_back(ns);
-    const size_t n = t.first_round ? t.first_round : t.candidates.size() / kTrialRounds;
-    if (!t.first_round && t.ns.size() == n) {
-        // First round done. The second one only separates candidates within
-        // 1.5x of the best; the others cannot win and are not run again
-        // (each run is a whole launch with that width, and a program that
-        // launches a shape a few times would spend them all measuring).
-        t.first_round = n;
-        const uint64_t best = *std::min_element(t.ns.begin(), t.ns.end());
-        t.candidates.resize(n);
-        for (int r = 1; r < kTrialRounds; ++r)
-            for (size_t i = 0; i < n; ++i)
-                if (t.ns[i] <= best + best / 2) t.candidates.push_back(t.candidates[i]);
-        if (t.candidates.size() == n + kTrialRounds - 1) t.candidates.resize(n);  // only one left: no need
-    }
-    if (t.ns.size() == t.candidates.size()) {
-        // Each candidate's best over its runs.
-        std::vector<uint64_t> best_ns(t.ns.begin(), t.ns.begin() + n);
-        for (size_t k = n; k < t.ns.size(); ++k)
-            for (size_t i = 0; i < n; ++i)
-                if (t.candidates[i] == t.candidates[k]) best_ns[i] = std::min(best_ns[i], t.ns[k]);
-        size_t best = 0;
-        for (size_t i = 0; i < n; ++i) {
-            t.ns[i] = best_ns[i];
-            if (t.ns[i] < t.ns[best]) best = i;
-        }
-        t.chosen = t.candidates[best];
-        if (std::getenv("CPUSIM_VERBOSE")) {
-            std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, over launches (us of launch time per 1000 blocks, best run)",
-                         fn->second.name.c_str(), (unsigned long long)(key >> 40),
-                         (unsigned long long)((key >> 20) & 0xfffff), (unsigned long long)(key & 0xfffff));
-            for (size_t i = 0; i < n; ++i)
-                std::fprintf(stderr, " %u%s:%.1f", t.candidates[i] & 0xffff, width_suffix(t.candidates[i]),
-                             t.ns[i] / 1e3);
-            std::fprintf(stderr, " -> %u%s lanes\n", t.chosen & 0xffff, width_suffix(t.chosen));
-        }
+    WidthTuning& t = fn->second.tuning[key];
+    if (!t.record(lanes, ns)) return;
+    if (std::getenv("CPUSIM_VERBOSE")) {
+        std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, over launches (us of launch time per 1000 blocks, best run)",
+                     fn->second.name.c_str(), (unsigned long long)(key >> 40),
+                     (unsigned long long)((key >> 20) & 0xfffff), (unsigned long long)(key & 0xfffff));
+        for (size_t i = 0; i < t.first_round(); ++i)
+            std::fprintf(stderr, " %u%s:%.1f", t.candidates()[i] & 0xffff, width_suffix(t.candidates()[i]),
+                         t.times()[i] / 1e3);
+        std::fprintf(stderr, " -> %u%s lanes\n", t.chosen() & 0xffff, width_suffix(t.chosen()));
     }
 }
 

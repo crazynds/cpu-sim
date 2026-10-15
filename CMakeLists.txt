@@ -35,6 +35,7 @@ add_library(cpusim_device STATIC
     src/device/device.cpp
     src/device/debug_exec.cpp
     src/device/device_core.cpp
+    src/device/width_tuning.cpp
     src/device/executor.cpp
     src/device/amx_gemm.cpp
     src/device/wmma_trace.cpp
@@ -54,7 +55,8 @@ target_compile_options(cpusim_tensor PRIVATE -O3)
 # Our CUDA runtime replacement, linked into programs built by cucc.
 # Named libcpusim_cudart so it never collides with NVIDIA's libcudart on the
 # library path (LD_LIBRARY_PATH would win over our RUNPATH).
-add_library(cudart SHARED src/cudart/runtime.cpp src/cudart/streams.cpp)
+add_library(cudart SHARED src/cudart/runtime.cpp src/cudart/module.cpp src/cudart/launch.cpp
+                          src/cudart/memory.cpp src/cudart/graph.cpp src/cudart/streams.cpp)
 set_target_properties(cudart PROPERTIES OUTPUT_NAME cpusim_cudart)
 target_include_directories(cudart PUBLIC include)
 target_link_libraries(cudart PRIVATE cpusim_device)
@@ -87,7 +89,11 @@ if(LLVM_FOUND AND LLVM_VERSION_MAJOR EQUAL 19)
     message(STATUS "LLVM ${LLVM_PACKAGE_VERSION}: ${LLVM_INSTALL_PREFIX}")
     add_executable(cpusim-devc
         src/compiler/main.cpp
+        src/compiler/passes.cpp
         src/compiler/simt.cpp
+        src/compiler/simt_memory.cpp
+        src/compiler/simt_ops.cpp
+        src/compiler/simt_emit.cpp
         src/compiler/uniformity.cpp
         src/compiler/wmma_trace.cpp
         src/compiler/refill.cpp
@@ -120,6 +126,10 @@ enable_testing()
 add_executable(test_allocator tests/test_allocator.cpp)
 target_link_libraries(test_allocator PRIVATE cpusim_device)
 add_test(NAME allocator COMMAND test_allocator)
+
+add_executable(test_width tests/test_width.cpp)
+target_link_libraries(test_width PRIVATE cpusim_device)
+add_test(NAME width_selection COMMAND test_width)
 
 add_executable(test_config tests/test_config.cpp)
 target_link_libraries(test_config PRIVATE cpusim_common)
@@ -164,6 +174,13 @@ if(TARGET cpusim-devc)
         set_tests_properties(cuda_warp_size_${warp} PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL|LLVM ERROR"
                              ENVIRONMENT "CPUSIM_WARP_SIZE=${warp}" LABELS features TIMEOUT 120)
     endforeach()
+    # Kernels that once took minutes to compile (heavy_kernels.cu): a
+    # compile time budget on top of the checks at every width.
+    add_test(NAME cuda_heavy_kernels
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_feature_test.sh ${CMAKE_BINARY_DIR}/cucc
+                $<TARGET_FILE:cpusimd> ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/heavy_kernels.cu)
+    set_tests_properties(cuda_heavy_kernels PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL" LABELS features
+                         ENVIRONMENT "COMPILE_BUDGET=60" TIMEOUT 300)
     # Compares durations (concurrent streams): alone, or other tests' load
     # decides the result.
     set_tests_properties(cuda_async PROPERTIES RUN_SERIAL TRUE)
