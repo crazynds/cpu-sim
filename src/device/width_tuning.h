@@ -81,8 +81,6 @@ public:
 
     bool started() const { return !cands_.empty() || chosen_; }
     void start(const std::vector<uint32_t>& valid);
-    // A width decided before (WidthDecisions): no measurement.
-    void adopt(uint32_t lanes) { chosen_ = lanes; }
     uint32_t chosen() const { return chosen_; }
     // The width the next launch runs (only while nothing is chosen).
     uint32_t next() const { return cands_[schedule_[pos_]]; }
@@ -94,9 +92,9 @@ public:
     void choose(const std::vector<uint32_t>& lanes, const std::vector<std::vector<uint64_t>>& slices);
 
     // For messages: the candidates and each one's median time so far, and
-    // all its times ("100.2 [91.0-130.5]", us per 1000 blocks).
+    // all its times ("100.2 [91.0-130.5]", us per 1000 blocks); once
+    // decided, as they were then.
     const std::vector<uint32_t>& candidates() const { return cands_; }
-    std::vector<uint64_t> medians() const;
     std::string describe() const;
     // Chosen by the rule for short launches, not by the times.
     bool short_launches() const { return chosen_ && round_ == 1 && first_work_ < kShortNs; }
@@ -113,32 +111,23 @@ private:
     int round_ = 0;
     bool warm_ = false;  // the warm-up launch is done
     uint64_t first_work_ = 0;  // the most work of a launch in the first round
+    std::string summary_;      // the times, once decided (describe())
+    void finish();             // decided: drops the times
     uint32_t chosen_ = 0;
 };
 
-// The widths decided for kernels while the daemon runs: a kernel measured for
-// a block shape in one program is not measured again in the next ones that
-// run the same code (they start at the decided width, and decide alike). In
-// memory only, gone with the daemon. The key is the code (a hash of the
-// module and the kernel's name), the block shape and the number of workers.
-class WidthDecisions {
-public:
-    struct Key {
-        uint64_t code = 0, shape = 0;
-        uint32_t workers = 0;
-        bool operator<(const Key& o) const {
-            return std::tie(code, shape, workers) < std::tie(o.code, o.shape, o.workers);
-        }
-    };
-    static constexpr size_t kMaxEntries = 1 << 16;
-
-    uint32_t find(const Key& k) const;  // 0: none
-    void store(const Key& k, uint32_t lanes);
-    size_t size() const;
-
-private:
-    mutable std::mutex mutex_;
-    std::map<Key, uint32_t> map_;
+// What a measurement is for: one kernel's code (a hash of its module and its
+// name), a block shape, and the number of workers. The daemon keeps one
+// measurement per key while it runs, across programs: a program too short to
+// finish it (one launch, ten) leaves it where the next program that runs the
+// same code picks it up, and once it is decided only the width remains (the
+// times are dropped). In memory only, gone with the daemon.
+struct WidthKey {
+    uint64_t code = 0, shape = 0;
+    uint32_t workers = 0;
+    bool operator<(const WidthKey& o) const {
+        return std::tie(code, shape, workers) < std::tie(o.code, o.shape, o.workers);
+    }
 };
 
 }  // namespace cpusim

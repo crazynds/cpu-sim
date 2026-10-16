@@ -81,6 +81,7 @@ bool WidthTuning::record(uint32_t lanes, uint64_t ns, uint64_t work_ns) {
     // A round is done.
     if (round_ == 1 && first_work_ < kShortNs) {
         chosen_ = cands_[0];
+        finish();
         return true;
     }
     if (round_ == 1) {
@@ -95,6 +96,7 @@ bool WidthTuning::record(uint32_t lanes, uint64_t ns, uint64_t work_ns) {
     pos_ = 0;
     if (++round_ <= kRounds && schedule_.size() > 1) return false;
     chosen_ = cands_[decide(samples_)];
+    finish();
     return true;
 }
 
@@ -102,18 +104,21 @@ void WidthTuning::choose(const std::vector<uint32_t>& lanes, const std::vector<s
     cands_ = lanes;
     samples_ = slices;
     chosen_ = cands_[decide(samples_)];
+    finish();
 }
 
-std::vector<uint64_t> WidthTuning::medians() const {
-    std::vector<uint64_t> m;
-    for (const auto& s : samples_) m.push_back(s.empty() ? 0 : median(s));
-    return m;
+void WidthTuning::finish() {
+    summary_ = describe();  // for messages
+    samples_.clear();       // only the decision stays
+    samples_.shrink_to_fit();
+    schedule_.clear();
 }
 
 std::string WidthTuning::describe() const {
+    if (chosen_ && !summary_.empty()) return summary_;
     std::string out;
     char buf[96];
-    for (size_t i = 0; i < cands_.size(); ++i) {
+    for (size_t i = 0; i < cands_.size() && i < samples_.size(); ++i) {
         const auto& s = samples_[i];
         if (s.empty()) {
             std::snprintf(buf, sizeof(buf), " %u%s:-", cands_[i] & 0xffff, width_suffix(cands_[i]));
@@ -125,22 +130,6 @@ std::string WidthTuning::describe() const {
         out += buf;
     }
     return out;
-}
-
-uint32_t WidthDecisions::find(const Key& k) const {
-    std::lock_guard lock(mutex_);
-    auto it = map_.find(k);
-    return it == map_.end() ? 0 : it->second;
-}
-
-void WidthDecisions::store(const Key& k, uint32_t lanes) {
-    std::lock_guard lock(mutex_);
-    if (map_.size() < kMaxEntries || map_.count(k)) map_[k] = lanes;
-}
-
-size_t WidthDecisions::size() const {
-    std::lock_guard lock(mutex_);
-    return map_.size();
 }
 
 }  // namespace cpusim

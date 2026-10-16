@@ -103,12 +103,17 @@ Wider groups give the core more independent work per instruction stream; they al
 
 ### 4.4 Choosing the width
 
-The runtime measures the valid candidates and keeps the fastest, per kernel and block shape, until the program ends ([03](docs/optimization/iteration-2/03-automatic-width-selection.md)):
+The device measures the valid candidates and keeps the fastest per kernel code, block shape and number of workers (`device/width_tuning.h`, tested on its own by `tests/test_width.cpp`). The rule is built so that the same program decides the same way each time, not only so that it finds the fastest ([03](docs/optimization/iteration-2/03-automatic-width-selection.md) has the first version):
 
-- **Large launches** measure inside the first launch: each candidate runs a slice of the launch's own blocks (32 per worker by default, `CPUSIM_TRIAL_BLOCKS`), in two rounds back to back keeping each candidate's best slice, and the rest of the launch runs with the winner. The measure is the workers' time per block, not the wall time of the slice.
-- **Small launches** measure one candidate per launch, by wall time per block. After the first round only candidates within 1.5x of the best are run again, so a program that launches a shape a few times does not spend them all measuring.
-- **Order of the candidates.** With barriers: wide, then suspending, and the 32-lane variant last, since a program that ends before the measurement does keeps the first ones, and the 32-lane variant, which suspends at every barrier, was the slowest on every barrier kernel measured.
-- `CPUSIM_LANES=<n>`, `<n>s` or `<n>r` (lanes that refill) forces a width; `CPUSIM_VERBOSE=1` prints the measurements and the choice.
+- **Large launches** measure inside the first launch: each candidate runs a slice of the launch's own blocks (32 per worker, `CPUSIM_TRIAL_BLOCKS`), in 5 rounds back to back; the measure is the workers' time per block.
+- **Smaller launches** measure one candidate per launch, by the launch's critical path (the longest a worker spent on it), which leaves out the round trip and the workers' wake-up: with the wall time, the same width measured 2-4x apart from one launch to the next. A first launch only warms up (first touch of the data, cold caches), then 5 rounds of every candidate, interleaved; after the first round a candidate 3x slower than the best is dropped.
+- **Short launches** (under 1 ms of work in the first round) take the first candidate unmeasured: there the fixed cost of a launch outweighs the width, and the executor's choice of how many workers to call, learned launch after launch, made the candidates run unlike each other.
+- **The decision**: each candidate's median, and among those within 10% of the best, the first in the order of the candidates. Near-equal widths are decided by that order, the same way every time, instead of by the noise.
+- **Across programs**: the measurement belongs to the daemon, not to the program, while the daemon runs. A program with one launch or ten leaves it where the next program running the same code picks it up (HeCBench rsbench: 32 lanes until its 13th run, 2.6x faster from then on); once decided only the width is kept. Nothing is written to disk.
+- **Order of the candidates.** Without barriers: 32, then wider, then lanes that refill. With barriers: wide, then suspending, and the 32-lane variant last, since a program that ends before the measurement does keeps the first ones, and the 32-lane variant, which suspends at every barrier, was the slowest on every barrier kernel measured.
+- `CPUSIM_LANES=<n>`, `<n>s` or `<n>r` (lanes that refill) forces a width; `CPUSIM_VERBOSE=1` prints each candidate's median and range, and the choice.
+
+How close the choice comes to the best forced width, kernel by kernel, is measured by `bench/track/oracle.sh`; how often fresh daemons decide alike, by `bench/track/stability.py`. On the 49 tracked programs, 62 of 73 kernels are within 10% of the best width (45 before these rules); fresh daemons still differ on kernels whose widths are within about 15% of each other, on a server shared with other work.
 
 Every width produces the same bits: a test suite checks it, with the selection switching widths in the middle of a program ([23](docs/optimization/iteration-3/23-reproducibility-and-stability.md)).
 

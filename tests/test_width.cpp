@@ -3,6 +3,7 @@
 // keeps. No kernel runs here, so the result does not depend on the machine.
 #include <algorithm>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "check.h"
@@ -166,25 +167,30 @@ int main() {
         EXPECT(u.chosen() == 128 && !u.short_launches());
     }
 
-    // --- decisions kept while the daemon runs
+    // --- the measurement is kept per code, shape and workers, across
+    // programs; once decided only the width (and its summary) remain
     {
-        const WidthDecisions::Key a{0x1234, (uint64_t(256) << 40) | (1 << 20) | 1, 62};
-        const WidthDecisions::Key b{0x1234, (uint64_t(128) << 40) | (1 << 20) | 1, 62};  // another shape
-        const WidthDecisions::Key c{0x1234, a.shape, 30};                                // other workers
-        const WidthDecisions::Key d{0x5678, a.shape, 62};                                // other code
-        WidthDecisions m;
-        EXPECT(m.find(a) == 0);
-        m.store(a, 64 | kSuspend);
-        m.store(b, 128);
-        EXPECT(m.find(a) == (64 | kSuspend));
-        EXPECT(m.find(b) == 128);
-        EXPECT(m.find(c) == 0 && m.find(d) == 0);
-        EXPECT(m.size() == 2);
-        // A decision adopted by the tuning: chosen, nothing to measure.
+        const WidthKey a{0x1234, (uint64_t(256) << 40) | (1 << 20) | 1, 62};
+        const WidthKey b{0x1234, (uint64_t(128) << 40) | (1 << 20) | 1, 62};  // another shape
+        const WidthKey c{0x1234, a.shape, 30};                                // other workers
+        const WidthKey d{0x5678, a.shape, 62};                                // other code
+        EXPECT(a < b || b < a);
+        EXPECT(a < c || c < a);
+        EXPECT(a < d || d < a);
+        EXPECT(!(a < a));
+        // A program of one launch leaves the measurement where the next one
+        // picks it up: one launch per program.
         WidthTuning t;
-        t.adopt(64);
-        EXPECT(t.started() && t.chosen() == 64);
-        EXPECT(!t.record(64, 1));
+        t.start(W{32, 64});
+        int programs = 0;
+        while (!t.chosen()) {
+            const uint32_t w = t.next();  // this program's only launch
+            t.record(w, w == 64 ? 60 : 100);
+            ++programs;
+        }
+        EXPECT(t.chosen() == 64 && programs == 1 + 2 * 5);
+        const std::string summary = t.describe();
+        EXPECT(summary.find("64:0.1") != std::string::npos);  // the times as they were
     }
     TEST_MAIN_END();
 }

@@ -156,9 +156,8 @@ private:
             uint64_t trace = 0;     // __cpusim_trace_: a wmma GEMM candidate (wmma_trace.h)
             uint64_t refill = 0;    // __cpusim_entryr_: warp entry whose lanes refill (CPUSIM_META_REFILL)
             std::string name;       // the kernel's (mangled), for messages
-            uint64_t code = 0;      // its code: a hash of its module and its name (WidthDecisions)
+            uint64_t code = 0;      // its code: a hash of its module and its name (WidthKey)
             cpusim_kernel_meta meta{};
-            std::map<uint64_t, WidthTuning> tuning;  // key: block shape; which width runs fastest
             // Launches of a wmma GEMM candidate, by grid, block and
             // parameters: the GEMM they compute (type 0: not one).
             std::map<std::string, GemmArgs> gemm_plans;
@@ -191,7 +190,11 @@ private:
     uint32_t choose_width(uint32_t ctx, uint64_t function, uint64_t key, const std::vector<Trial>& trials,
                           const std::vector<std::vector<uint64_t>>& slices);
     void record_timing(uint32_t ctx, uint64_t function, uint64_t key, uint32_t lanes, uint64_t ns, uint64_t work_ns);
-    WidthDecisions decisions_;  // widths decided while the daemon runs, for the same code
+    // The width measurements, across programs, while the daemon runs (WidthKey).
+    static constexpr size_t kMaxTunings = 1 << 16;
+    std::map<WidthKey, WidthTuning> tunings_;
+    // The measurement for a function and block shape (null: too many kept).
+    WidthTuning* tuning(const Context::FunctionInfo& fn, uint64_t shape);
 
     Config cfg_;
     Topology topo_;

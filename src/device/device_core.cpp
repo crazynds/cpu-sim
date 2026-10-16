@@ -713,12 +713,9 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
     if (valid.size() == 1) return warp;
 
     uint64_t key = (uint64_t(cfg.block[0]) << 40) ^ (uint64_t(cfg.block[1]) << 20) ^ cfg.block[2];
-    WidthTuning& t = fn.tuning[key];
-    // Decided for this code before, in this program or an earlier one.
-    if (!t.started())
-        if (const uint32_t w = decisions_.find({fn.code, key, uint32_t(executor_->workers())});
-            w && std::find(valid.begin(), valid.end(), w) != valid.end())
-            t.adopt(w);
+    WidthTuning* tp = tuning(fn, key);
+    if (!tp) return warp;
+    WidthTuning& t = *tp;
     if (!t.started()) {
         // The measure is the workers' time per block (Executor::run), so it
         // holds for small slices and small launches alike.
@@ -742,6 +739,14 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
     return w;
 }
 
+WidthTuning* DeviceCore::tuning(const Context::FunctionInfo& fn, uint64_t shape) {
+    const WidthKey key{fn.code, shape, uint32_t(executor_->workers())};
+    auto it = tunings_.find(key);
+    if (it != tunings_.end()) return &it->second;
+    if (tunings_.size() >= kMaxTunings) return nullptr;
+    return &tunings_[key];
+}
+
 uint32_t DeviceCore::choose_width(uint32_t id, uint64_t function, uint64_t key, const std::vector<Trial>& trials,
                                   const std::vector<std::vector<uint64_t>>& slices) {
     std::vector<uint32_t> lanes;
@@ -753,9 +758,10 @@ uint32_t DeviceCore::choose_width(uint32_t id, uint64_t function, uint64_t key, 
     if (it == contexts_.end()) return chosen.chosen();
     auto fn = it->second.functions.find(function);
     if (fn == it->second.functions.end()) return chosen.chosen();
-    WidthTuning& t = fn->second.tuning[key];
+    WidthTuning* tp = tuning(fn->second, key);
+    if (!tp) return chosen.chosen();
+    WidthTuning& t = *tp;
     t = chosen;
-    decisions_.store({fn->second.code, key, uint32_t(executor_->workers())}, t.chosen());
     if (std::getenv("CPUSIM_VERBOSE")) {
         std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, in the first launch (us per 1000 blocks, median [range] of %d slices of %llu)",
                      fn->second.name.c_str(), (unsigned long long)(key >> 40), (unsigned long long)((key >> 20) & 0xfffff),
@@ -772,9 +778,10 @@ void DeviceCore::record_timing(uint32_t id, uint64_t function, uint64_t key, uin
     if (it == contexts_.end()) return;
     auto fn = it->second.functions.find(function);
     if (fn == it->second.functions.end()) return;
-    WidthTuning& t = fn->second.tuning[key];
+    WidthTuning* tp = tuning(fn->second, key);
+    if (!tp) return;
+    WidthTuning& t = *tp;
     if (!t.record(lanes, ns, work_ns)) return;
-    decisions_.store({fn->second.code, key, uint32_t(executor_->workers())}, t.chosen());
     if (std::getenv("CPUSIM_VERBOSE")) {
         std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, over launches (us of critical path per 1000 blocks, median [range] of the runs; -: dropped)",
                      fn->second.name.c_str(), (unsigned long long)(key >> 40),
