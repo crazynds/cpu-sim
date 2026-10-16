@@ -190,7 +190,7 @@ private:
     // candidate's slice times, one per round.
     uint32_t choose_width(uint32_t ctx, uint64_t function, uint64_t key, const std::vector<Trial>& trials,
                           const std::vector<std::vector<uint64_t>>& slices);
-    void record_timing(uint32_t ctx, uint64_t function, uint64_t key, uint32_t lanes, uint64_t ns);
+    void record_timing(uint32_t ctx, uint64_t function, uint64_t key, uint32_t lanes, uint64_t ns, uint64_t work_ns);
     WidthDecisions decisions_;  // widths decided while the daemon runs, for the same code
 
     Config cfg_;

@@ -69,15 +69,20 @@ size_t WidthTuning::decide(const std::vector<std::vector<uint64_t>>& times) {
     return 0;
 }
 
-bool WidthTuning::record(uint32_t lanes, uint64_t ns) {
+bool WidthTuning::record(uint32_t lanes, uint64_t ns, uint64_t work_ns) {
     if (chosen_ || pos_ >= schedule_.size() || cands_[schedule_[pos_]] != lanes) return false;
     if (!warm_) {
         warm_ = true;
         return false;
     }
     samples_[schedule_[pos_]].push_back(ns);
+    if (round_ == 1) first_work_ = std::max(first_work_, work_ns);
     if (++pos_ < schedule_.size()) return false;
     // A round is done.
+    if (round_ == 1 && first_work_ < kShortNs) {
+        chosen_ = cands_[0];
+        return true;
+    }
     if (round_ == 1) {
         uint64_t best = UINT64_MAX;
         for (const auto& s : samples_) best = std::min(best, s.front());

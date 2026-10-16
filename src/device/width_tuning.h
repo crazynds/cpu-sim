@@ -58,6 +58,13 @@ std::vector<uint32_t> valid_widths(const KernelVariants& v, uint64_t threads);
 //    clock or of the machine's load hits all of them alike. After the first
 //    round, a candidate more than kDrop times slower than the best is not run
 //    again (each run is a whole launch; a 20x slower one costs 20 launches).
+// Short launches are not measured: when the first round's launches did less
+// than kShortNs of work in all (the workers' time summed), the first
+// candidate in the order of valid_widths is chosen. There the launch's fixed
+// cost outweighs the width, the time a worker takes is mostly noise, and the
+// executor calls a number of workers it learns from launch to launch, so
+// the candidates did not even run alike (a 12 us kernel picked 128 lanes on
+// one daemon and 64 on the next).
 // The decision: each candidate's median time (one slow or lucky launch does
 // not decide), and among the candidates within kTie of the best, the first
 // in the order of valid_widths. Widths that close are a tie the noise would
@@ -70,6 +77,7 @@ public:
     static constexpr int kRounds = 5;
     static constexpr double kDrop = 3.0;
     static constexpr double kTie = 0.10;
+    static constexpr uint64_t kShortNs = 1000000;
 
     bool started() const { return !cands_.empty() || chosen_; }
     void start(const std::vector<uint32_t>& valid);
@@ -78,10 +86,10 @@ public:
     uint32_t chosen() const { return chosen_; }
     // The width the next launch runs (only while nothing is chosen).
     uint32_t next() const { return cands_[schedule_[pos_]]; }
-    // One launch's time per block with `lanes`. Ignored unless it is the
-    // width next() asked for, and for the warm-up launch. True when this
-    // time made the choice.
-    bool record(uint32_t lanes, uint64_t ns);
+    // One launch's time per block with `lanes`, and its work (the workers'
+    // time summed). Ignored unless it is the width next() asked for, and for
+    // the warm-up launch. True when this launch made the choice.
+    bool record(uint32_t lanes, uint64_t ns, uint64_t work_ns = UINT64_MAX);
     // In-launch trials: each candidate's slice times, one per round.
     void choose(const std::vector<uint32_t>& lanes, const std::vector<std::vector<uint64_t>>& slices);
 
@@ -90,6 +98,8 @@ public:
     const std::vector<uint32_t>& candidates() const { return cands_; }
     std::vector<uint64_t> medians() const;
     std::string describe() const;
+    // Chosen by the rule for short launches, not by the times.
+    bool short_launches() const { return chosen_ && round_ == 1 && first_work_ < kShortNs; }
 
     // The rule itself: the chosen index, given each candidate's times
     // (empty: dropped), in the order of preference.
@@ -102,6 +112,7 @@ private:
     size_t pos_ = 0;                              // the next in schedule_
     int round_ = 0;
     bool warm_ = false;  // the warm-up launch is done
+    uint64_t first_work_ = 0;  // the most work of a launch in the first round
     uint32_t chosen_ = 0;
 };
 

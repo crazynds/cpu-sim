@@ -143,6 +143,29 @@ int main() {
         EXPECT(t.chosen() == 256);  // within 10% of the best: the first
     }
 
+    // Short launches (under 1 ms of work in the first round): the first
+    // candidate, whatever the times, after one round.
+    {
+        WidthTuning t;
+        t.start(W{32, 64, 128});
+        int n = 0;
+        while (!t.chosen()) {
+            const uint32_t w = t.next();
+            t.record(w, w == 128 ? 10 : 30, 400000);  // 0.4 ms of work
+            ++n;
+        }
+        EXPECT(t.chosen() == 32 && t.short_launches());
+        EXPECT(n == 1 + 3);
+        // One launch of the first round over 1 ms: measured as usual.
+        WidthTuning u;
+        u.start(W{32, 64, 128});
+        while (!u.chosen()) {
+            const uint32_t w = u.next();
+            u.record(w, w == 128 ? 10 : 30, w == 64 ? 1500000 : 400000);
+        }
+        EXPECT(u.chosen() == 128 && !u.short_launches());
+    }
+
     // --- decisions kept while the daemon runs
     {
         const WidthDecisions::Key a{0x1234, (uint64_t(256) << 40) | (1 << 20) | 1, 62};

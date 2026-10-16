@@ -669,7 +669,8 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     // for grids that vary.
     const uint64_t launch_blocks = uint64_t(cfg.grid[0]) * cfg.grid[1] * cfg.grid[2];
     if (tuning_key && trials.empty() && launch_span)
-        record_timing(id, function, tuning_key, lanes, launch_span * 1000 / std::max<uint64_t>(launch_blocks, 1));
+        record_timing(id, function, tuning_key, lanes, launch_span * 1000 / std::max<uint64_t>(launch_blocks, 1),
+                      launch_busy);
     counters_.kernels_launched.fetch_add(1, std::memory_order_relaxed);
     if (cfg.profile) counters_.kernels_profiled.fetch_add(1, std::memory_order_relaxed);
     return Error::Success;
@@ -764,20 +765,22 @@ uint32_t DeviceCore::choose_width(uint32_t id, uint64_t function, uint64_t key, 
     return t.chosen();
 }
 
-void DeviceCore::record_timing(uint32_t id, uint64_t function, uint64_t key, uint32_t lanes, uint64_t ns) {
+void DeviceCore::record_timing(uint32_t id, uint64_t function, uint64_t key, uint32_t lanes, uint64_t ns,
+                               uint64_t work_ns) {
     std::lock_guard lock(mutex_);
     auto it = contexts_.find(id);
     if (it == contexts_.end()) return;
     auto fn = it->second.functions.find(function);
     if (fn == it->second.functions.end()) return;
     WidthTuning& t = fn->second.tuning[key];
-    if (!t.record(lanes, ns)) return;
+    if (!t.record(lanes, ns, work_ns)) return;
     decisions_.store({fn->second.code, key, uint32_t(executor_->workers())}, t.chosen());
     if (std::getenv("CPUSIM_VERBOSE")) {
         std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, over launches (us of critical path per 1000 blocks, median [range] of the runs; -: dropped)",
                      fn->second.name.c_str(), (unsigned long long)(key >> 40),
                      (unsigned long long)((key >> 20) & 0xfffff), (unsigned long long)(key & 0xfffff));
-        std::fprintf(stderr, "%s -> %u%s lanes\n", t.describe().c_str(), t.chosen() & 0xffff, width_suffix(t.chosen()));
+        std::fprintf(stderr, "%s -> %u%s lanes%s\n", t.describe().c_str(), t.chosen() & 0xffff, width_suffix(t.chosen()),
+                     t.short_launches() ? " (short launches: the first)" : "");
     }
 }
 
