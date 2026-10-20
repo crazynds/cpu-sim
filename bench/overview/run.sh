@@ -8,7 +8,7 @@
 set -u
 BUILD=$(realpath "$1"); SRC=$(realpath "$2"); OUT=$(realpath -m "$3"); shift 3
 RUNS=${RUNS:-2}; TMO=${TMO:-120}
-NVCC=${NVCC:-/usr/local/cuda/bin/nvcc}; OMPCC=${OMPCC:-$HOME/hec/clang-omp}
+NVCC=${NVCC:-/usr/local/cuda/bin/nvcc}; OMPCC=${OMPCC:-$(dirname "$(realpath "$0")")/clang-omp}
 mkdir -p "$OUT"; CSV=$OUT/results.csv
 [ -f "$CSV" ] || echo "app,form,build,build_s,size_kb,runs_ok,best_s,verdict" > "$CSV"
 # cucc's programs run on a daemon of their own.

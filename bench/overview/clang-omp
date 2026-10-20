@@ -1,0 +1,15 @@
+#!/bin/bash
+# clang++ in place of icpx for HeCBench's -omp Makefiles: host OpenMP, this CPU.
+# The offload flags are dropped, so `target teams` loops run on the host.
+# (CLANGXX: another clang++.)
+args=(); compile=0
+for a in "$@"; do
+  case "$a" in
+    -fiopenmp|-qopenmp|-fopenmp-targets=*|-D__STRICT_ANSI__) ;;
+    -c) compile=1; args+=("$a") ;;
+    *) args+=("$a") ;;
+  esac
+done
+pre=(-O3 -march=native -fopenmp)
+[ $compile = 1 ] && pre+=(-x c++)
+exec ${CLANGXX:-/usr/lib/llvm-19/bin/clang++} "${pre[@]}" "${args[@]}" -I../include

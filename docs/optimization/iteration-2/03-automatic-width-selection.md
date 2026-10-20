@@ -2,6 +2,8 @@
 
 > **In one sentence:** since no group width is the best for every kernel, the runtime tries the candidates in the first launches of each (kernel, block shape), measures what each one costs and starts using the fastest; this document tells how that measurement was fixed three times until it chose correctly.
 
+> **Since then:** the selection was rebuilt in iteration 4 to decide the same way every time (critical path in CPU time, a warm-up, medians of 5 rounds, ties decided by order, short launches unmeasured, the measurement kept across programs): [37](../iteration-4/37-width-selection.md).
+
 The project's general concepts (launch, worker, lane, Gcyc) are in [00-basic-concepts.md](../00-basic-concepts.md). The variants (32, 64, 128, 256, `s`, `c`) are in [02-width-variants.md](../iteration-1/02-width-variants.md).
 
 > **Iteration:** the first version of the selection (one whole launch per candidate) is from iteration 1 and is described in the [original log](../iteration-1/OPTIMIZATIONS.md). This document tells how it was redone in iteration 2 and describes the current algorithm.

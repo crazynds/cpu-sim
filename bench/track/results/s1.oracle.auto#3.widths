@@ -1,0 +1,57 @@
+cpusim: width of _Z13sigmas_kernelIifEvPKT0_PS0_ffifT_i, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:224673.2 64:0.0 128:0.0 32r:158774.1 -> 32r lanes
+cpusim: width of _Z24groupnorm_forward_kernelPKfS0_S0_PfS1_S1_iiiii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 256:0.0 128s:0.0 64s:65.5 32:61.6 -> 64s lanes
+cpusim: width of _Z25groupnorm_forward_kernel2PKfS0_S0_PfS1_S1_iiiii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 256:62.1 128s:0.0 64s:56.2 32:54.9 -> 64s lanes
+cpusim: width of _Z25groupnorm_backward_kernelPKfS0_S0_S0_S0_PfS1_S1_iiiii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 256:101.9 128s:95.2 64s:98.8 32:106.4 -> 256 lanes
+cpusim: width of _Z9kQuantizeILi256ELi256EEvPKfS1_Phi, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 256:130.6 128s:0.0 64s:92.6 32:74.9 -> 32 lanes
+cpusim: width of _Z7presentiiPKhS0_PhS0_S0_S0_S0_S0_, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:2439.0 64:2286.6 128:2437.3 -> 32 lanes
+cpusim: width of _Z9laplace3diiiiPKfPf, block 32x8x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 256:4909.4 128s:0.0 64s:4881.1 32:5609.0 -> 256 lanes
+cpusim: width of _Z14rainflow_countPKdPKiPdPiP7double3S4_i, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:47780.3 64:64805.3 128:82981.3 32r:0.0 -> 32 lanes
+cpusim: width of _Z17rank_gpu_kernel_2Piii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:629.9 64:0.0 128:549.0 -> 128 lanes
+cpusim: width of _Z17rank_gpu_kernel_6PKiPiS0_ii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:666.8 64:0.0 128:651.8 -> 32 lanes
+cpusim: width of _Z17rank_gpu_kernel_3PiPKiii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:683.7 64:620.9 128:566.8 -> 64 lanes
+cpusim: width of _Z17rank_gpu_kernel_4PKiPiS1_ii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 256:464.5 128s:560.0 64s:729.6 32:0.0 -> 256 lanes
+cpusim: width of _Z17rank_gpu_kernel_5PKiPiii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 256:2217.0 128s:0.0 64s:4464.0 32:5725.0 -> 256 lanes
+cpusim: width of _Z9fft1D_512P7double2, block 64x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 64:55.6 32:0.0 -> 64 lanes
+cpusim: width of _Z10ifft1D_512P7double2, block 64x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 64:49.9 32:0.0 -> 64 lanes
+cpusim: width of _Z3sumPKfiPjPVf, block 256x1x1, in the first launch (us per 1000 blocks, median of 3 slices of 3968) 256:5482.0 128s:5249.2 64s:5306.7 32:5283.5 -> 256 lanes
+cpusim: width of _Z9initTablePyy, block 256x1x1, in the first launch (us per 1000 blocks, median of 3 slices of 3968) 32:1780.6 64:1946.9 128:1859.2 -> 32 lanes
+cpusim: width of _Z10base64_encPKhPhcmj, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:49.3 64:52.3 128:58.8 -> 32 lanes
+cpusim: width of _Z9incKernelPiPKiii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:21.8 64:23.2 128:22.8 -> 32 lanes
+cpusim: width of _Z26MurmurHash3_x64_128_kernelPKhPKjS2_Pmj, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:16521.8 64:22202.4 128:27082.3 32r:14537.1 -> 32r lanes
+cpusim: width of _Z13dev_lapl_iterPfPKfffii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:12.2 64:12.1 128:0.0 -> 32 lanes
+cpusim: width of _Z14md5hash_kernelPiPhPjiiijjjj, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:398.9 64:370.1 128:396.1 32r:0.0 -> 32 lanes
+cpusim: width of _Z15jk3_hash_kernelPKjS0_S0_Pji, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:85.3 64:80.0 128:85.3 32r:0.0 -> 32 lanes
+cpusim: width of _Z20accelerate_particlesP8Particleiff, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:32904.3 64:36507.6 128:53826.2 -> 32 lanes
+cpusim: width of _Z16update_particlesP8ParticlePfif, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:1271.3 64:1379.8 128:1206.5 -> 32 lanes
+cpusim: width of _Z15winograd_conv2dPKfS0_Pfii, block 32x8x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:297.3 64:331.0 128:263.7 -> 128 lanes
+cpusim: width of _Z15getOutValOptionPK17optionInputStructPfi, block 256x1x1, in the first launch (us per 1000 blocks, median of 3 slices of 3968) 32:5814.8 64:6120.9 128:6283.9 -> 32 lanes
+cpusim: width of _Z15iso_2dfd_kernelPfPKfS1_fmm, block 16x16x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:0.0 64:0.0 128:13.9 -> 128 lanes
+cpusim: width of _Z6mandelPiPK16MandelParametersii, block 16x16x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:78.0 64:72.7 128:89.7 32r:0.0 -> 32 lanes
+cpusim: width of _Z15PTTWAC_soa_astaiiiPfPiS0_, block 64x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 64:783207.3 32:737187.9 -> 64 lanes
+cpusim: width of _Z13haccmk_kerneliiPKfS0_S0_S0_PfS1_S1_fff, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:97472.5 64:0.0 128:0.0 -> 32 lanes
+cpusim: width of _Z30fast_hadamard_transform_kernelI37fast_hadamard_transform_kernel_traitsILi256ELi12EfEEv18HadamardParamsBase, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 64s:0.0 32:183.7 -> 32 lanes
+cpusim: width of _Z30fast_hadamard_transform_kernelI37fast_hadamard_transform_kernel_traitsILi256ELi12E6__halfEEv18HadamardParamsBase, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 64s:176.0 32:189.5 -> 64s lanes
+cpusim: width of _Z30fast_hadamard_transform_kernelI37fast_hadamard_transform_kernel_traitsILi256ELi12E13__nv_bfloat16EEv18HadamardParamsBase, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 64s:155.7 32:147.1 -> 64s lanes
+cpusim: width of _Z30fast_hadamard_transform_kernelI37fast_hadamard_transform_kernel_traitsILi256ELi15EfEEv18HadamardParamsBase, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 64s:3866.2 32:3187.6 -> 32 lanes
+cpusim: width of _Z30fast_hadamard_transform_kernelI37fast_hadamard_transform_kernel_traitsILi256ELi15E6__halfEEv18HadamardParamsBase, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 64s:3130.8 32:2730.3 -> 32 lanes
+cpusim: width of _Z30fast_hadamard_transform_kernelI37fast_hadamard_transform_kernel_traitsILi256ELi15E13__nv_bfloat16EEv18HadamardParamsBase, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 64s:2832.5 32:2554.2 -> 32 lanes
+cpusim: width of _Z11lombscargleiiPKfS0_S0_Pff, block 256x1x1, in the first launch (us per 1000 blocks, median of 3 slices of 3968) 32:2158.2 64:1438.8 128:1599.9 32r:3425.7 -> 64 lanes
+cpusim: width of _Z12bitonic_sortiiPi, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:4.6 64:4.2 128:5.4 -> 32 lanes
+cpusim: width of _Z5colorPhiiff, block 16x16x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:39.8 64:61.3 128:64.2 -> 32 lanes
+cpusim: width of _Z4rtm8PKfS0_S0_PfS1_S1_S0_m, block 16x16x1, in the first launch (us per 1000 blocks, median of 3 slices of 3968) 32:7090.6 64:6882.8 128:7867.9 -> 32 lanes
+cpusim: width of _Z26add_kernel_non_interleavedP17NON_INTERLEAVED_TPKS_j, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:62128.4 64:86785.8 -> 32 lanes
+cpusim: width of _Z22add_kernel_interleavedP13INTERLEAVED_TPKS_j, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:159167.2 64:329099.8 -> 32 lanes
+cpusim: width of _Z17CompressionKerneliPKyPcPKiPi, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:40443.5 64:37066.5 128:39134.7 -> 32 lanes
+cpusim: width of _Z9hellingerPKfS0_Pfiii, block 16x16x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:1379.5 64:1379.4 128:1378.3 -> 32 lanes
+cpusim: width of _Z22rotate_matrix_parallelPfi, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:363033.3 64:324948.2 128:0.0 32r:587211.4 -> 64 lanes
+cpusim: width of _Z7reversePii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 256:883.0 128s:0.0 64s:0.0 32:0.0 -> 256 lanes
+cpusim: width of _Z4adamIffEvPT_S1_S1_PKT0_fffffim10adamMode_tf, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:2513.5 64:1977.8 128:2326.4 32r:0.0 -> 64 lanes
+cpusim: width of _Z12lud_internalPfmi, block 16x16x1, in the first launch (us per 1000 blocks, median of 3 slices of 3968) 256:2272.2 128s:2246.0 64s:1773.3 32:2190.2 -> 64s lanes
+cpusim: width of _Z7softMaxiiPKfPf, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:12752.9 64:14210.2 128:19691.4 -> 32 lanes
+cpusim: width of _Z3attPKiS0_PfS1_S1_S1_S1_iii, block 128x1x1, in the first launch (us per 1000 blocks, median of 3 slices of 3968) 32:4721171.4 64:2355352.4 128:1295366.0 -> 128 lanes
+cpusim: width of _Z10zero_pointPKfS0_iiibPfPi, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:13.0 64:12.6 128:12.5 -> 32 lanes
+cpusim: width of _Z14cuParallelSqrtPfii, block 16x16x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:0.0 64:225.4 128:188.6 -> 128 lanes
+cpusim: width of _Z15cuInsertionSortPfPiiii, block 256x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:262797.8 64:373605.9 128:398877.4 -> 32 lanes
+cpusim: width of _Z23cuComputeDistanceGlobalPKfiS0_iiPf, block 16x16x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 256:36.6 128s:35.4 64s:34.1 32:39.6 -> 256 lanes
+cpusim: width of _Z29Pathcalc_Portfolio_KernelGPU2PfPKfPKiS1_fiii, block 64x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:2440.2 32r:2436.8 -> 32 lanes
+cpusim: width of _Z28Pathcalc_Portfolio_KernelGPUPfS_PKfPKiS1_fiii, block 64x1x1, over launches (us of critical path per 1000 blocks, median run; 0: dropped) 32:3107.1 32r:0.0 -> 32 lanes

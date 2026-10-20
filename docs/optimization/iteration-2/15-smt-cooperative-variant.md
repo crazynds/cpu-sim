@@ -2,6 +2,8 @@
 
 > **In one sentence:** in the cooperative variant (suffix `c`, for example `128c`), the two logical (SMT) threads of one physical core execute the two halves of a CUDA block **at the same time**, sharing the same shared memory, and each `__syncthreads` becomes a real, very short wait between the two, generated directly in the code, without saving state and without suspending anyone.
 
+> **Since then:** removed in iteration 4. Measured per kernel over 47 HeCBench programs, it never won and was 2 to 50 times slower than the best width: [36](../iteration-4/36-cooperative-variant-false-sharing-and-vram.md).
+
 The project's general concepts (worker, shared memory, variants) are in [00-basic-concepts.md](../00-basic-concepts.md). The handling of the barrier in the other variants is in [09-state-at-barriers.md](../iteration-1/09-state-at-barriers.md).
 
 ## The problem

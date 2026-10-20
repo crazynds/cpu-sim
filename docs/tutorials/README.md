@@ -11,8 +11,9 @@ Each tutorial lists the commands, what the output means, and how to check that a
 | 3 | [The fp32 GEMM duel](03-gemm-duel.md) | GPU vs OpenMP vs `cucc`: kernel time, total time, GFLOPS |
 | 4 | [GEMM ablation](04-gemm-ablation.md) | the effect of each change in the `cucc` version, one at a time |
 | 5 | [Tensor cores and the other benchmarks](05-tensor-cores-and-samples.md) | WMMA and capability gating, every tensor operation (`tensor_ops`), `cpu_gemm`, `tensor_gemm`, function calls (`calls`), `bench/run.sh`, the samples |
+| 6 | [Tracking performance, the width selection and stability](06-tracking.md) | `bench/track`: performance across builds over 49 HeCBench programs, the automatic width against every width, whether fresh drivers decide alike, repeating a failure; `bench/overview`: GPU, `cucc` and OpenMP side by side |
 
-Do them in order: tutorial 1 builds everything the others use, and tutorial 2 gives the reference that tutorials 3 to 5 are compared against.
+Do them in order: tutorial 1 builds everything the others use, and tutorial 2 gives the reference that tutorials 3 to 5 are compared against. Tutorial 6 stands on its own after tutorial 1.
 
 The programs these tutorials use:
 

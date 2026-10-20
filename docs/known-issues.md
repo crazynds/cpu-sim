@@ -2,11 +2,11 @@
 
 Failures seen once or now and then, not reproduced on demand, kept here to look into. Each entry: what was seen, where, and what is known.
 
-## `cudaMemset` "invalid argument" in `sync_locks`
+## `cudaMemset` "invalid argument" in `sync_locks` (fixed)
 
 - **Seen:** 2026-10-13, Xeon Gold 6548Y+ server, the first full stress run (`tests/stress/run.sh both`). `spinlock_block_critical` failed at `stress.cuh:136` (`Buffer::zero`, `cudaMemset(p, 0, n * sizeof(T))`), and the rest of the program did not run.
 - **Not reproduced:** 15 runs right after, the second full run, and a run of the 58 programs in parallel all passed.
-- **Found (2026-10-14):** not the driver: the client's own check. A client reserves the device's address range in its address space at connection (so a host pointer can never equal a device pointer); when the range was taken, it refused every device pointer in `cudaMemset` (and every call that checks `is_device_pointer`). The range was at 0x600000000000, inside the span where the kernel randomizes the load address of PIE executables (from 0x555555554000 up to 16 TiB above with `vm.mmap_rnd_bits = 32`): 8 of 400 runs of a minimal program had their own code there. The VRAM is now at 0x200000000000, below every randomized span: 0 of 400. A client that cannot reserve the range now says so. The same cause made HeCBench groupnorm fail once (`cudaMemset ... invalid argument`) in a tracking run.
+- **Found (2026-10-14):** not the driver: the client's own check. A client reserves the device's address range in its address space at connection (so a host pointer can never equal a device pointer); when the range was taken, it refused every device pointer in `cudaMemset` (and every call that checks `is_device_pointer`). The range was at 0x600000000000, inside the span where the kernel randomizes the load address of PIE executables (from 0x555555554000 up to 16 TiB above with `vm.mmap_rnd_bits = 32`): 8 of 400 runs of a minimal program had their own code there. The VRAM is now at 0x200000000000, below every randomized span: 0 of 400. A client that cannot reserve the range now says so. The same cause made HeCBench groupnorm fail once (`cudaMemset ... invalid argument`) in a tracking run. A `static_assert` in `src/device/device_core.h` keeps the range below the randomized span; 30 runs of groupnorm since: no failure. Write-up: [36](optimization/iteration-4/36-cooperative-variant-false-sharing-and-vram.md).
 
 ## `j0` and `y0` (double) error on the Xeon server
 
@@ -41,9 +41,15 @@ Failures that are the programs' own bugs, which the GPU hides by its timing:
 ## base64e failed once in a tracking run
 
 - **Seen:** 2026-10-14, Xeon server, `bench/track/track.sh build2 base3`: one of the three runs of HeCBench base64e failed its check (the build before shape classes).
-- **Not reproduced:** 16 more runs, 8 with that build and 8 with the next, all passed. The run's log was not kept; `track.sh` should keep the log of a failing run.
+- **Not reproduced:** 16 more runs, 8 with that build and 8 with the next, all passed; 30 more on 2026-10-15 (`bench/track/repeat.sh`), all passed. `track.sh` now keeps the log of a failing run (`results/<label>.<app>.fail<n>.log`).
 
 ## concurrentKernels crashed once in a tracking run
 
 - **Seen:** 2026-10-14, Xeon server, a tracking run (`widesplit`, a build reverted since): one of three runs of HeCBench concurrentKernels died with a core dump and no output at all.
+- **Not reproduced:** 30 runs on 2026-10-15 (`bench/track/repeat.sh`), all passed.
 - **Not known yet:** the program launches kernels of 1 thread into several streams with `cudaStreamWaitEvent` between them. No output at all suggests a crash early (the connection, the first launches) rather than in a kernel, whose fault would have been reported. The log is in that run's results (`widesplit.concurrentKernels.fail2.log`, on the server).
+
+## The width a kernel gets can differ between fresh drivers
+
+- **Seen:** 2026-10-15/16, Xeon server, `bench/track/stability.py` over 5 fresh drivers running the 49 tracked programs: some kernel shapes got different widths from one driver to the next (16 of 48 measured shapes before measuring in CPU time; see [37](optimization/iteration-4/37-width-selection.md) for the numbers after).
+- **Known:** within one driver the choice is made once and kept for every program running the same code. Across drivers, the widths that alternate are mostly within 5 to 15% of each other; in others the gap between the same two widths changed from one driver to the next (1.00 on four, 2.25 on the fifth), during periods when other users' work loaded the machine (load average 32 with 10 users logged in). On a machine not shared with other work this should not happen; not checked on one yet.

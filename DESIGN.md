@@ -24,8 +24,9 @@ Take a CUDA program that works on an NVIDIA GPU and, **without changing the sour
 | Compiler | the CUDA used by real programs: divergence, barriers, static and dynamic shared memory, per-thread arrays, warp intrinsics, atomics, device and constant variables, recursion and function pointers, `printf`/`malloc`/`assert`, cooperative groups, libcu++ atomics, `half`/`bfloat16`, `wmma` tensor cores |
 | Runtime | memory and copies (linear, pitched, 3D, pinned, mapped, managed), asynchronous streams and events, CUDA graphs, occupancy and attribute queries, error codes with sticky errors |
 | Driver | `cpusimd` serving several programs at once, `cpu-smi`, kernel faults and hangs isolated per program |
-| Validation | `ctest` (features at every width and on both backends, samples, bit-for-bit stability); the stress suite, 631 cases checked against the GPU, 629 passing ([29](docs/optimization/iteration-3/29-stress-suite.md)) |
-| Performance | against the same computation in OpenMP on the same CPU, 335 of 541 cases faster, geometric mean 1.24x ([30](docs/optimization/iteration-3/30-launches-and-hot-spots.md)) |
+| Validation | `ctest`, 43 tests (features at every width and on both backends, samples, bit-for-bit stability, the width selection's rules, a compile time budget for the kernels that once took minutes); the stress suite, 631 cases checked against the GPU, 629 passing ([29](docs/optimization/iteration-3/29-stress-suite.md)); on 72 HeCBench programs drawn at random, every one that runs on the GPU without CUB or Thrust passes (52 of 52) ([38](docs/optimization/iteration-4/38-where-we-stand.md)) |
+| Performance | against the same computation in OpenMP on the same CPU, 335 of 541 stress cases faster, geometric mean 1.24x ([30](docs/optimization/iteration-3/30-launches-and-hot-spots.md)); on 72 HeCBench programs drawn at random, faster than their OpenMP version in 15 of 27 comparable ones, tied in 3, and 7.8x behind an H100 in geometric mean ([38](docs/optimization/iteration-4/38-where-we-stand.md)) |
+| Compile time | median 1.7 s per program (`nvcc`: 1.3 s); the slowest tracked program 29 s ([35](docs/optimization/iteration-4/35-compile-time.md)) |
 
 ### Development machine
 
@@ -105,15 +106,15 @@ Wider groups give the core more independent work per instruction stream; they al
 
 The device measures the valid candidates and keeps the fastest per kernel code, block shape and number of workers (`device/width_tuning.h`, tested on its own by `tests/test_width.cpp`). The rule is built so that the same program decides the same way each time, not only so that it finds the fastest ([03](docs/optimization/iteration-2/03-automatic-width-selection.md) has the first version):
 
-- **Large launches** measure inside the first launch: each candidate runs a slice of the launch's own blocks (32 per worker, `CPUSIM_TRIAL_BLOCKS`), in 5 rounds back to back; the measure is the workers' time per block.
-- **Smaller launches** measure one candidate per launch, by the launch's critical path (the longest a worker spent on it), which leaves out the round trip and the workers' wake-up: with the wall time, the same width measured 2-4x apart from one launch to the next. A first launch only warms up (first touch of the data, cold caches), then 5 rounds of every candidate, interleaved; after the first round a candidate 3x slower than the best is dropped.
-- **Short launches** (under 1 ms of work in the first round) take the first candidate unmeasured: there the fixed cost of a launch outweighs the width, and the executor's choice of how many workers to call, learned launch after launch, made the candidates run unlike each other.
+- **Large launches** measure inside the first launch: each candidate runs a slice of the launch's own blocks (32 per worker, `CPUSIM_TRIAL_BLOCKS`), in 5 rounds back to back; the measure is the workers' CPU time per block.
+- **Smaller launches** measure one candidate per launch, by the launch's critical path (the most CPU time a worker spent on it), which leaves out the round trip, the workers' wake-up and any time another process held a worker's core: with the wall time, the same width measured 2-4x apart from one launch to the next. A first launch only warms up (first touch of the data, cold caches), then 5 rounds of every candidate, interleaved; after the first round a candidate 3x slower than the best is dropped.
+- **Short launches** (under 1 ms of the workers' CPU time in the first round) take the first candidate unmeasured: there the fixed cost of a launch outweighs the width, and the executor's choice of how many workers to call, learned launch after launch, made the candidates run unlike each other.
 - **The decision**: each candidate's median, and among those within 10% of the best, the first in the order of the candidates. Near-equal widths are decided by that order, the same way every time, instead of by the noise.
 - **Across programs**: the measurement belongs to the daemon, not to the program, while the daemon runs. A program with one launch or ten leaves it where the next program running the same code picks it up (HeCBench rsbench: 32 lanes until its 13th run, 2.6x faster from then on); once decided only the width is kept. Nothing is written to disk.
 - **Order of the candidates.** Without barriers: 32, then wider, then lanes that refill. With barriers: wide, then suspending, and the 32-lane variant last, since a program that ends before the measurement does keeps the first ones, and the 32-lane variant, which suspends at every barrier, was the slowest on every barrier kernel measured.
 - `CPUSIM_LANES=<n>`, `<n>s` or `<n>r` (lanes that refill) forces a width; `CPUSIM_VERBOSE=1` prints each candidate's median and range, and the choice.
 
-How close the choice comes to the best forced width, kernel by kernel, is measured by `bench/track/oracle.sh`; how often fresh daemons decide alike, by `bench/track/stability.py`. On the 49 tracked programs, 62 of 73 kernels are within 10% of the best width (45 before these rules); fresh daemons still differ on kernels whose widths are within about 15% of each other, on a server shared with other work.
+How close the choice comes to the best forced width, kernel by kernel, is measured by `bench/track/oracle.sh`; how often fresh daemons decide alike, by `bench/track/stability.py` ([37](docs/optimization/iteration-4/37-width-selection.md)). On the 49 tracked programs, 62 of 73 kernels are within 10% of the best width (45 before these rules); fresh daemons still differ on some kernels, mostly between widths within about 15% of each other.
 
 Every width produces the same bits: a test suite checks it, with the selection switching widths in the middle of a program ([23](docs/optimization/iteration-3/23-reproducibility-and-stability.md)).
 
@@ -280,7 +281,7 @@ These are read by the program and travel with each launch, so the one driver run
 
 - **Out of scope**: Thrust, CUB, cuBLAS and other NVIDIA libraries; inline PTX (`asm()`); dynamic parallelism; textures and surfaces.
 - **Semantics**: no independent thread scheduling inside a warp (section 4.1); with warps of 64, CUDA's 32-bit warp masks cover only lanes 0..31; managed and mapped memory are coherent with the host at kernel boundaries, not while a kernel runs; a cooperative launch is limited to two blocks per core.
-- **Performance** (the slow cases are listed in [30](docs/optimization/iteration-3/30-launches-and-hot-spots.md)): atomics contended by every core on the same cache lines, kernels tuned for a GPU's memory system, deep per-thread divergence, one-byte-per-thread code (16 bytes per vector where a CPU loop handles 64), and the socket round trip per launch through the driver.
+- **Performance** (the slow cases are listed in [30](docs/optimization/iteration-3/30-launches-and-hot-spots.md) and [38](docs/optimization/iteration-4/38-where-we-stand.md)): atomics contended by every core on the same cache lines, kernels tuned for a GPU's memory system (a stream of memory per thread, most threads idle), single-precision transcendentals (computed in double for accuracy), deep per-thread divergence, one-byte-per-thread code (16 bytes per vector where a CPU loop handles 64), and the socket round trip per launch through the driver.
 
 ## 8. Open directions
 
@@ -289,6 +290,9 @@ Not tried yet:
 - Sending launches to the driver without waiting for each reply, or through a shared-memory ring, to remove most of the per-launch round trip.
 - A memory yield: in chains of dependent loads, prefetch and switch to another group, with the same state machine as the barriers.
 - The block distribution policy as one more dimension of the automatic selection ([17](docs/optimization/iteration-2/17-block-distribution.md)).
+- Atomics that every thread of a grid makes on one address: merged per warp for add, sub, the bitwise operations, min and max ([30](docs/optimization/iteration-3/30-launches-and-hot-spots.md)), but not for increment and decrement with wrap, exchange or compare-and-swap; and even merged, every core contends for the same lines (HeCBench atomicIntrinsics: 182x behind the GPU, [38](docs/optimization/iteration-4/38-where-we-stand.md)).
+- Single-precision `expf`, `logf` and the other transcendentals in float within CUDA's ulp bounds, instead of in double (bilateral: 73x behind the GPU).
+- Predicting from a kernel's features the one to three widths worth building, to cut compile time further ([35](docs/optimization/iteration-4/35-compile-time.md)).
 
 ## 9. References
 

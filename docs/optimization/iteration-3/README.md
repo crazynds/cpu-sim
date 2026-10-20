@@ -55,4 +55,4 @@ New in the stress suite ([29](29-stress-suite.md)):
 - **Waiting loops:** a kernel that waits for other threads runs one warp per call; a lane waiting for another lane of its own warp still hangs.
 - **`j0` and `y0`:** glibc's double versions exceed CUDA's ulp bound near their zeros.
 
-Previous: [iteration 2](../iteration-2/README.md). Back to the [index](../README.md).
+Previous: [iteration 2](../iteration-2/README.md). Next: [iteration 4](../iteration-4/README.md). Back to the [index](../README.md).

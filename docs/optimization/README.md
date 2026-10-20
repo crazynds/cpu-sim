@@ -6,6 +6,8 @@ This folder explains, one per file, each optimization that the compiler (`cucc` 
 
 ## The machine and how we measure
 
+Iterations 1 to 3 (up to [32](iteration-3/32-warp-size.md)) were measured on the laptop below; from [33](iteration-3/33-xeon-server.md) on, on a server with 2 x Intel Xeon Gold 6548Y+ (64 cores) and an NVIDIA H100 NVL, where HeCBench programs are tracked with `bench/track` ([tutorial 6](../tutorials/06-tracking.md)).
+
 - **CPU:** AMD Ryzen 9 8940HX (Zen 4, 16 cores, 2 threads per core, AVX-512, 2 x 32 MB of L3). The "device" uses 14 cores (28 workers, CPUs 2-15 and 18-31); 2 cores are left for the program.
 - **Reference GPU:** NVIDIA RTX 5060 Laptop.
 - **Benchmarks:** `bench/run.sh` (sample kernels, with the result checked bit for bit against the GPU) and 9 HeCBench applications compared in three forms: GPU (`nvcc`), CPU with the suite's OpenMP version, and CPU with the CUDA code on our compiler.
@@ -19,7 +21,8 @@ The optimizations were done in rounds. Each round has a folder with its own inde
 |---|---|---|
 | [Iteration 1](iteration-1/README.md) | Making it viable to run CUDA on the CPU: JIT, widths, memory accesses, control flow and barriers. Includes the original record, [OPTIMIZATIONS.md](iteration-1/OPTIMIZATIONS.md) | 01, 02, 04 to 09, 11 |
 | [Iteration 2](iteration-2/README.md) | Making the CUDA code on the CPU beat the HeCBench OpenMP version and making the width choice reliable | 03, 10, 12 to 22 |
-| [Iteration 3](iteration-3/README.md) | The same bits in all execution modes, 16-bit types and tensor cores, the adjustments that this work exposed and a kernel written for the CPU near peak | 23 to 32 |
+| [Iteration 3](iteration-3/README.md) | The same bits in all execution modes, 16-bit types and tensor cores, the adjustments that this work exposed, a kernel written for the CPU near peak, and the move to a two-socket Xeon | 23 to 34 |
+| [Iteration 4](iteration-4/README.md) | Compile times of minutes to seconds, a width selection that decides the same way every time, the code split by subject with regression tests, and programs drawn at random against an H100 and OpenMP | 35 to 39 |
 
 ## The documents
 
@@ -62,6 +65,11 @@ The numbering is unique across all iterations, so that references do not change.
 | 32 | 3 | [The warp size](iteration-3/32-warp-size.md) | `CPUSIM_WARP_SIZE=16/32/64`; blocks smaller than a warp in fewer lanes (10 to 46% faster) |
 | 33 | 3 | [A two-socket Xeon](iteration-3/33-xeon-server.md) | H100, OpenMP and the simulator on 2 x 32 cores; launches 816 to 3.7 us (monitor, wake-ups, workers per job, C-states) |
 | 34 | 3 | [Adapting to the CPU](iteration-3/34-adapting-to-the-cpu.md) | Code for this CPU only; native fp16 fma/sqrt; AMX tensor path (opt-in); small launches on one socket |
+| 35 | 4 | [Compile time](iteration-4/35-compile-time.md) | Kernels compiled apart, classes of block shapes, barrier loops kept rolled, no 128-lane variants past 64 live values: minutes to seconds |
+| 36 | 4 | [A variant that never won, a false sharing, a failure one run in fifty](iteration-4/36-cooperative-variant-false-sharing-and-vram.md) | The cooperative variant removed, the job's hot atomics on lines of their own, the VRAM below where PIE executables load |
+| 37 | 4 | [The width selection, the same way every time](iteration-4/37-width-selection.md) | Critical path in CPU time, warm-up, medians, ties by order, short launches, the measurement kept across programs |
+| 38 | 4 | [Where we stand](iteration-4/38-where-we-stand.md) | 72 HeCBench programs drawn at random against an H100 and OpenMP |
+| 39 | 4 | [The code by subject, and tests](iteration-4/39-organization-and-tests.md) | Large files split by subject; tests for every problem the round fixed |
 
 ## Suggested reading order
 
@@ -72,5 +80,6 @@ The numbering is unique across all iterations, so that references do not change.
 5. **Behind the scenes:** 11, 21 and 22.
 6. **Correctness and new features:** 23, 24, 25 and 26. Bit-for-bit reproducibility, 16-bit types and tensor cores.
 7. **Writing the kernel for the CPU:** 27. A GEMM near the theoretical peak, and what the compiler needed to change for it.
+8. **Where it stands, and keeping it there:** 38, then 35, 37 and 39. Programs drawn at random, compile time, a width choice that does not change between runs, and the tests and scripts that track all of it.
 
 The shorter original record of iteration 1 is in [iteration-1/OPTIMIZATIONS.md](iteration-1/OPTIMIZATIONS.md).
