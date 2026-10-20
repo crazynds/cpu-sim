@@ -577,7 +577,8 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     LaunchResult local;
     if (!result) result = &local;
     uint64_t launch_busy = 0;  // workers' time on this launch's blocks
-    uint64_t launch_span = 0;  // the longest of them (Executor::run's span_ns)
+    uint64_t launch_span = 0;  // the most CPU time of one of them (Executor::run's span_ns)
+    uint64_t launch_cpu = 0;   // their CPU time
     {
         // Busy time = time with at least one kernel running (launches from
         // several streams overlap). `since` lets the monitor count a long
@@ -606,12 +607,12 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
         } else {
             KernelFault fault;
             auto run = [&](uint64_t fn_entry, uint32_t w, uint64_t first, uint64_t last, uint64_t* busy,
-                           uint64_t* span = nullptr) {
+                           uint64_t* span = nullptr, uint64_t* cpu = nullptr) {
                 if (fault.signal) return;
                 executor_->run(reinterpret_cast<cpusim_entry_fn>(fn_entry), w & 0xffff,
                                w == meta.warp_lanes || (w & kSuspend), meta, run_cfg, aligned,
                                cfg.profile ? result->counters : nullptr, reinterpret_cast<cpusim_block_fn>(block_fn),
-                               first, last, busy, &fault, id, (w & kRefill) != 0, span);
+                               first, last, busy, &fault, id, (w & kRefill) != 0, span, cpu);
             };
             // A fault ends the launch (and only it): an invalid address is
             // cudaErrorIllegalAddress, anything else an unspecified failure.
@@ -628,9 +629,9 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
                 const uint64_t slice = trial_blocks();
                 std::vector<uint64_t> ns;
                 for (const Trial& tr : trials) {
-                    uint64_t busy = 0;
-                    run(tr.entry, tr.lanes, first, first + slice, &busy);
-                    ns.push_back(busy * 1000 / slice);
+                    uint64_t busy = 0, cpu = 0;
+                    run(tr.entry, tr.lanes, first, first + slice, &busy, nullptr, &cpu);
+                    ns.push_back(cpu * 1000 / slice);
                     first += slice;
                 }
                 // Each candidate's slices (trials are the rounds back to back).
@@ -643,7 +644,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
                 for (size_t i = 0; i < n; ++i)
                     if (trials[i].lanes == lanes) entry = trials[i].entry;
             }
-            run(entry, lanes, first, UINT64_MAX, &launch_busy, &launch_span);
+            run(entry, lanes, first, UINT64_MAX, &launch_busy, &launch_span, &launch_cpu);
             if (failed()) return fault_error(fault.signal);
         }
         result->kernel_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -661,7 +662,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
                      100.0 * double(launch_busy) / (double(result->kernel_ns) * double(executor_->workers())));
     // One candidate per launch (launches too small for in-launch trials):
     // whole launches of one shape compared with each other, by their
-    // critical path, the longest a worker spent on them. Like the wall time
+    // critical path, the most CPU time a worker spent on them. Like the wall time
     // it counts how well the width spreads over the workers (matrix-rotate:
     // 128 lanes does less work in all but leaves cores idle); unlike it, it
     // leaves out the round trip and the workers' wake-up, whose noise made the
@@ -670,7 +671,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
     const uint64_t launch_blocks = uint64_t(cfg.grid[0]) * cfg.grid[1] * cfg.grid[2];
     if (tuning_key && trials.empty() && launch_span)
         record_timing(id, function, tuning_key, lanes, launch_span * 1000 / std::max<uint64_t>(launch_blocks, 1),
-                      launch_busy);
+                      launch_cpu);
     counters_.kernels_launched.fetch_add(1, std::memory_order_relaxed);
     if (cfg.profile) counters_.kernels_profiled.fetch_add(1, std::memory_order_relaxed);
     return Error::Success;

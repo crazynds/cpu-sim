@@ -87,7 +87,7 @@ public:
              const LaunchConfig& cfg, const uint8_t* params, uint64_t* counters = nullptr,
              cpusim_block_fn block = nullptr, uint64_t first = 0,
              uint64_t last = UINT64_MAX, uint64_t* busy_ns = nullptr, KernelFault* fault = nullptr,
-             uint32_t tag = 0, bool refill = false, uint64_t* span_ns = nullptr);
+             uint32_t tag = 0, bool refill = false, uint64_t* span_ns = nullptr, uint64_t* cpu_ns = nullptr);
     // Stops the running launches tagged `tag` (0: all): their workers leave
     // the kernel code they are in. Their run() returns with a fault of
     // SIGUSR2. Call again while they last: a worker outside kernel code
@@ -98,10 +98,14 @@ public:
     // worker per physical core (state such as AMX tiles that two SMT
     // threads would share). Returns the fault that stopped it, if any.
     KernelFault run_native(uint64_t units, const std::function<void(uint64_t, int)>& fn, bool one_per_core);
-    // span_ns: the longest time one worker spent on this launch's blocks,
+    // span_ns: the most CPU time one worker spent on this launch's blocks,
     // its critical path: the launch's duration without the round trip, the
     // workers' wake-up and the end of the launch, which add their own noise
     // to the wall time, but with what an uneven spread over the workers costs.
+    // cpu_ns: the CPU time of all of them. CPU time, not wall time: a worker
+    // that another process takes the core from does not count that time
+    // (on a shared machine, bursts of other work had the same kernel's widths
+    // measure 2x apart on one daemon and alike on the next).
     // busy_ns: the time workers spent running this launch's blocks, summed
     // over workers. Divided by the blocks, the cost of a block: unlike wall
     // time, it ignores the uneven end of a launch and the launch overhead,
@@ -195,7 +199,8 @@ private:
             return state.compare_exchange_strong(zero, kClosed, std::memory_order_acq_rel);
         }
         alignas(64) std::atomic<uint64_t> busy_ns{0};  // added to by every worker leaving
-        std::atomic<uint64_t> span_ns{0};               // the most one worker spent on it
+        std::atomic<uint64_t> span_ns{0};               // the most CPU time one worker spent on it
+        std::atomic<uint64_t> cpu_ns{0};                // their CPU time, summed
         alignas(64) std::atomic<bool> done{false};
         // A worker faulted: the others take no more blocks.
         mutable std::atomic<bool> aborted{false};
