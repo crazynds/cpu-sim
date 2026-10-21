@@ -24,7 +24,7 @@ MODES="auto 32 32r 64 64s 128 128s 256 512" REPS=3 bench/track/oracle.sh build o
 bench/track/oracle.py o1
 ```
 
-`oracle.sh <build> <label> [apps.txt]` compiles every program once, then runs them all on a fresh driver per mode: `auto` is the automatic selection, any other mode is a width forced with `CPUSIM_LANES` (read by the driver). A forced width the kernel has no variant for falls back to 32 lanes, so such a line repeats the 32-lane one. One line per mode, program and kernel in `results/o1.oracle.tsv`, the least of `REPS` runs; the driver's width messages per mode in `results/o1.oracle.<mode>.widths`.
+`oracle.sh <build> <label> [apps.txt]` compiles every program once, then runs each program in every mode, back to back, on a fresh driver per mode (the machine's load changes over minutes, and the modes of one program must see the same): `auto` is the automatic selection, any other mode is a width forced with `CPUSIM_LANES` (read by the driver). A forced width the kernel has no variant for falls back to 32 lanes, so such a line repeats the 32-lane one. One line per mode, program and kernel in `results/o1.oracle.tsv`, the least of `REPS` runs; the driver's width messages per mode in `results/o1.oracle.<mode>.widths`.
 
 `oracle.py <label>` compares, per kernel, the automatic selection with the best forced width, and counts kernels by how far off it is (within 5%, 5 to 10%, ... over 2x), leaving out kernels under 1 ms (`--min-ms`). A mode may repeat as `auto#2`: the automatic selection again on another fresh driver.
 
@@ -37,7 +37,7 @@ MODES="auto auto#2 auto#3 auto#4 auto#5" REPS=1 bench/track/oracle.sh build s1
 bench/track/stability.py s1
 ```
 
-Five fresh drivers, one run of each program on each. `stability.py` reads the five width logs and lists every kernel and block shape that got more than one width, then the count. A kernel listed with widths whose medians (in the logs) are within a few percent of each other is a near tie; one whose gap between the same two widths changes from driver to driver points at interference from other work on the machine.
+Five fresh drivers, one run of each program on each. Each mode's width messages go to `results/s1.oracle.<mode>.widths`. `stability.py` reads the five width logs and lists every kernel and block shape that got more than one width, then the count. A kernel listed with widths whose estimates (in the logs) are close to the 25% tie margin is a near tie; one whose gap between the same two widths changes from driver to driver points at interference from other work on the machine.
 
 ## A failure seen once: `repeat.sh`
 

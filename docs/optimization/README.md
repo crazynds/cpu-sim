@@ -67,7 +67,7 @@ The numbering is unique across all iterations, so that references do not change.
 | 34 | 3 | [Adapting to the CPU](iteration-3/34-adapting-to-the-cpu.md) | Code for this CPU only; native fp16 fma/sqrt; AMX tensor path (opt-in); small launches on one socket |
 | 35 | 4 | [Compile time](iteration-4/35-compile-time.md) | Kernels compiled apart, classes of block shapes, barrier loops kept rolled, no 128-lane variants past 64 live values: minutes to seconds |
 | 36 | 4 | [A variant that never won, a false sharing, a failure one run in fifty](iteration-4/36-cooperative-variant-false-sharing-and-vram.md) | The cooperative variant removed, the job's hot atomics on lines of their own, the VRAM below where PIE executables load |
-| 37 | 4 | [The width selection, the same way every time](iteration-4/37-width-selection.md) | Critical path in CPU time, warm-up, medians, ties by order, short launches, the measurement kept across programs |
+| 37 | 4 | [The width selection, the same way every time](iteration-4/37-width-selection.md) | Critical path in CPU time, warm-up, up to 15 rounds, ties within 25% by order, early stop, short launches, the measurement kept across programs |
 | 38 | 4 | [Where we stand](iteration-4/38-where-we-stand.md) | 72 HeCBench programs drawn at random against an H100 and OpenMP |
 | 39 | 4 | [The code by subject, and tests](iteration-4/39-organization-and-tests.md) | Large files split by subject; tests for every problem the round fixed |
 
