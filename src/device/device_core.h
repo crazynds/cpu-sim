@@ -177,7 +177,7 @@ private:
         }();
         return per_worker * executor_->workers();
     }
-    static constexpr int kTrialRounds = WidthTuning::kRounds;
+    static constexpr int trial_rounds() { return WidthTuning::kSliceRounds; }
     // A width to try, with its entry point.
     struct Trial {
         uint32_t lanes;

@@ -635,7 +635,7 @@ Error DeviceCore::launch(uint32_t id, uint64_t function, const LaunchConfig& cfg
                     first += slice;
                 }
                 // Each candidate's slices (trials are the rounds back to back).
-                const size_t n = trials.size() / kTrialRounds;
+                const size_t n = trials.size() / trial_rounds();
                 std::vector<std::vector<uint64_t>> slices(n);
                 for (size_t k = 0; k < trials.size(); ++k) slices[k % n].push_back(ns[k]);
                 if (failed()) return fault_error(fault.signal);
@@ -726,8 +726,8 @@ uint32_t DeviceCore::pick_width(Context::FunctionInfo& fn, const LaunchConfig& c
         // in the first launch. Smaller launches measure one candidate per
         // launch (every launch counts, whatever its size).
         const uint64_t blocks = uint64_t(cfg.grid[0]) * cfg.grid[1] * cfg.grid[2];
-        if (blocks >= 2 * kTrialRounds * trial_blocks() * valid.size()) {
-            for (int r = 0; r < kTrialRounds; ++r)
+        if (blocks >= 2 * trial_rounds() * trial_blocks() * valid.size()) {
+            for (int r = 0; r < trial_rounds(); ++r)
                 for (uint32_t w : valid) trials->push_back({w, entry_for(w)});
             *tuning_key = key;
             *entry = trials->front().entry;
@@ -764,9 +764,9 @@ uint32_t DeviceCore::choose_width(uint32_t id, uint64_t function, uint64_t key, 
     WidthTuning& t = *tp;
     t = chosen;
     if (std::getenv("CPUSIM_VERBOSE")) {
-        std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, in the first launch (us per 1000 blocks, median [range] of %d slices of %llu)",
+        std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, in the first launch (us per 1000 blocks, estimate [range] of %d slices of %llu)",
                      fn->second.name.c_str(), (unsigned long long)(key >> 40), (unsigned long long)((key >> 20) & 0xfffff),
-                     (unsigned long long)(key & 0xfffff), kTrialRounds, (unsigned long long)trial_blocks());
+                     (unsigned long long)(key & 0xfffff), trial_rounds(), (unsigned long long)trial_blocks());
         std::fprintf(stderr, "%s -> %u%s lanes\n", t.describe().c_str(), t.chosen() & 0xffff, width_suffix(t.chosen()));
     }
     return t.chosen();
@@ -784,7 +784,7 @@ void DeviceCore::record_timing(uint32_t id, uint64_t function, uint64_t key, uin
     WidthTuning& t = *tp;
     if (!t.record(lanes, ns, work_ns)) return;
     if (std::getenv("CPUSIM_VERBOSE")) {
-        std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, over launches (us of critical path per 1000 blocks, median [range] of the runs; -: dropped)",
+        std::fprintf(stderr, "cpusim: width of %s, block %llux%llux%llu, over launches (us of critical path per 1000 blocks, estimate [range] of the runs; -: dropped)",
                      fn->second.name.c_str(), (unsigned long long)(key >> 40),
                      (unsigned long long)((key >> 20) & 0xfffff), (unsigned long long)(key & 0xfffff));
         std::fprintf(stderr, "%s -> %u%s lanes%s\n", t.describe().c_str(), t.chosen() & 0xffff, width_suffix(t.chosen()),

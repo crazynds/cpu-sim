@@ -53,20 +53,71 @@ void WidthTuning::start(const std::vector<uint32_t>& valid) {
 }
 
 namespace {
-uint64_t median(std::vector<uint64_t> v) {
+// The mean of the times between the lowest eighth and the middle. What
+// disturbs a launch (another process on the core, an interrupt, a page
+// fault) only adds time, so the upper half is where the noise is; the lowest
+// eighth is left out too, against a launch that measured unusually little.
+uint64_t estimate(std::vector<uint64_t> v) {
     std::sort(v.begin(), v.end());
-    return v[(v.size() - 1) / 2];  // the lower middle of an even count
+    // (From 3 times on, at least the lowest is left out: the measurement may
+    // stop after 3 rounds, and one lucky launch must not decide it.)
+    const size_t lo = v.size() >= 3 ? std::max<size_t>(1, v.size() / 8) : 0;
+    const size_t hi = std::max(lo + 1, (v.size() + 1) / 2);
+    uint64_t sum = 0;
+    for (size_t i = lo; i < hi; ++i) sum += v[i];
+    return sum / (hi - lo);
+}
+}  // namespace
+
+double WidthTuning::tie() {
+    static const double t = [] {
+        const char* v = std::getenv("CPUSIM_WIDTH_TIE");
+        return v && std::atof(v) > 0 ? std::atof(v) : kTie;
+    }();
+    return t;
+}
+
+int WidthTuning::rounds() {
+    static const int n = [] {
+        const char* v = std::getenv("CPUSIM_WIDTH_ROUNDS");
+        return v && std::atoi(v) > 0 ? std::atoi(v) : kRounds;
+    }();
+    return n;
+}
+
+namespace {
+// The rule on estimates (0: dropped).
+size_t decide_on(const std::vector<double>& est, double tie) {
+    double best = 0;
+    for (double e : est)
+        if (e > 0 && (best == 0 || e < best)) best = e;
+    for (size_t i = 0; i < est.size(); ++i)
+        if (est[i] > 0 && est[i] <= best * (1.0 + tie)) return i;
+    return 0;
 }
 }  // namespace
 
 size_t WidthTuning::decide(const std::vector<std::vector<uint64_t>>& times) {
-    std::vector<uint64_t> med(times.size(), UINT64_MAX);
-    uint64_t best = UINT64_MAX;
+    std::vector<double> est(times.size(), 0);
     for (size_t i = 0; i < times.size(); ++i)
-        if (!times[i].empty()) best = std::min(best, med[i] = median(times[i]));
+        if (!times[i].empty()) est[i] = double(estimate(times[i]));
+    return decide_on(est, tie());
+}
+
+bool WidthTuning::settled(const std::vector<std::vector<uint64_t>>& times) {
+    std::vector<double> est(times.size(), 0);
     for (size_t i = 0; i < times.size(); ++i)
-        if (med[i] != UINT64_MAX && double(med[i]) <= double(best) * (1.0 + kTie)) return i;
-    return 0;
+        if (!times[i].empty()) est[i] = double(estimate(times[i]));
+    const size_t d = decide_on(est, tie());
+    // Every estimate kSettle off, up or down, in every combination.
+    const size_t n = est.size();
+    if (n > 12) return false;
+    for (uint32_t mask = 0; mask < (1u << n); ++mask) {
+        std::vector<double> e = est;
+        for (size_t i = 0; i < n; ++i) e[i] *= (mask >> i & 1) ? 1.0 + kSettle : 1.0 - kSettle;
+        if (decide_on(e, tie()) != d) return false;
+    }
+    return true;
 }
 
 bool WidthTuning::record(uint32_t lanes, uint64_t ns, uint64_t work_ns) {
@@ -87,14 +138,19 @@ bool WidthTuning::record(uint32_t lanes, uint64_t ns, uint64_t work_ns) {
     if (round_ == 1) {
         uint64_t best = UINT64_MAX;
         for (const auto& s : samples_) best = std::min(best, s.front());
-        for (auto& s : samples_)
-            if (double(s.front()) > double(best) * kDrop) s.clear();  // dropped
+        // (Never the first candidate: it is what a tie falls back to, and a
+        // dropped one would hand the tie to the next in one run only.)
+        for (size_t i = 1; i < samples_.size(); ++i)
+            if (double(samples_[i].front()) > double(best) * kDrop) samples_[i].clear();  // dropped
     }
     schedule_.clear();
     for (size_t i = 0; i < cands_.size(); ++i)
         if (!samples_[i].empty()) schedule_.push_back(i);
     pos_ = 0;
-    if (++round_ <= kRounds && schedule_.size() > 1) return false;
+    // Settled early: the choice would be the same with every estimate kSettle
+    // off either way (a clear winner needs kMinRounds, a near tie all of them).
+    const bool early = round_ >= kMinRounds && settled(samples_);
+    if (++round_ <= rounds() && schedule_.size() > 1 && !early) return false;
     chosen_ = cands_[decide(samples_)];
     finish();
     return true;
@@ -125,7 +181,7 @@ std::string WidthTuning::describe() const {
         } else {
             const auto [lo, hi] = std::minmax_element(s.begin(), s.end());
             std::snprintf(buf, sizeof(buf), " %u%s:%.1f[%.1f-%.1f]", cands_[i] & 0xffff, width_suffix(cands_[i]),
-                          median(s) / 1e3, *lo / 1e3, *hi / 1e3);
+                          estimate(s) / 1e3, *lo / 1e3, *hi / 1e3);
         }
         out += buf;
     }

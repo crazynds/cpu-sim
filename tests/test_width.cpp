@@ -71,48 +71,50 @@ int main() {
     EXPECT(valid_widths(w16, 64) == (W{16, 32, 64}));
 
     // --- which one the measurement keeps
-    // Launches: the warm-up, then 5 rounds; a candidate more than 3x slower
+    // Launches: the warm-up, then 15 rounds; a candidate more than 3x slower
     // than the best after the first round is not run again.
     int launches = 0;
     EXPECT(measure(W{32, 64, 128}, [](uint32_t w) { return w == 64 ? 300 : w == 128 ? 70 : 100; }, &launches) == 128);
-    EXPECT(launches == 1 + 3 + 4 * 2);  // 64 dropped after the first round
+    EXPECT(launches == 1 + 3 + 14 * 2);  // 64 dropped after the first round
     // Only one left after the first round: chosen there.
-    EXPECT(measure(W{32, 64, 128}, [](uint32_t w) { return w == 32 ? 100 : 1000; }, &launches) == 32);
-    EXPECT(launches == 1 + 3);
+    EXPECT(measure(W{32, 64, 128}, [](uint32_t w) { return w == 64 ? 100 : 1000; }, &launches) == 64);
+    EXPECT(launches == 1 + 3 + 2 * 2);  // 32, the fallback of a tie, is never dropped; settled in 3 rounds
+    // The measurement stops once the choice would be the same with every
+    // estimate 20% off: a clear winner after 3 rounds, a near tie after 15.
+    EXPECT(measure(W{32, 64}, [](uint32_t w) { return w == 32 ? 200 : 100; }, &launches) == 64);
+    EXPECT(launches == 1 + 3 * 2);
+    EXPECT(measure(W{32, 64}, [](uint32_t w) { return w == 32 ? 105 : 100; }, &launches) == 32);
+    EXPECT(launches == 1 + 15 * 2);
+    EXPECT(WidthTuning::settled({{200, 200, 200}, {100, 100, 100}}));
+    EXPECT(!WidthTuning::settled({{120, 120, 120}, {100, 100, 100}}));  // near the 25% margin
     // The first launch is cold (first touch of the data, caches): its time
     // does not count, so the width it runs is not dropped for it (HeCBench
     // adam: 32 lanes measured 2.9x slower than 128 in the first launch, and
     // was the fastest).
     {
         int launch = 0;
-        EXPECT(measure(W{32, 64, 128}, [&](uint32_t w) { return launch++ == 0 ? 300 : w == 32 ? 70 : 100; }) == 32);
+        EXPECT(measure(W{64, 32}, [&](uint32_t w) { return launch++ == 0 ? 300 : w == 64 ? 70 : 100; }) == 64);
     }
     // A candidate 2x off in its first run is not dropped (outliers that
-    // large happen; 3x drops it), and wins if it is the faster one.
-    EXPECT(measure(W{32, 64}, [n = 0](uint32_t w) mutable { return w == 64 && n++ == 0 ? 190 : 90 + (w == 32) * 10; }) ==
+    // large happen; 3x drops it), and wins if it is clearly faster.
+    EXPECT(measure(W{32, 64}, [n = 0](uint32_t w) mutable { return w == 64 && n++ == 0 ? 190 : w == 32 ? 130 : 90; }) ==
            64);
-    // The median of each candidate's runs: two slow (or lucky) launches do
-    // not decide.
-    {
-        WidthTuning t;
-        t.start(W{32, 64});
-        const uint64_t times[] = {999,        // warm-up
-                                  100, 95,    // round 1
-                                  100, 40,    // round 2: 64 lucky
-                                  100, 96,    // round 3
-                                  100, 41,    // round 4: lucky again
-                                  100, 97};   // round 5
-        for (uint64_t ns : times) t.record(t.next(), ns);
-        EXPECT(t.chosen() == 32);  // medians: 32 -> 100, 64 -> 95, a tie: the first
-    }
-    // Within 10% of the best is a tie, decided by the order of valid_widths
+    // The estimate: the mean of the times between the lowest eighth and the
+    // middle. Slow launches (another process on the core) do not count...
+    EXPECT(measure(W{32, 64}, [n = 0](uint32_t w) mutable { return w == 32 ? (n++ % 3 == 0 ? 600 : 140) : 100; }) ==
+           64);
+    // ...nor does one launch that measured unusually little.
+    // (Counted, the 10 would bring 64's estimate to 97.5, past the tie with 130.)
+    EXPECT(measure(W{32, 64}, [n = 0](uint32_t w) mutable { return w == 64 ? (n++ == 3 ? 10 : 110) : 130; }) == 32);
+    // Within 25% of the best is a tie, decided by the order of valid_widths
     // (the same way in every run); a clear difference decides by the times.
     EXPECT(WidthTuning::decide({{105}, {100}}) == 0);
     EXPECT(WidthTuning::decide({{100}, {105}}) == 0);
-    EXPECT(WidthTuning::decide({{120}, {100}}) == 1);
+    EXPECT(WidthTuning::decide({{120}, {100}}) == 0);
+    EXPECT(WidthTuning::decide({{130}, {100}}) == 1);
     EXPECT(WidthTuning::decide({{}, {300}, {100}}) == 2);  // dropped candidates do not count
-    // The same program decides the same way however its times wobble: the
-    // times of two widths 5% apart, each launch off by up to +-2%, never decide
+    // The same program decides the same way however its times wobble: two
+    // widths 5% apart, each launch off by up to +-2%, never decide
     // differently from one run to the next (the tie rule), and two widths 40%
     // apart always go to the faster one.
     unsigned seed = 7;
@@ -134,14 +136,14 @@ int main() {
         EXPECT(t.next() == 32);
         EXPECT(!t.chosen());
     }
-    // In-launch trials: the median of each candidate's slices, the same tie rule.
+    // In-launch trials: the same estimate of each candidate's slices, the same tie rule.
     {
         WidthTuning t;
         t.choose(W{256, 128 | kSuspend, 32}, {{50, 52, 51}, {40, 41, 39}, {60, 61, 62}});
         EXPECT(t.chosen() == (128 | kSuspend));
         EXPECT(!t.record(32, 1));  // nothing more once chosen
         t.choose(W{256, 128 | kSuspend, 32}, {{42, 43, 41}, {40, 41, 39}, {60, 61, 62}});
-        EXPECT(t.chosen() == 256);  // within 10% of the best: the first
+        EXPECT(t.chosen() == 256);  // within 25% of the best: the first
     }
 
     // Short launches (under 1 ms of work in the first round): the first
@@ -188,7 +190,7 @@ int main() {
             t.record(w, w == 64 ? 60 : 100);
             ++programs;
         }
-        EXPECT(t.chosen() == 64 && programs == 1 + 2 * 5);
+        EXPECT(t.chosen() == 64 && programs == 1 + 2 * 15);  // 1.67x: not clear enough to stop early
         const std::string summary = t.describe();
         EXPECT(summary.find("64:0.1") != std::string::npos);  // the times as they were
     }

@@ -65,18 +65,36 @@ std::vector<uint32_t> valid_widths(const KernelVariants& v, uint64_t threads);
 // executor calls a number of workers it learns from launch to launch, so
 // the candidates did not even run alike (a 12 us kernel picked 128 lanes on
 // one daemon and 64 on the next).
-// The decision: each candidate's median time (one slow or lucky launch does
-// not decide), and among the candidates within kTie of the best, the first
-// in the order of valid_widths. Widths that close are a tie the noise would
+// The decision: each candidate's estimate (the mean of its times between the
+// lowest eighth and the middle: what disturbs a launch only adds time), and
+// among the candidates within kTie of the best, the first in the order of
+// valid_widths, which is never dropped. Widths that close are a tie the noise would
 // decide one way in one run and the other in the next; the order decides
 // them the same way every time, and only a clear difference is measured.
 class WidthTuning {
 public:
-    // (Single launches measured up to 2x off the rest of their candidate's:
-    // the median of 5 stands two of them, and only 3x drops a candidate.)
-    static constexpr int kRounds = 5;
+    // (Single launches measured up to 2x off the rest of their candidate's,
+    // so only 3x drops a candidate. On 5 fresh drivers running 49 programs,
+    // 5 rounds and a 10% tie left 17 of 53 kernel shapes with more than one
+    // width, 15 rounds 12 of 49, and 15 rounds with a 25% tie 4 of 49: the
+    // estimates were steady by then, and the kernels that alternated had two
+    // widths whose real gap was close to the tie margin.)
+    static constexpr int kRounds = 15;
+    // In-launch trials: slices of 32 blocks per worker, long and steady;
+    // 15 of them would need launches of half a million blocks.
+    static constexpr int kSliceRounds = 5;
     static constexpr double kDrop = 3.0;
-    static constexpr double kTie = 0.10;
+    static constexpr double kTie = 0.25;
+    // The measurement stops before kRounds once at least kMinRounds are done
+    // and the choice would be the same with every estimate kSettle off either
+    // way: a clear winner (about 1.9x with these margins) is decided in 3
+    // rounds, so a program of a few launches measures 3 rounds, not 15; a
+    // closer call gets all 15. (With 10%, estimates from 3 rounds settled
+    // wrong now and then: 8 of 56 kernel shapes alternated on fresh drivers.)
+    static constexpr int kMinRounds = 3;
+    static constexpr double kSettle = 0.20;
+    static int rounds();  // kRounds, or CPUSIM_WIDTH_ROUNDS
+    static double tie();  // kTie, or CPUSIM_WIDTH_TIE
     static constexpr uint64_t kShortNs = 1000000;
 
     bool started() const { return !cands_.empty() || chosen_; }
@@ -91,7 +109,7 @@ public:
     // In-launch trials: each candidate's slice times, one per round.
     void choose(const std::vector<uint32_t>& lanes, const std::vector<std::vector<uint64_t>>& slices);
 
-    // For messages: the candidates and each one's median time so far, and
+    // For messages: the candidates and each one's estimate so far, and
     // all its times ("100.2 [91.0-130.5]", us per 1000 blocks); once
     // decided, as they were then.
     const std::vector<uint32_t>& candidates() const { return cands_; }
@@ -102,6 +120,8 @@ public:
     // The rule itself: the chosen index, given each candidate's times
     // (empty: dropped), in the order of preference.
     static size_t decide(const std::vector<std::vector<uint64_t>>& times);
+    // Whether decide() would choose the same with every estimate kSettle off.
+    static bool settled(const std::vector<std::vector<uint64_t>>& times);
 
 private:
     std::vector<uint32_t> cands_;                 // in the order of valid_widths
